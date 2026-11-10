@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <stop_token>
+#include <thread>
+#include <condition_variable>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -13,6 +16,7 @@
 #include <windows.h>
 #endif
 
+#include "common/thread.h"
 #include "common/logging/log.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/direct_memory.h"
@@ -64,6 +68,75 @@ std::atomic<bool> g_has_pending{false}; // checked on every bind without the loc
 // FIX-205: in native mode views dropped at an unmap wait for the native renderer's next list.
 std::atomic<bool> g_hold_for_splice{false};
 constexpr u64 HeldForSplice = ~u64{0};
+
+// PERF-GT7-129 (RYGT_D1_ASYNC_RELEASE=0 off): GT7 streams a track's textures in 64 KB maps, each
+// a view of its own, and unmaps the ones it leaves: 240 to 960 views dropped at a time while
+// driving, each ~100 us to release (the driver's free, the buffer, the alias), all on the
+// recorder at its next bind: 25 to 100 ms of one frame. The recorder still decides when a
+// view may go (the GPU is past its tick); this thread does the releasing.
+class ReleaseWorker {
+public:
+    static bool On() {
+        static const bool on = [] {
+            const char* env = std::getenv("RYGT_D1_ASYNC_RELEASE");
+            return !(env && env[0] == '0');
+        }();
+        return on;
+    }
+    static void Release(VkDevice device, PendingRelease& p) {
+        p.wrapper.reset();
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(device, p.memory, nullptr);
+        UnmapAlias()(p.alias);
+    }
+    void Push(VkDevice device, std::vector<PendingRelease>&& batch) {
+        {
+            std::scoped_lock lk{mutex};
+            if (!thread.joinable()) {
+                thread = std::jthread{[this](std::stop_token stop) { Run(stop); }};
+            }
+            queue.emplace_back(device, std::move(batch));
+        }
+        cv.notify_one();
+    }
+    /// Returns once everything pushed has been released (before the device goes).
+    void Drain() {
+        std::unique_lock lk{mutex};
+        idle_cv.wait(lk, [this] { return queue.empty() && !busy; });
+    }
+    ~ReleaseWorker() {
+        thread.request_stop();
+        cv.notify_all();
+    }
+
+private:
+    void Run(std::stop_token stop) {
+        Common::SetCurrentThreadName("shadGT:ViewRelease");
+        std::unique_lock lk{mutex};
+        while (true) {
+            cv.wait(lk, [&] { return stop.stop_requested() || !queue.empty(); });
+            if (queue.empty()) {
+                return; // stopping
+            }
+            auto [device, batch] = std::move(queue.front());
+            queue.erase(queue.begin());
+            busy = true;
+            lk.unlock();
+            for (PendingRelease& p : batch) {
+                Release(device, p);
+            }
+            lk.lock();
+            busy = false;
+            idle_cv.notify_all();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::condition_variable idle_cv;
+    std::vector<std::pair<VkDevice, std::vector<PendingRelease>>> queue;
+    bool busy = false;
+    std::jthread thread; // last: stops before the rest goes
+};
+ReleaseWorker g_release_worker;
 // D7: views a thread found lately, valid while no view was unmapped since (lock-free check).
 std::atomic<u64> g_unmap_generation{1};
 struct RecentView {
@@ -77,6 +150,16 @@ thread_local u32 t_recent_next = 0;
 // GT7's busy scenes bind thousands of ranges a frame over more views than the eight above hold,
 // and each miss walked the view map page by page under the lock.
 thread_local std::array<RecentView, 256> t_recent_ranges{};
+// PERF-GT7-127: the view FindBuffer found for an address lately, by the address's 2 MB chunk
+// (the size GT7's memory is imported in). Valid while no view was unmapped since, as D7's: a
+// view only goes at an unmap, which moves the generation on under the map's lock.
+struct RecentFind {
+    u64 generation;
+    VAddr begin;
+    VAddr end;
+    const Buffer* buffer;
+};
+thread_local std::array<RecentFind, 64> t_recent_finds{};
 
 } // namespace
 
@@ -96,7 +179,12 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
                 l1->BufferDeviceAddress());
 }
 
-DirectMemory::~DirectMemory() = default;
+DirectMemory::~DirectMemory() {
+    // PERF-GT7-127: the views go with this object; finds other threads remember of them must
+    // not be taken by a DirectMemory made later.
+    g_unmap_generation.fetch_add(1, std::memory_order_acq_rel);
+    g_release_worker.Drain(); // PERF-GT7-129: its releases use this device
+}
 
 bool DirectMemory::Enabled() {
     // D11: the direct renderer is the renderer (GPU.direct_renderer from older launchers is
@@ -209,6 +297,19 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
+    // PERF-GT7-127 (RYGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
+    // view ~10,000 times a frame, each time under the lock and down the map (2.5% of its busy
+    // time in the map walk alone), almost always for one of a few dozen views.
+    static const bool recent_on = [] {
+        const char* env = std::getenv("RYGT_DIRECT_FIND_RECENT");
+        return !(env && env[0] == '0');
+    }();
+    RecentFind& recent = t_recent_finds[(address >> 21) % t_recent_finds.size()];
+    if (recent_on && recent.buffer &&
+        recent.generation == g_unmap_generation.load(std::memory_order_acquire) &&
+        address >= recent.begin && address + size <= recent.end) {
+        return std::make_pair(recent.buffer, address - recent.begin);
+    }
     std::scoped_lock lk{mutex};
     auto it = views.upper_bound(address);
     if (it == views.begin()) {
@@ -218,6 +319,9 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     if (address < view.begin || address + size > view.end || !view.wrapper) {
         return std::nullopt;
     }
+    // Under the lock an unmap holds while it moves the generation on and drops its views.
+    recent = {g_unmap_generation.load(std::memory_order_acquire), view.begin, view.end,
+              view.wrapper.get()};
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
@@ -376,16 +480,23 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
     if (g_has_pending.load(std::memory_order_relaxed)) {
         // Aliases of unmapped views the GPU no longer uses.
         std::scoped_lock lk{g_pending_mutex};
-        const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+        // PERF-GT7-129: the ones the GPU is done with go to the release thread.
+        std::vector<PendingRelease> ready;
+        const bool async = ReleaseWorker::On();
         std::erase_if(g_pending, [&](PendingRelease& p) {
             if (!scheduler.IsFree(p.tick)) {
                 return false;
             }
-            p.wrapper.reset();
-            d.vkFreeMemory(instance.GetDevice(), p.memory, nullptr);
-            UnmapAlias()(p.alias);
+            if (async) {
+                ready.push_back(std::move(p));
+            } else {
+                ReleaseWorker::Release(instance.GetDevice(), p);
+            }
             return true;
         });
+        if (!ready.empty()) {
+            g_release_worker.Push(instance.GetDevice(), std::move(ready));
+        }
         g_has_pending.store(!g_pending.empty(), std::memory_order_relaxed);
     }
     const VAddr end = address + size;
