@@ -3,10 +3,6 @@
 
 #pragma once
 
-#include <atomic>
-#include <shared_mutex>
-#include <thread>
-
 #include "common/spin_mutex.h"
 
 #include <atomic>
@@ -16,8 +12,11 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
+#include <stop_token>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -696,7 +695,8 @@ private:
     static constexpr size_t MaxPrefetchedModules = 1024;
     u64 prefetched_evicted = 0; ///< under prefetched_mutex
 
-    // Last member, so the workers stop before anything they use is destroyed.
+    // Last member, so the workers stop before anything they use is destroyed. Made in the
+    // constructor and never replaced, so job threads may read the pointer (FinishBuildUnlocked).
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };
 
