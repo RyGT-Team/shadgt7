@@ -2318,6 +2318,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                                instance.IsShaderObjectEnabled());
         translate_stats.since = std::chrono::steady_clock::now();
     }
+    // Made here, not on the first build: job threads read the pointer without the lookup lock.
+    build_workers = std::make_unique<PipelineBuildWorkers>();
 }
 
 PipelineCache::~PipelineCache() {
