@@ -344,6 +344,7 @@ private:
         u64 hud_frame = ~u64{0};       ///< the frame HUD draws went to the layer in
         bool clear_pending = false;    ///< the next HUD draw clears both pictures first
         u64 race_frame = ~u64{0};      ///< the frame its HUD showed a race's maps
+        u32 scale = 1;                 ///< DLSS-GT7-001: the pictures' size over the display's
     };
     /// GT7-UW: small pictures drawn with a depth buffer, and the frame (a race HUD's track
     /// and course maps are drawn so every frame; menus' HUDs take none).
@@ -360,6 +361,10 @@ private:
         bool reset = true;   ///< the frame before that one had none
         float jitter[2]{};
         float mvec_scale[2]{};
+        /// The pass's result is replaced with this colour before the next draw into it or into
+        /// a display buffer (after the game's bloom and exposure passes read it).
+        const Native::ImageEntry* pending_color = nullptr;
+        const Native::ImageEntry* pending_out = nullptr;
         u64 seen = 0;     ///< passes noted
         u64 replaced = 0; ///< results replaced with the un-resolved colour
         u64 refused = 0;  ///< passes whose inputs or constants did not fit
@@ -368,7 +373,12 @@ private:
     /// Called at the end of a draw: notes the pass's inputs and replaces its result.
     void NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
                           const DrawBindings& b);
-    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like);
+    void ApplyTemporalReplace();
+    /// DLSS-GT7-001: the HUD split for this frame: a wide screen's, or a frame with the pass.
+    bool HudSplitNow() const;
+    /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.
+    u32 HudScale() const;
+    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1);
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,

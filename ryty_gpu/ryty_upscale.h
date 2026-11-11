@@ -89,6 +89,9 @@ inline bool NativeAA() {
 // written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
 //   RYGT_DLSS_TEMPORAL_KEY=0     no F9 key (F9 switches the prototype off and on while playing)
 //   RYGT_DLSS_TEMPORAL_TAA=1     the game's anti-aliasing result is kept (DLSS still gets the data)
+//   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
+//                                read the un-resolved colour too (the first prototype)
+//   RYGT_DLSS_TEMPORAL_HUD_SCALE=1  the HUD is drawn at the game's size, not twice it
 //   RYGT_DLSS_TEMPORAL_JITTER=x,y  factors applied to the jitter (default 1,1; -1 flips an axis)
 //   RYGT_DLSS_TEMPORAL_MVEC=x,y    factors applied to the motion vectors (default 1,1)
 

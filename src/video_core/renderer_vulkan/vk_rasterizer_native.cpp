@@ -925,9 +925,36 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     ForgetBindings(s); // OPT-014
 }
 
-Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
+// DLSS-GT7-001: with the temporal prototype the HUD is only split in a frame that had the game's
+// temporal pass (a race). Menus keep their pictures as they are drawn: split, their 2D pages
+// came out wrong (seen by the user on 2026-11-11).
+bool NativeRenderer::HudSplitNow() const {
+    return HudSplitOn() && (RytyDisplayAspect() > 0.0f || temporal.frame == frame);
+}
+
+// DLSS-GT7-001: the prototype's HUD pictures are twice the display's size, and the HUD's draws
+// get their viewports and scissors doubled, so a 1920x1080 HUD is drawn at 3840x2160 instead of
+// being stretched (the user saw it "left in low resolution" beside the DLSS picture). The draws
+// that give screen positions use a 16384-wide viewport: doubled, it needs 32768 (NVIDIA has it;
+// without it the HUD stays at the display's size).
+u32 NativeRenderer::HudScale() const {
+    static const bool wanted = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_SCALE");
+        return !(env && env[0] == '1');
+    }();
+    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f) {
+        return 1;
+    }
+    return r.instance.GetMaxViewportWidth() >= 32768 && r.instance.GetMaxViewportHeight() >= 32768
+               ? 2
+               : 1;
+}
+
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale) {
     auto* entry = new Native::ImageEntry{};
     entry->info = like.info;
+    entry->info.size.width *= scale;
+    entry->info.size.height *= scale;
     Native::MadeImage made = MakeImage(entry->info, true);
     if (!made.image) {
         delete entry;
@@ -9136,11 +9163,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
+    // DLSS-GT7-001: the temporal pass's result is replaced before the first draw into it or
+    // into a display buffer.
+    if (temporal.pending_out) {
+        bool due = targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        for (const auto* color : targets.colors) {
+            due |= color == temporal.pending_out;
+        }
+        if (due) {
+            ApplyTemporalReplace();
+        }
+    }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
     // drawn into the display's black and white HUD pictures instead.
     std::optional<RenderState> hud_black_state;
     std::optional<RenderState> hud_white_state;
     HudLayer* hud_layer = nullptr;
+    u32 hud_scale = 1; // DLSS-GT7-001
     // (Multisampled, as a race's track and course maps are; a menu's small pictures drawn with
     // depth, like the World Map's 256x256 probe, are not.)
     if (HudSplitOn() && targets.colors[0] && targets.depth &&
@@ -9148,15 +9187,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
         hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
     }
-    if (HudSplitOn() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+    if (HudSplitNow() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
         HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
         if (layer.composite_frame != frame) {
             layer.composite_frame = frame;
             layer.clear_pending = true;
             if (!layer.black) {
-                layer.black = MakeHudPicture(*targets.colors[0]);
-                layer.white = MakeHudPicture(*targets.colors[0]);
+                layer.scale = HudScale(); // DLSS-GT7-001
+                layer.black = MakeHudPicture(*targets.colors[0], layer.scale);
+                layer.white = MakeHudPicture(*targets.colors[0], layer.scale);
             }
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
@@ -9178,6 +9218,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 layer.clear_pending = false;
                 layer.hud_frame = frame;
                 hud_layer = &layer;
+                if (layer.scale > 1) { // DLSS-GT7-001: larger pictures, larger render area
+                    hud_scale = layer.scale;
+                    for (auto* state : {&*hud_black_state, &*hud_white_state}) {
+                        state->width = static_cast<u16>(state->width * hud_scale);
+                        state->height = static_cast<u16>(state->height * hud_scale);
+                    }
+                }
             }
         }
     }
@@ -9490,6 +9537,26 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             r.ctx->attachment_feedback_loop |= vk::ImageAspectFlagBits::eDepth;
         }
         r.UpdateViewportScissorState();
+        if (hud_scale > 1 && hud_black_state) {
+            // DLSS-GT7-001: the HUD's pictures are hud_scale times the display's size.
+            const float k = static_cast<float>(hud_scale);
+            auto viewports = s.dynamic.viewports;
+            for (auto& viewport : viewports) {
+                viewport.x *= k;
+                viewport.y *= k;
+                viewport.width *= k;
+                viewport.height *= k;
+            }
+            s.dynamic.SetViewports(viewports);
+            auto scissors = s.dynamic.scissors;
+            for (auto& scissor : scissors) {
+                scissor.offset.x *= static_cast<s32>(hud_scale);
+                scissor.offset.y *= static_cast<s32>(hud_scale);
+                scissor.extent.width *= hud_scale;
+                scissor.extent.height *= hud_scale;
+            }
+            s.dynamic.SetScissors(scissors);
+        }
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
         r.UpdateRasterizationState();
@@ -9877,7 +9944,29 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         refuse("no colour picture of the result's format to replace it with (data still used)");
         return;
     }
-    Stream& s = stream;
+    // The game's bloom and exposure passes read the pass's result right after it, at a quarter
+    // of its size and less: they keep the game's resolved picture (steady from frame to frame;
+    // on the un-resolved one the highlights of car bodies flickered, seen by the user on
+    // 2026-11-11), and the result is replaced before the next draw into it or into a display
+    // buffer, which is the tone mapping. RYGT_DLSS_TEMPORAL_BLOOM=0: replaced at once.
+    static const bool late = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_BLOOM");
+        return !(env && env[0] == '0');
+    }();
+    temporal.pending_color = color;
+    temporal.pending_out = out;
+    if (!late) {
+        ApplyTemporalReplace();
+    }
+}
+
+void NativeRenderer::ApplyTemporalReplace() {
+    const Native::ImageEntry* color = std::exchange(temporal.pending_color, nullptr);
+    const Native::ImageEntry* out = std::exchange(temporal.pending_out, nullptr);
+    if (!color || !out) {
+        return;
+    }
+    Stream& s = Begin();
     GlobalBarrier();
     const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
                                             .mipLevel = 0,
@@ -12808,6 +12897,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.hud_race = it->second.race_frame + 1 == frame;
         }
     }
+    // DLSS-GT7-001: a result no draw came to replace stays the game's.
+    temporal.pending_color = nullptr;
+    temporal.pending_out = nullptr;
     // DLSS-GT7-001: the depth and motion vectors of the frame just finished, when it had the
     // game's temporal pass and they are the display's size.
     if (RytyUpscale::TemporalActive() && temporal.frame + 1 == frame && temporal.depth &&
