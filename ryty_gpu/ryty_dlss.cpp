@@ -180,7 +180,8 @@ void Pass::Create(vk::Device device_, VmaAllocator allocator_, u32 num_images) {
 
 vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                            vk::Format input_format, vk::Extent2D input_size,
-                           vk::Extent2D output_size) {
+                           vk::Extent2D output_size,
+                           const RytyUpscale::TemporalInputs* temporal) {
     if ((!g_plugin.ready && !g_streamline) || failed) {
         return input;
     }
@@ -251,7 +252,7 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
         g_streamline
             ? RytyDlssG::Upscale(device, allocator, cmdbuf, input_image, input, input_format,
                                  input_size, img.output_image, img.output_image_view.get(),
-                                 vk::Format::eR16G16B16A16Sfloat, output_size)
+                                 vk::Format::eR16G16B16A16Sfloat, output_size, temporal)
             : g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) == 0;
     if (!ok) {
         // The output was not written; stop trying and let FSR (or plain scaling) take over.

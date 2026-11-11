@@ -26,6 +26,7 @@
 #include "common/diagnostics.h"
 #include "common/types.h"
 #include "ryty_gpu/native/same_texel.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -129,6 +130,9 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
+        /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
+        std::optional<RytyUpscale::TemporalInputs> temporal;
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
 
@@ -346,6 +350,24 @@ private:
     std::unordered_map<VAddr, u64> hud_depth_drawn; ///< by address
     std::unordered_map<VAddr, HudLayer> hud_layers;
     static bool HudSplitOn();
+
+    /// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): what GT7's temporal anti-aliasing pass
+    /// read in the frame being drawn, for the presenter's DLSS pass (ryty_upscale.h).
+    struct TemporalCapture {
+        const Native::ImageEntry* depth = nullptr;
+        const Native::ImageEntry* motion = nullptr;
+        u64 frame = ~u64{0}; ///< the frame the pass was last seen in
+        bool reset = true;   ///< the frame before that one had none
+        float jitter[2]{};
+        float mvec_scale[2]{};
+        u64 seen = 0;     ///< passes noted
+        u64 replaced = 0; ///< results replaced with the un-resolved colour
+        u64 refused = 0;  ///< passes whose inputs or constants did not fit
+    };
+    TemporalCapture temporal;
+    /// Called at the end of a draw: notes the pass's inputs and replaces its result.
+    void NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
+                          const DrawBindings& b);
     Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like);
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);

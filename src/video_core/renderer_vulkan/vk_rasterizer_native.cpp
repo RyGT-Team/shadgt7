@@ -847,7 +847,10 @@ float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HUD_SPLIT");
-        return RytyDisplayAspect() > 0.0f && !(env && env[0] == '0');
+        // DLSS-GT7-001: the temporal prototype wants the HUD out of the picture DLSS scales (its
+        // pixels would take the scene's motion vectors); it is laid over the result as here.
+        return (RytyDisplayAspect() > 0.0f || RytyUpscale::TemporalRequested()) &&
+               !(env && env[0] == '0');
     }();
     return on;
 }
@@ -9766,8 +9769,133 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         ++stats.indirect_draws;
     }
     ++s.commands;
+    if (RytyUpscale::TemporalActive()) {
+        NoteTemporalDraw(*pipeline, targets, b); // DLSS-GT7-001
+    }
     ChunkFlushCheck();
     Report();
+}
+
+// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1; see ryty_upscale.h): GT7's temporal
+// anti-aliasing pass in a race. Its pixel shader 0xcfa125dd reads the depth, the motion vectors
+// (RG16F, written by every scene draw as a second target), the frame's colour and the history,
+// and writes the new history (target 0) and the resolved picture (target 1). Its constants hold
+// the frame's jitter: the shader samples at position - c14*c20, - c15*c21 (c14/c15 turn motion
+// units into pixels: 960, -540 at 1920x1080; c20/c21 follow a 49-frame sequence within +-0.25
+// pixel), and reads the history at position - motion * (c14, c15). Measured in two of the user's
+// races on 2026-11-11 (dry and rain, chase and cockpit views); the frame of a camera cut has no
+// such pass, which is the history reset. The pictures are noted for the presenter's DLSS pass,
+// and the resolved picture is replaced with the un-resolved colour, so that what reaches DLSS
+// still carries the jitter (RYGT_DLSS_TEMPORAL_TAA=1 keeps the game's result).
+void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
+                                      const DrawBindings& b) {
+    constexpr u64 Gt7TemporalAa = 0xcfa125dd;
+    const Shader::Info* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fs || fs->pgm_hash != Gt7TemporalAa) {
+        return;
+    }
+    const auto refuse = [&](const char* why) {
+        if (temporal.refused++ < 8) {
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: the temporal pass is not used: {}",
+                        frame, why);
+        }
+    };
+    const Native::ImageEntry* out = targets.colors[1];
+    if (!out) {
+        refuse("no second colour target");
+        return;
+    }
+    const Native::ImageEntry* depth = nullptr;
+    const Native::ImageEntry* motion = nullptr;
+    const Native::ImageEntry* color = nullptr;
+    for (const auto* entry : b.sampled) {
+        if (!entry || entry->info.size.width != out->info.size.width ||
+            entry->info.size.height != out->info.size.height) {
+            continue;
+        }
+        if (entry->info.props.is_depth) {
+            depth = entry;
+        } else if (entry->info.pixel_format == vk::Format::eR16G16Sfloat) {
+            motion = entry;
+        } else if (entry != out && entry != targets.colors[0] &&
+                   entry->image->Desc().format == out->image->Desc().format) {
+            color = entry;
+        }
+    }
+    if (!depth || !motion) {
+        refuse("no depth or no RG16F motion picture of the result's size among its textures");
+        return;
+    }
+    // The constants: the stage's first guest buffer (128 bytes of floats).
+    std::array<float, 24> c{};
+    bool read = false;
+    for (const auto& desc : fs->buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(*fs);
+        const u64 base = vsharp.base_address;
+        read = base != 0 && vsharp.GetSize() >= sizeof(c) &&
+               Core::RytyMemory::GuardedCopy(c.data(), reinterpret_cast<const void*>(base),
+                                             sizeof(c));
+        break;
+    }
+    const float width = static_cast<float>(out->info.size.width);
+    const float height = static_cast<float>(out->info.size.height);
+    const float jitter_x = -c[14] * c[20];
+    const float jitter_y = -c[15] * c[21];
+    if (!read || !std::isfinite(jitter_x) || !std::isfinite(jitter_y) ||
+        std::abs(jitter_x) > 1.0f || std::abs(jitter_y) > 1.0f || c[14] == 0.0f || c[15] == 0.0f ||
+        std::abs(c[14]) > width || std::abs(c[15]) > height) {
+        refuse("its constants are unreadable or not the ones measured");
+        return;
+    }
+    if (temporal.frame != frame) {
+        temporal.reset = temporal.frame + 1 != frame;
+    }
+    temporal.depth = depth;
+    temporal.motion = motion;
+    temporal.frame = frame;
+    temporal.jitter[0] = jitter_x;
+    temporal.jitter[1] = jitter_y;
+    // motion * (c14, c15) = current - previous position in pixels; DLSS wants the opposite.
+    temporal.mvec_scale[0] = -c[14] / width;
+    temporal.mvec_scale[1] = -c[15] / height;
+    if (temporal.seen++ < 4) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: frame {}: temporal pass, depth {:#x} motion {:#x} colour {:#x} "
+                    "-> {:#x} {}x{}, c14 {} c15 {}, jitter {:.4f},{:.4f} px{}",
+                    frame, depth->info.guest_address, motion->info.guest_address,
+                    color ? color->info.guest_address : 0, out->info.guest_address,
+                    out->info.size.width, out->info.size.height, c[14], c[15], jitter_x, jitter_y,
+                    temporal.reset ? ", after a frame without one" : "");
+    }
+    if (!RytyUpscale::TemporalReplacesTaa()) {
+        return;
+    }
+    if (!color) {
+        refuse("no colour picture of the result's format to replace it with (data still used)");
+        return;
+    }
+    Stream& s = stream;
+    GlobalBarrier();
+    const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1};
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .dstSubresource = layers,
+        .extent{out->info.size.width, out->info.size.height, 1},
+    };
+    const vk::Image src_image{Handle<VkImage_T>(color->image->NativeHandle())};
+    const vk::Image dst_image{Handle<VkImage_T>(out->image->NativeHandle())};
+    CmdBuf{s.cmd}.copyImage(src_image, vk::ImageLayout::eGeneral, dst_image,
+                            vk::ImageLayout::eGeneral, copy);
+    Written(out);
+    s.buffers_written = true;
+    ++s.commands;
+    ++temporal.replaced;
 }
 
 std::optional<NativeRenderer::IndirectBuffers> NativeRenderer::ResolveIndirect(
@@ -12678,6 +12806,32 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
             display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
             display.hud_race = it->second.race_frame + 1 == frame;
+        }
+    }
+    // DLSS-GT7-001: the depth and motion vectors of the frame just finished, when it had the
+    // game's temporal pass and they are the display's size.
+    if (RytyUpscale::TemporalActive() && temporal.frame + 1 == frame && temporal.depth &&
+        temporal.motion && temporal.depth->info.size.width == entry->info.size.width &&
+        temporal.depth->info.size.height == entry->info.size.height) {
+        VideoCore::ImageViewInfo depth_info{};
+        depth_info.format = vk::Format::eR32Sfloat;
+        VideoCore::ImageViewInfo motion_info{};
+        motion_info.format = vk::Format::eR16G16Sfloat;
+        RytyUpscale::TemporalInputs inputs{};
+        inputs.depth = vk::Image{Handle<VkImage_T>(temporal.depth->image->NativeHandle())};
+        inputs.depth_view = View(*temporal.depth, depth_info, ViewUse::Sampled);
+        inputs.depth_format = static_cast<vk::Format>(temporal.depth->image->Desc().format);
+        inputs.motion = vk::Image{Handle<VkImage_T>(temporal.motion->image->NativeHandle())};
+        inputs.motion_view = View(*temporal.motion, motion_info, ViewUse::Sampled);
+        inputs.motion_format = static_cast<vk::Format>(temporal.motion->image->Desc().format);
+        inputs.size = vk::Extent2D{entry->info.size.width, entry->info.size.height};
+        inputs.jitter[0] = temporal.jitter[0];
+        inputs.jitter[1] = temporal.jitter[1];
+        inputs.mvec_scale[0] = temporal.mvec_scale[0];
+        inputs.mvec_scale[1] = temporal.mvec_scale[1];
+        inputs.reset = temporal.reset;
+        if (inputs.depth_view && inputs.motion_view) {
+            display.temporal = inputs;
         }
     }
     VerifyMirrors(); // FIX-176 (diagnosis)

@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 
+#include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 // ryGT: the size DLSS and FSR 3.1 scale the game picture to (RYGT_UPSCALE_QUALITY, set by the
@@ -75,6 +77,85 @@ inline vk::Extent2D Target(vk::Extent2D input, vk::Extent2D window) {
 /// Whether the upscaler should run at the picture's own size (DLAA / FSR native AA).
 inline bool NativeAA() {
     return GetQuality() == Quality::Native;
+}
+
+// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1, off by default): DLSS fed with the game's own
+// depth, motion vectors and sub-pixel jitter instead of a flat depth, zero motion and a history
+// reset every frame. GT7's race draws a jittered 1920x1080 scene (49 positions of +-0.25 pixel)
+// with a motion-vector target, and resolves it with its own temporal anti-aliasing pass (pixel
+// shader 0xcfa125dd); the native renderer notes that pass's inputs and replaces its result with
+// the frame's un-resolved colour, so DLSS, at the present, gets jittered frames it can
+// accumulate. Elsewhere (menus, a frame without that pass) DLSS runs as before. Measured and
+// written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
+//   RYGT_DLSS_TEMPORAL_KEY=0     no F9 key (F9 switches the prototype off and on while playing)
+//   RYGT_DLSS_TEMPORAL_TAA=1     the game's anti-aliasing result is kept (DLSS still gets the data)
+//   RYGT_DLSS_TEMPORAL_JITTER=x,y  factors applied to the jitter (default 1,1; -1 flips an axis)
+//   RYGT_DLSS_TEMPORAL_MVEC=x,y    factors applied to the motion vectors (default 1,1)
+
+/// The frame's inputs for a temporal upscale, all at the game picture's size.
+struct TemporalInputs {
+    vk::Image depth;
+    vk::ImageView depth_view; ///< depth aspect; larger = nearer (GT7 draws reversed depth)
+    vk::Format depth_format;
+    vk::Image motion;
+    vk::ImageView motion_view;
+    vk::Format motion_format;
+    vk::Extent2D size;
+    float jitter[2];     ///< this frame's jitter in pixels: the scene's shift, x right, y down
+    float mvec_scale[2]; ///< motion * scale = (previous - current position) / picture size
+    bool reset;          ///< the frame before had no such pass (a camera cut): history starts over
+};
+
+/// RYGT_DLSS_TEMPORAL=1 was set for this run.
+inline bool TemporalRequested() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+inline std::atomic<bool>& TemporalSwitch() {
+    static std::atomic<bool> on{true};
+    return on;
+}
+
+/// What the last DLSS pass ran with, for the FPS counter: 0 a single frame (as without the
+/// prototype), 1 the game's depth, motion vectors and jitter.
+inline std::atomic<int>& TemporalStatus() {
+    static std::atomic<int> status{0};
+    return status;
+}
+
+/// The prototype is requested and not switched off with its key.
+inline bool TemporalActive() {
+    return TemporalRequested() && TemporalSwitch().load(std::memory_order_relaxed);
+}
+
+/// The game's anti-aliasing result is replaced with the un-resolved colour.
+inline bool TemporalReplacesTaa() {
+    static const bool keep = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_TAA");
+        return env && env[0] == '1';
+    }();
+    return !keep;
+}
+
+/// The two factors of RYGT_DLSS_TEMPORAL_JITTER or _MVEC (1,1 when unset or unreadable).
+inline void TemporalFactors(const char* name, float out[2]) {
+    out[0] = out[1] = 1.0f;
+    if (const char* env = std::getenv(name); env && *env) {
+        char* end = nullptr;
+        const float x = std::strtof(env, &end);
+        if (end != env && *end == ',') {
+            const char* second = end + 1;
+            const float y = std::strtof(second, &end);
+            if (end != second && std::isfinite(x) && std::isfinite(y)) {
+                out[0] = x;
+                out[1] = y;
+            }
+        }
+    }
 }
 
 } // namespace Vulkan::RytyUpscale

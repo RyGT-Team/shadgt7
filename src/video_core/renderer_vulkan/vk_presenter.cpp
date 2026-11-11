@@ -1362,8 +1362,23 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool scaled = false;
     const vk::Extent2D upscale_target =
         RytyUpscale::Target(image_size, {frame->width, frame->height});
-    if (const auto dlss_view = dlss_pass.Render(pass_cmdbuf, display->image, image_view,
-                                                view_format, image_size, upscale_target);
+    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): F9 switches it off and on while playing.
+    if (RytyUpscale::TemporalRequested()) {
+        static const bool key = [] {
+            const char* env = std::getenv("RYGT_DLSS_TEMPORAL_KEY");
+            return !(env && env[0] == '0');
+        }();
+#ifdef _WIN32
+        if (key && (GetAsyncKeyState(0x78 /* F9 */) & 1)) {
+            const bool on = !RytyUpscale::TemporalSwitch().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalSwitch().store(on, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: F9, temporal DLSS {}", on ? "on" : "off");
+        }
+#endif
+    }
+    if (const auto dlss_view = dlss_pass.Render(
+            pass_cmdbuf, display->image, image_view, view_format, image_size, upscale_target,
+            display->temporal ? &*display->temporal : nullptr);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;

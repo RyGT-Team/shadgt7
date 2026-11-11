@@ -619,7 +619,8 @@ bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output) {
 bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
-             vk::Format output_format, vk::Extent2D output_size) {
+             vk::Format output_format, vk::Extent2D output_size,
+             const RytyUpscale::TemporalInputs* temporal) {
     if (!UpscaleSupports(input_size, output_size)) {
         return false;
     }
@@ -642,6 +643,16 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!g_sl.sr.Ready(input_size)) {
         CreateAuxImages(g_sl.sr, device, allocator, cmdbuf, input_size);
     }
+    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1; ryty_upscale.h): with the frame's own depth,
+    // motion vectors and jitter, DLSS keeps its history from frame to frame. A refusal from
+    // Streamline ends the prototype for the run, and the frame is scaled as before.
+    static bool temporal_refused = false;
+    static bool last_temporal = false;
+    static u64 temporal_frames = 0;
+    static u64 flat_frames = 0;
+    const bool use_temporal = temporal && !temporal_refused && temporal->size == input_size &&
+                              temporal->depth_view && temporal->motion_view;
+    const auto run = [&](const RytyUpscale::TemporalInputs* t) -> bool {
     sl::FrameToken* frame{};
     ++g_sl.frame_index;
     if (g_sl.new_frame_token(frame, &g_sl.frame_index) != sl::Result::eOk || !frame) {
@@ -653,7 +664,34 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
 
     // No motion vectors: every frame starts DLSS's history over, like the plugin.
-    g_sl.set_constants(FlatConstants(input_size, true), *frame, viewport);
+    sl::Constants constants = FlatConstants(input_size, true);
+    if (t) {
+        static const std::array<float, 4> factors = [] {
+            std::array<float, 4> f{};
+            RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_JITTER", &f[0]);
+            RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_MVEC", &f[2]);
+            return f;
+        }();
+        const bool reset = t->reset || !last_temporal;
+        constants.jitterOffset = sl::float2(t->jitter[0] * factors[0], t->jitter[1] * factors[1]);
+        constants.mvecScale =
+            sl::float2(t->mvec_scale[0] * factors[2], t->mvec_scale[1] * factors[3]);
+        constants.depthInverted = sl::Boolean::eTrue;
+        constants.cameraMotionIncluded = sl::Boolean::eTrue;
+        constants.motionVectorsJittered = sl::Boolean::eFalse;
+        constants.motionVectorsDilated = sl::Boolean::eFalse;
+        constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        if (temporal_frames < 4 || (reset && temporal_frames % 16 == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: temporal frame {}: jitter {:.4f},{:.4f} px, motion scale "
+                        "{:.4f},{:.4f}, depth {} motion {}, {}x{}{}",
+                        temporal_frames, constants.jitterOffset.x, constants.jitterOffset.y,
+                        constants.mvecScale.x, constants.mvecScale.y,
+                        vk::to_string(t->depth_format), vk::to_string(t->motion_format),
+                        t->size.width, t->size.height, reset ? ", history reset" : "");
+        }
+    }
+    g_sl.set_constants(constants, *frame, viewport);
 
     constexpr auto aux_usage = vk::ImageUsageFlagBits::eSampled |
                                vk::ImageUsageFlagBits::eTransferDst |
@@ -676,6 +714,19 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     sl::Resource depth = Texture(g_sl.sr.depth, *g_sl.sr.depth_view,
                                  vk::ImageLayout::eShaderReadOnlyOptimal, input_size,
                                  vk::Format::eR32Sfloat, aux_usage);
+    if (t) {
+        // The game's own pictures: native mode keeps them in the general layout, and the next
+        // frame draws into them again, so they are only promised until the evaluate.
+        mvec = Texture(t->motion, t->motion_view, vk::ImageLayout::eGeneral, input_size,
+                       t->motion_format,
+                       vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment);
+        depth = Texture(t->depth, t->depth_view, vk::ImageLayout::eGeneral, input_size,
+                        t->depth_format,
+                        vk::ImageUsageFlagBits::eSampled |
+                            vk::ImageUsageFlagBits::eDepthStencilAttachment);
+    }
+    const auto aux_life = t ? sl::ResourceLifecycle::eValidUntilEvaluate
+                            : sl::ResourceLifecycle::eValidUntilPresent;
     const sl::Extent in_extent{0, 0, input_size.width, input_size.height};
     const sl::Extent out_extent{0, 0, output_size.width, output_size.height};
     const sl::ResourceTag tags[] = {
@@ -683,10 +734,8 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                         sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent},
         sl::ResourceTag{&color_out, sl::kBufferTypeScalingOutputColor,
                         sl::ResourceLifecycle::eValidUntilEvaluate, &out_extent},
-        sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors,
-                        sl::ResourceLifecycle::eValidUntilPresent, &in_extent},
-        sl::ResourceTag{&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
-                        &in_extent},
+        sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors, aux_life, &in_extent},
+        sl::ResourceTag{&depth, sl::kBufferTypeDepth, aux_life, &in_extent},
     };
     auto* command_buffer =
         reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(cmdbuf));
@@ -700,11 +749,38 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *frame, inputs,
                                             static_cast<u32>(std::size(inputs)), command_buffer);
     if (result != sl::Result::eOk) {
-        LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline's DLSS failed (result {})",
-                  static_cast<int>(result));
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline's DLSS failed (result {}){}",
+                  static_cast<int>(result), t ? " with the game's depth and motion vectors" : "");
         return false;
     }
     return true;
+    };
+    bool ok = false;
+    if (use_temporal) {
+        ok = run(temporal);
+        if (!ok) {
+            temporal_refused = true;
+            LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the temporal inputs were refused; DLSS runs "
+                                     "on single frames for the rest of this run");
+        }
+    }
+    const bool ran_temporal = ok;
+    if (!ok) {
+        ok = run(nullptr);
+    }
+    if (ok) {
+        if (ran_temporal != last_temporal && RytyUpscale::TemporalRequested()) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: DLSS now runs {} ({} temporal frames, {} single so far)",
+                        ran_temporal ? "with the game's depth, motion vectors and jitter"
+                                     : "on single frames",
+                        temporal_frames, flat_frames);
+        }
+        ++(ran_temporal ? temporal_frames : flat_frames);
+        last_temporal = ran_temporal;
+        RytyUpscale::TemporalStatus().store(ran_temporal ? 1 : 0, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 void PresentStart() {
