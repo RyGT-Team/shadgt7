@@ -984,8 +984,9 @@ Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& lik
     };
     s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
                                               .pImageMemoryBarriers = &barrier});
-    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{})",
-             like.info.guest_address, like.info.size.width, like.info.size.height);
+    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{}), {}x{}",
+             like.info.guest_address, like.info.size.width, like.info.size.height,
+             entry->info.size.width, entry->info.size.height);
     return entry;
 }
 
