@@ -1369,11 +1369,16 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             return !(env && env[0] == '0');
         }();
 #ifdef _WIN32
-        if (key && (GetAsyncKeyState(0x78 /* F9 */) & 1)) {
+        // The key's state now, and a press when it goes down (the "pressed since the last
+        // call" bit is shared with every other program that asks).
+        static bool was_down = false;
+        const bool down = key && (GetAsyncKeyState(0x78 /* F9 */) & 0x8000) != 0;
+        if (down && !was_down) {
             const bool on = !RytyUpscale::TemporalSwitch().load(std::memory_order_relaxed);
             RytyUpscale::TemporalSwitch().store(on, std::memory_order_relaxed);
             LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: F9, temporal DLSS {}", on ? "on" : "off");
         }
+        was_down = down;
 #endif
     }
     if (const auto dlss_view = dlss_pass.Render(
