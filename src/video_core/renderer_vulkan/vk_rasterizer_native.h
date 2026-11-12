@@ -426,12 +426,16 @@ private:
     void TemporalSwapOut();
     void CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to);
     /// A picture of the prototype's own like another, made again when the size changes.
-    Native::ImageEntry* TemporalPicture(Native::ImageEntry*& slot, const Native::ImageEntry& like);
+    /// size: the picture's size, when not like's.
+    Native::ImageEntry* TemporalPicture(Native::ImageEntry*& slot, const Native::ImageEntry& like,
+                                        vk::Extent2D size = {});
     /// DLSS-GT7-001: the HUD split for this frame: a wide screen's, or a frame with the pass.
     bool HudSplitNow() const;
     /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.
     u32 HudScale() const;
-    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1);
+    /// size: the picture's size before scale, when not like's.
+    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1,
+                                       vk::Extent2D size = {});
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,

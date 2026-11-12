@@ -818,13 +818,19 @@ NativeRenderer::~NativeRenderer() {
 // GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
 namespace {
 std::array<std::atomic<VAddr>, 16> g_display_addresses{};
+/// DLSS-GT7-001: the size each was registered with (width << 32 | height; 0 unknown).
+std::array<std::atomic<u64>, 16> g_display_sizes{};
 } // namespace
 
-void NoteDisplayAddress(VAddr address) {
-    for (auto& slot : g_display_addresses) {
+void NoteDisplayAddress(VAddr address, u32 width, u32 height) {
+    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
+        auto& slot = g_display_addresses[i];
         VAddr expected = 0;
         if (slot.load(std::memory_order_relaxed) == address ||
             slot.compare_exchange_strong(expected, address)) {
+            if (width != 0 && height != 0) {
+                g_display_sizes[i].store((u64{width} << 32) | height, std::memory_order_relaxed);
+            }
             return;
         }
     }
@@ -844,6 +850,31 @@ static bool IsDisplayAddress(VAddr address) {
 }
 
 float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+
+// DLSS-GT7-001: the part of a picture drawn at a display buffer's address that the screen shows:
+// the size the buffer was registered with, from the top left corner. In the PS4 Pro mode GT7
+// draws into a 3840x2160 surface and shows its 1920x1080 or 3200x1800 corner (NEO-GT7-006); the
+// prototype's pictures standing for the display (HUD pictures, the scene drawn beside, the scene
+// before a menu's interface) are made that size, so they match what FindDisplay shows. Elsewhere
+// the picture's own size.
+static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
+    vk::Extent2D size{picture.info.size.width, picture.info.size.height};
+    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
+        const VAddr value = g_display_addresses[i].load(std::memory_order_relaxed);
+        if (value == 0) {
+            break;
+        }
+        if (value == picture.info.guest_address) {
+            const u64 shown = g_display_sizes[i].load(std::memory_order_relaxed);
+            if (shown != 0) {
+                size.width = std::min(size.width, static_cast<u32>(shown >> 32));
+                size.height = std::min(size.height, static_cast<u32>(shown & 0xffffffffu));
+            }
+            break;
+        }
+    }
+    return size;
+}
 
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
@@ -982,9 +1013,14 @@ u32 NativeRenderer::HudScale() const {
                : 1;
 }
 
-Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale) {
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale,
+                                                   vk::Extent2D size) {
     auto* entry = new Native::ImageEntry{};
     entry->info = like.info;
+    if (size.width != 0 && size.height != 0) {
+        entry->info.size.width = size.width;
+        entry->info.size.height = size.height;
+    }
     entry->info.size.width *= scale;
     entry->info.size.height *= scale;
     Native::MadeImage made = MakeImage(entry->info, true);
@@ -9239,13 +9275,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                                               r.liverpool->DrawCbExtent(0)};
                 if (to_display) {
                     Native::ImageEntry* raw =
-                        single ? TemporalPicture(temporal.raw_display, *targets.colors[0])
+                        single ? TemporalPicture(temporal.raw_display, *targets.colors[0],
+                                                 ShownPart(*targets.colors[0]))
                                : nullptr;
                     const vk::ImageView view =
                         raw ? View(*raw, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
                     if (view) {
                         raw_scene_state = targets.state;
                         raw_scene_state->color_attachments[0].image_view = view;
+                        // (the shown part only: a PS4 Pro surface is larger, NEO-GT7-006)
+                        raw_scene_state->width = static_cast<u16>(
+                            std::min<u32>(raw_scene_state->width, raw->info.size.width));
+                        raw_scene_state->height = static_cast<u16>(
+                            std::min<u32>(raw_scene_state->height, raw->info.size.height));
                     } else {
                         TemporalSwapOut(); // nothing for DLSS in this frame
                     }
@@ -9304,7 +9346,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
                 const u32 slot = static_cast<u32>(frame & 1);
                 if (Native::ImageEntry* scene =
-                        TemporalPicture(temporal.ui_scene[slot], *targets.colors[0])) {
+                        TemporalPicture(temporal.ui_scene[slot], *targets.colors[0],
+                                        ShownPart(*targets.colors[0]))) {
                     CopyPicture(*targets.colors[0], *scene);
                     temporal.ui_scene_frame = frame;
                     temporal.ui_scene_slot = slot;
@@ -9336,7 +9379,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if (layer.composite_frame != frame) {
             layer.composite_frame = frame;
             layer.clear_pending = true;
-            if (!layer.black || layer.scale != HudScale()) {
+            // DLSS-GT7-001: the shown part of the display (ShownPart), times the HUD's scale.
+            const vk::Extent2D shown = ShownPart(*targets.colors[0]);
+            const u32 scale = HudScale();
+            if (!layer.black || layer.scale != scale ||
+                layer.black->info.size.width != shown.width * scale ||
+                layer.black->info.size.height != shown.height * scale) {
                 // DLSS-GT7-001: made again when End changes their size (the old ones are kept:
                 // recorded commands may still name them).
                 if (layer.black) {
@@ -9345,9 +9393,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 if (layer.white) {
                     temporal.retired.push_back(layer.white);
                 }
-                layer.scale = HudScale();
-                layer.black = MakeHudPicture(*targets.colors[0], layer.scale);
-                layer.white = MakeHudPicture(*targets.colors[0], layer.scale);
+                layer.scale = scale;
+                layer.black = MakeHudPicture(*targets.colors[0], layer.scale, shown);
+                layer.white = MakeHudPicture(*targets.colors[0], layer.scale, shown);
             }
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
@@ -9369,12 +9417,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 layer.clear_pending = false;
                 layer.hud_frame = frame;
                 hud_layer = &layer;
-                if (layer.scale > 1) { // DLSS-GT7-001: larger pictures, larger render area
+                // DLSS-GT7-001: larger pictures, larger render area; never past the pictures
+                // (made the shown part's size: a PS4 Pro surface is larger, NEO-GT7-006).
+                if (layer.scale > 1) {
                     hud_scale = layer.scale;
-                    for (auto* state : {&*hud_black_state, &*hud_white_state}) {
-                        state->width = static_cast<u16>(state->width * hud_scale);
-                        state->height = static_cast<u16>(state->height * hud_scale);
-                    }
+                }
+                for (auto* state : {&*hud_black_state, &*hud_white_state}) {
+                    state->width = static_cast<u16>(std::min<u32>(
+                        u32{state->width} * layer.scale, layer.black->info.size.width));
+                    state->height = static_cast<u16>(std::min<u32>(
+                        u32{state->height} * layer.scale, layer.black->info.size.height));
                 }
             }
         }
@@ -10379,15 +10431,18 @@ void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::I
 }
 
 Native::ImageEntry* NativeRenderer::TemporalPicture(Native::ImageEntry*& slot,
-                                                    const Native::ImageEntry& like) {
-    if (slot && (slot->info.size.width != like.info.size.width ||
-                 slot->info.size.height != like.info.size.height ||
+                                                    const Native::ImageEntry& like,
+                                                    vk::Extent2D size) {
+    if (size.width == 0 || size.height == 0) {
+        size = vk::Extent2D{like.info.size.width, like.info.size.height};
+    }
+    if (slot && (slot->info.size.width != size.width || slot->info.size.height != size.height ||
                  slot->image->Desc().format != like.image->Desc().format)) {
         temporal.retired.push_back(slot); // commands recorded may still name it
         slot = nullptr;
     }
     if (!slot) {
-        slot = MakeHudPicture(like);
+        slot = MakeHudPicture(like, 1, size);
     }
     return slot;
 }
