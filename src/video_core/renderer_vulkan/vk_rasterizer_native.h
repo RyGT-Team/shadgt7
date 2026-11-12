@@ -378,6 +378,9 @@ private:
         bool mirror = false;        ///< the frame being drawn is such a frame
         bool white_inline = false;  ///< else: the HUD's record over white runs in place
         u64 run_start = 0;          ///< the frame the pass came back in after frames without it
+        const Native::ImageEntry* result = nullptr; ///< the pass's result picture
+        u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
+        u32 halo_logged = 0;          ///< draws after the pass into its result, logged
         u64 mirror_frame = ~u64{0}; ///< the last such frame
         Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
         Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it

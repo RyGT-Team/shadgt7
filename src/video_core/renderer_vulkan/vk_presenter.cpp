@@ -1393,13 +1393,23 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         static bool home_was_down = false;
         const bool home_down = key && (GetAsyncKeyState(0x24 /* Home */) & 0x8000) != 0;
         if (home_down && !home_was_down) {
-            const u32 preset = (RytyUpscale::TemporalPreset().load(std::memory_order_relaxed) + 1) %
-                               static_cast<u32>(std::size(RytyUpscale::TemporalPresets));
-            RytyUpscale::TemporalPreset().store(preset, std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Home, DLSS model {} (frame {})",
-                        RytyUpscale::TemporalPresets[preset], DebugState.GetFrameNum());
+            const u32 mode = (RytyUpscale::TemporalHaloMode().load(std::memory_order_relaxed) + 1) %
+                             static_cast<u32>(std::size(RytyUpscale::TemporalHaloModes));
+            RytyUpscale::TemporalHaloMode().store(mode, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Home, light glows {} (frame {})",
+                        RytyUpscale::TemporalHaloModes[mode], DebugState.GetFrameNum());
         }
         home_was_down = home_down;
+        static bool end_was_down = false;
+        const bool end_down = key && (GetAsyncKeyState(0x23 /* End */) & 0x8000) != 0;
+        if (end_down && !end_was_down) {
+            const bool full = !RytyUpscale::TemporalHudFull().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalHudFull().store(full, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: End, HUD pictures {} (frame {})",
+                        full ? "at twice the display's size" : "at the display's size",
+                        DebugState.GetFrameNum());
+        }
+        end_was_down = end_down;
 #endif
     }
     if (const auto dlss_view = dlss_pass.Render(

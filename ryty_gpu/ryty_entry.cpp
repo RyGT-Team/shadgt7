@@ -293,14 +293,16 @@ void DrawFpsCounter() {
         const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;
         std::snprintf(
             text + written, sizeof(text) - written,
-            " | DLSS %s (Page Haut) | HUD %s (Page Bas) | modele %s (Debut)",
+            " | DLSS %s (Page Haut) | HUD %s (Page Bas) | halos %s (Debut) | HUD %s (Fin)",
             !wanted ? "classique" : used ? "TEMPOREL" : "temporel en attente",
             Vulkan::RytyUpscale::TemporalHudModes[
                 Vulkan::RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed) %
                 std::size(Vulkan::RytyUpscale::TemporalHudModes)],
-            Vulkan::RytyUpscale::TemporalPresets[
-                Vulkan::RytyUpscale::TemporalPreset().load(std::memory_order_relaxed) %
-                std::size(Vulkan::RytyUpscale::TemporalPresets)]);
+            Vulkan::RytyUpscale::TemporalHaloModes[
+                Vulkan::RytyUpscale::TemporalHaloMode().load(std::memory_order_relaxed) %
+                std::size(Vulkan::RytyUpscale::TemporalHaloModes)],
+            Vulkan::RytyUpscale::TemporalHudFull().load(std::memory_order_relaxed) ? "4K"
+                                                                                  : "1080p");
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImVec2 origin = ImGui::GetMainViewport()->Pos;

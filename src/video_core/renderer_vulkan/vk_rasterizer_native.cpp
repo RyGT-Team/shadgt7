@@ -942,7 +942,8 @@ u32 NativeRenderer::HudScale() const {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_SCALE");
         return !(env && env[0] == '1');
     }();
-    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f) {
+    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f ||
+        !RytyUpscale::TemporalHudFull().load(std::memory_order_relaxed)) {
         return 1;
     }
     return r.instance.GetMaxViewportWidth() >= 32768 && r.instance.GetMaxViewportHeight() >= 32768
@@ -9215,6 +9216,28 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     }
+    // DLSS-GT7-001: a draw into the pass's result while it holds the un-resolved colour (GT7's
+    // light glows, drawn after its anti-aliasing): Home chooses how it goes into DLSS's picture
+    // (ryty_upscale.h). The game's own copy of the result, in a frame left as it draws it, gets
+    // the draw as it is.
+    bool halo_shift = false;
+    bool halo_skip = false;
+    if (temporal.result && temporal.frame == frame && targets.colors[0] == temporal.result &&
+        !raw_scene_state &&
+        (temporal.swapped_out == temporal.result || temporal.replaced_frame == frame)) {
+        const u32 halo_mode = RytyUpscale::TemporalHaloMode().load(std::memory_order_relaxed);
+        halo_shift = halo_mode == 1;
+        halo_skip = halo_mode == 2;
+        if (temporal.halo_logged < 12) {
+            ++temporal.halo_logged;
+            const Shader::Info* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: frame {}: a draw into the anti-aliased picture after the "
+                        "pass (ps {:#x}, {} vertices), glows {}",
+                        frame, fs ? fs->pgm_hash : 0, regs.num_indices,
+                        RytyUpscale::TemporalHaloModes[halo_mode % 3]);
+        }
+    }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
     // drawn into the display's black and white HUD pictures instead.
     std::optional<RenderState> hud_black_state;
@@ -9234,8 +9257,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if (layer.composite_frame != frame) {
             layer.composite_frame = frame;
             layer.clear_pending = true;
-            if (!layer.black) {
-                layer.scale = HudScale(); // DLSS-GT7-001
+            if (!layer.black || layer.scale != HudScale()) {
+                // DLSS-GT7-001: made again when End changes their size (the old ones are kept:
+                // recorded commands may still name them).
+                if (layer.black) {
+                    temporal.retired.push_back(layer.black);
+                }
+                if (layer.white) {
+                    temporal.retired.push_back(layer.white);
+                }
+                layer.scale = HudScale();
                 layer.black = MakeHudPicture(*targets.colors[0], layer.scale);
                 layer.white = MakeHudPicture(*targets.colors[0], layer.scale);
             }
@@ -9633,6 +9664,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
             s.dynamic.SetScissors(scissors);
         }
+        if (halo_shift) {
+            // DLSS-GT7-001: drawn where the jittered scene under it is (temporal.jitter: the
+            // scene's shift in pixels, x right, y down).
+            auto viewports = s.dynamic.viewports;
+            for (auto& viewport : viewports) {
+                viewport.x += temporal.jitter[0];
+                viewport.y += temporal.jitter[1];
+            }
+            s.dynamic.SetViewports(viewports);
+        }
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
         r.UpdateRasterizationState();
@@ -9807,7 +9848,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                              (pipeline->LdsEmulation() & 0xff) |
                                  (u32(regs.stage_enable.hs_en != 0) << 8));
         }
-        if (!lds_deferred) {
+        if (!lds_deferred && !halo_skip) {
             record_draw();
         }
         // DIAG-241 (diagnosis): in a dumped frame, the LDS scratch of the first such draw.
@@ -9855,6 +9896,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
             // stay bound across the change of attachment).
             BeginRendering(*hud_white_state);
+            if (halo_shift) {
+                halo_shift = false; // DLSS-GT7-001: the game's own copy, unshifted
+                bind_state();
+            }
             record_draw();
         }
         if (raw_scene_state) {
@@ -10092,6 +10137,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         temporal.reset = temporal.frame + 1 != frame;
     }
     temporal.depth = depth;
+    temporal.result = out;
     temporal.motion = motion;
     temporal.frame = frame;
     temporal.jitter[0] = jitter_x;
@@ -10218,6 +10264,7 @@ void NativeRenderer::ApplyTemporalReplace() {
     s.buffers_written = true;
     ++s.commands;
     ++temporal.replaced;
+    temporal.replaced_frame = frame;
 }
 
 std::optional<NativeRenderer::IndirectBuffers> NativeRenderer::ResolveIndirect(

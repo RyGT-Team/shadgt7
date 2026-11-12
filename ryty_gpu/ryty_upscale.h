@@ -90,7 +90,8 @@ inline bool NativeAA() {
 // written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
 //   RYGT_DLSS_TEMPORAL_KEY=0     no keys (Page Up switches the prototype off and on while
 //                                playing; Page Down steps through the ways the HUD is drawn,
-//                                Home through the DLSS models). Not function keys: the emulator's own
+//                                Home through the light glows' ways, End switches the HUD pictures'
+//                                size). Not function keys: the emulator's own
 //                                hotkeys take them all (F9 pauses the game, F10 hides the FPS
 //                                counter), which the first builds' F9 and F10 ran into.
 //   RYGT_DLSS_TEMPORAL_MENUS=1   also outside a race (menus with a 3D scene: their pages come
@@ -196,7 +197,30 @@ inline std::atomic<u32>& TemporalHudMode() {
     return mode;
 }
 
-/// The DLSS model (preset), switched with Home while playing: the default of the quality mode
+/// The light glows GT7 draws after its anti-aliasing into the pass's result (the halo sprites,
+/// ps 0x12b8ffe0 in a race, 56 quads over a depth test), switched with Home while playing. They
+/// land on the un-resolved colour DLSS gets, which is shifted by the frame's jitter; if the game
+/// draws them for the un-jittered picture (where they go in its own pipeline), DLSS moves them
+/// by the jitter each frame and they shimmer (the user's report of 2026-11-12, to be checked).
+///   normaux  drawn as the game draws them
+///   decales  drawn shifted by the frame's jitter, like the scene under them
+///   sans     left out of DLSS's picture (a test only: the glows then go missing)
+inline constexpr const char* TemporalHaloModes[] = {"normaux", "decales", "sans"};
+inline std::atomic<u32>& TemporalHaloMode() {
+    static std::atomic<u32> mode{0};
+    return mode;
+}
+
+/// The HUD pictures at twice the display's size (true) or at its size, switched with End while
+/// playing: the 4K pictures cost four times the fill for every interface draw, drawn two or three
+/// times over (2026-11-12, the main menu at 45 frames a second instead of 60).
+inline std::atomic<bool>& TemporalHudFull() {
+    static std::atomic<bool> full{true};
+    return full;
+}
+
+/// The DLSS model (preset): no key any more (Home was tried on 2026-11-12, no change seen); the
+/// default of the quality mode
 /// (M in performance mode), then K, L and J. To judge which keeps small lights the steadiest.
 inline constexpr const char* TemporalPresets[] = {"defaut", "K", "L", "J"};
 inline std::atomic<u32>& TemporalPreset() {
