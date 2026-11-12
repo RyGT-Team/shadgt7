@@ -9996,6 +9996,16 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 1;
     }();
     const bool mirror = mirror_mode == 2 || (mirror_mode == 1 && !race && !menus_too);
+    static bool mirror_logged = false;
+    static u32 mirror_changes = 0;
+    if (mirror != mirror_logged && mirror_changes++ < 32) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {} ({} frames drawn beside so far)",
+                    frame,
+                    mirror ? "the frame is left as the game draws it and drawn beside for DLSS"
+                           : "the pass's result is replaced in place",
+                    temporal.mirrored);
+    }
+    mirror_logged = mirror;
     if (!race && !menus_too && !mirror) {
         return;
     }
