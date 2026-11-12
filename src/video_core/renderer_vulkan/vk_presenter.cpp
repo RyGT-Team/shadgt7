@@ -1379,18 +1379,27 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Up, temporal DLSS {}", on ? "on" : "off");
         }
         was_down = down;
-        // Page Down: the next choice of jitter signs (ryty_upscale.h).
+        // Page Down: the next way of drawing the HUD; Home: the next DLSS model (ryty_upscale.h).
         static bool next_was_down = false;
         const bool next_down = key && (GetAsyncKeyState(0x22 /* Page Down */) & 0x8000) != 0;
         if (next_down && !next_was_down) {
-            const u32 index = (RytyUpscale::TemporalJitterIndex().load(std::memory_order_relaxed) +
-                               1) % static_cast<u32>(std::size(RytyUpscale::TemporalJitterChoices));
-            RytyUpscale::TemporalJitterIndex().store(index, std::memory_order_relaxed);
-            const auto& choice = RytyUpscale::TemporalJitterChoices[index];
-            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Down, jitter choice {} (factors {}, {})",
-                        choice.name, choice.x, choice.y);
+            const u32 mode = (RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed) + 1) %
+                             static_cast<u32>(std::size(RytyUpscale::TemporalHudModes));
+            RytyUpscale::TemporalHudMode().store(mode, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Down, HUD mode {} (frame {})",
+                        RytyUpscale::TemporalHudModes[mode], DebugState.GetFrameNum());
         }
         next_was_down = next_down;
+        static bool home_was_down = false;
+        const bool home_down = key && (GetAsyncKeyState(0x24 /* Home */) & 0x8000) != 0;
+        if (home_down && !home_was_down) {
+            const u32 preset = (RytyUpscale::TemporalPreset().load(std::memory_order_relaxed) + 1) %
+                               static_cast<u32>(std::size(RytyUpscale::TemporalPresets));
+            RytyUpscale::TemporalPreset().store(preset, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Home, DLSS model {} (frame {})",
+                        RytyUpscale::TemporalPresets[preset], DebugState.GetFrameNum());
+        }
+        home_was_down = home_down;
 #endif
     }
     if (const auto dlss_view = dlss_pass.Render(

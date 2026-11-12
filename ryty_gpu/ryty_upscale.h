@@ -89,8 +89,8 @@ inline bool NativeAA() {
 // accumulate. Elsewhere (menus, a frame without that pass, outside a race) DLSS runs as before. Measured and
 // written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
 //   RYGT_DLSS_TEMPORAL_KEY=0     no keys (Page Up switches the prototype off and on while
-//                                playing; Page Down steps through the jitter's signs, see
-//                                TemporalJitterChoices). Not function keys: the emulator's own
+//                                playing; Page Down steps through the ways the HUD is drawn,
+//                                Home through the DLSS models). Not function keys: the emulator's own
 //                                hotkeys take them all (F9 pauses the game, F10 hides the FPS
 //                                counter), which the first builds' F9 and F10 ran into.
 //   RYGT_DLSS_TEMPORAL_MENUS=1   also outside a race (menus with a 3D scene: their pages come
@@ -178,6 +178,30 @@ inline std::atomic<u32>& TemporalJitterIndex() {
 inline const TemporalJitterChoice& TemporalJitterNow() {
     return TemporalJitterChoices[TemporalJitterIndex().load(std::memory_order_relaxed) %
                                  std::size(TemporalJitterChoices)];
+}
+
+/// How a frame's HUD is drawn, switched with Page Down while playing (2026-11-12, to measure
+/// what each way costs: the main menu fell from 60 to 57 frames a second with the frames "left
+/// as the game draws them", which a G-SYNC screen shows as flicker).
+///   auto     as the game draws it only while its interface reads the display back, or a scene
+///            has just started; else out of the display, with the record over white in place
+///            outside a race and in the HUD's own list in a race
+///   miroir   every frame left as the game draws it (three records a HUD draw)
+///   direct   HUD kept out of the display, the record over white in place (two)
+///   liste    HUD kept out of the display, the record over white in the HUD's own list (run after
+///            the main list: a menu's pieces then come out with the wrong textures)
+inline constexpr const char* TemporalHudModes[] = {"auto", "miroir", "direct", "liste"};
+inline std::atomic<u32>& TemporalHudMode() {
+    static std::atomic<u32> mode{0};
+    return mode;
+}
+
+/// The DLSS model (preset), switched with Home while playing: the default of the quality mode
+/// (M in performance mode), then K, L and J. To judge which keeps small lights the steadiest.
+inline constexpr const char* TemporalPresets[] = {"defaut", "K", "L", "J"};
+inline std::atomic<u32>& TemporalPreset() {
+    static std::atomic<u32> preset{0};
+    return preset;
 }
 
 /// The two factors of RYGT_DLSS_TEMPORAL_JITTER or _MVEC (1,1 when unset or unreadable).

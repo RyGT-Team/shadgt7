@@ -9283,7 +9283,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         hud_white_state = kept_result_state;
         second_inline = true;
     }
-    if (hud_mirrored) {
+    if (hud_mirrored || (hud_black_state && hud_layer && temporal.frame == frame &&
+                         temporal.white_inline)) {
         // A menu's interface draws its pieces through one scratch picture, written again for
         // each piece: the record over white must run where it stands, not later in the HUD's
         // own list, or it samples the scratch as a later piece left it (colours off in menus,
@@ -10002,7 +10003,22 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIRROR");
         return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 1;
     }();
-    const bool mirror = mirror_mode == 2 || (mirror_mode == 1 && !race && !menus_too);
+    // 2026-11-12: three records a HUD draw took the main menu from 60 to 57 frames a second,
+    // which a G-SYNC screen shows as flicker. Only where it is needed, then: while the interface
+    // reads the display back, and in a scene's first half second (a page that keeps a copy of
+    // the display, as the title screen's artwork, must find it whole in its first frame).
+    // Elsewhere the HUD stays out of the display, its record over white run in place outside a
+    // race (a menu's pieces share one scratch picture). Page Down forces one way (ryty_upscale.h).
+    if (temporal.frame == ~u64{0} || temporal.frame + 1 < frame) {
+        temporal.run_start = frame;
+    }
+    const bool fresh = frame - temporal.run_start < 30;
+    const u32 hud_mode = RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed);
+    const bool mirror =
+        hud_mode == 1 ||
+        (hud_mode == 0 && !menus_too &&
+         (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh))));
+    temporal.white_inline = hud_mode == 2 || (hud_mode == 0 && !race_hud);
     static bool mirror_logged = false;
     static u32 mirror_changes = 0;
     if (mirror != mirror_logged && mirror_changes++ < 32) {
@@ -10013,7 +10029,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
                     temporal.mirrored);
     }
     mirror_logged = mirror;
-    if (!race && !menus_too && !mirror) {
+    if (mirror_mode == 0 && hud_mode == 0 && !race && !menus_too) {
         return;
     }
     const auto refuse = [&](const char* why) {

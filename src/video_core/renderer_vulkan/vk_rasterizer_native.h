@@ -376,6 +376,8 @@ private:
         /// Outside a race the game's pictures are left as it draws them, and the tone-mapped
         /// un-resolved scene DLSS needs is drawn beside them (NoteTemporalDraw).
         bool mirror = false;        ///< the frame being drawn is such a frame
+        bool white_inline = false;  ///< else: the HUD's record over white runs in place
+        u64 run_start = 0;          ///< the frame the pass came back in after frames without it
         u64 mirror_frame = ~u64{0}; ///< the last such frame
         Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
         Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it

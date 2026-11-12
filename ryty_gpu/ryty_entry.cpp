@@ -279,7 +279,7 @@ void DrawFpsCounter() {
         window_shown = shown;
         window_start = now;
     }
-    char text[112];
+    char text[192];
     int written = 0;
     if (shown_fps > 0.0) {
         written = std::snprintf(text, sizeof(text), "%.0f FPS (%.0f shown)", fps, shown_fps);
@@ -291,9 +291,16 @@ void DrawFpsCounter() {
         written < static_cast<int>(sizeof(text))) {
         const bool wanted = Vulkan::RytyUpscale::TemporalActive();
         const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;
-        std::snprintf(text + written, sizeof(text) - written, " | DLSS %s (Page Haut) | jitter %s (Page Bas)",
-                      !wanted ? "classique" : used ? "TEMPOREL" : "temporel en attente",
-                      Vulkan::RytyUpscale::TemporalJitterNow().name);
+        std::snprintf(
+            text + written, sizeof(text) - written,
+            " | DLSS %s (Page Haut) | HUD %s (Page Bas) | modele %s (Debut)",
+            !wanted ? "classique" : used ? "TEMPOREL" : "temporel en attente",
+            Vulkan::RytyUpscale::TemporalHudModes[
+                Vulkan::RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed) %
+                std::size(Vulkan::RytyUpscale::TemporalHudModes)],
+            Vulkan::RytyUpscale::TemporalPresets[
+                Vulkan::RytyUpscale::TemporalPreset().load(std::memory_order_relaxed) %
+                std::size(Vulkan::RytyUpscale::TemporalPresets)]);
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImVec2 origin = ImGui::GetMainViewport()->Pos;

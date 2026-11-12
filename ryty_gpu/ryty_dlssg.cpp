@@ -832,12 +832,25 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
     std::scoped_lock lock{g_sl.mutex};
     const sl::ViewportHandle viewport{1u};
+    // DLSS-GT7-001: the model chosen with Home (ryty_upscale.h); a change sets the options again.
+    static u32 preset_set = 0;
+    const u32 preset_now = RytyUpscale::TemporalPreset().load(std::memory_order_relaxed) %
+                           static_cast<u32>(std::size(RytyUpscale::TemporalPresets));
+    if (preset_now != preset_set) {
+        g_sl.sr_options_set = false;
+    }
     if (!g_sl.sr_options_set) {
         sl::DLSSOptions options{};
         options.mode = static_cast<sl::DLSSMode>(g_sl.sr_mode);
         options.outputWidth = output_size.width;
         options.outputHeight = output_size.height;
         options.colorBuffersHDR = sl::Boolean::eFalse;
+        constexpr sl::DLSSPreset presets[] = {sl::DLSSPreset::eDefault, sl::DLSSPreset::ePresetK,
+                                              sl::DLSSPreset::ePresetL, sl::DLSSPreset::ePresetJ};
+        options.dlaaPreset = options.qualityPreset = options.balancedPreset =
+            options.performancePreset = options.ultraPerformancePreset =
+                options.ultraQualityPreset = presets[preset_now];
+        preset_set = preset_now;
         const sl::Result set = g_sl.dlss_set_options(viewport, options);
         if (set != sl::Result::eOk) {
             LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline refused the options (result {})",
