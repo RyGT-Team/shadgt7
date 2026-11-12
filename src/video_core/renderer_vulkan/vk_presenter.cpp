@@ -1259,6 +1259,93 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 #ifdef RYTY_GPU
+namespace {
+// DLSS-GT7-001 (diagnosis, with RYGT_DLSS_TEMPORAL=1): timestamps around the presenter's DLSS
+// pass and the composition of the picture (HUD pictures laid over it), read four frames later,
+// summed for temporal and classic frames apart and logged every 2 s. The main menu ran at 45
+// frames a second with temporal DLSS and 60 without, with the engine's own lists taking the same
+// ~13 ms of GPU a frame: the rest is here or in the HUD lists.
+struct PresenterTimes {
+    static constexpr u32 Slots = 8;
+    vk::Device device{};
+    vk::QueryPool pool{};
+    double period_ns = 1.0;
+    u64 frame = 0;
+    std::array<bool, Slots> temporal{};
+    std::array<bool, Slots> written{};
+    double sum[2][2]{}; // [temporal][dlss, compose] in ms
+    u64 count[2]{};
+    std::chrono::steady_clock::time_point report = std::chrono::steady_clock::now();
+
+    bool Ready(const Instance& instance) {
+        if (pool) {
+            return true;
+        }
+        device = instance.GetDevice();
+        period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+        auto [result, made] = device.createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = Slots * 3,
+        });
+        if (result != vk::Result::eSuccess) {
+            return false;
+        }
+        pool = made;
+        return true;
+    }
+    void Begin(vk::CommandBuffer cmd, bool is_temporal) {
+        const u32 slot = static_cast<u32>(frame % Slots);
+        Collect(static_cast<u32>((frame + Slots - 4) % Slots));
+        cmd.resetQueryPool(pool, slot * 3, 3);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, slot * 3);
+        temporal[slot] = is_temporal;
+        written[slot] = true;
+    }
+    void Mark(vk::CommandBuffer cmd, u32 which) {
+        const u32 slot = static_cast<u32>(frame % Slots);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, slot * 3 + which);
+    }
+    void End() {
+        ++frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - report < std::chrono::seconds{2}) {
+            return;
+        }
+        report = now;
+        for (int t = 1; t >= 0; --t) {
+            if (count[t] == 0) {
+                continue;
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: presenter GPU time (2 s), {} frames: {} frames, DLSS {:.2f} "
+                        "ms, composition {:.2f} ms a frame",
+                        t ? "temporal" : "classic", count[t], sum[t][0] / double(count[t]),
+                        sum[t][1] / double(count[t]));
+        }
+        sum[0][0] = sum[0][1] = sum[1][0] = sum[1][1] = 0.0;
+        count[0] = count[1] = 0;
+    }
+    void Collect(u32 slot) {
+        if (!written[slot]) {
+            return;
+        }
+        std::array<u64, 6> values{}; // value, availability, three times
+        const vk::Result result = device.getQueryPoolResults(
+            pool, slot * 3, 3, sizeof(values), values.data(), 2 * sizeof(u64),
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        written[slot] = false;
+        if (result != vk::Result::eSuccess || !values[1] || !values[3] || !values[5]) {
+            return;
+        }
+        const int t = temporal[slot] ? 1 : 0;
+        sum[t][0] += double(values[2] - values[0]) * period_ns / 1e6;
+        sum[t][1] += double(values[4] - values[2]) * period_ns / 1e6;
+        ++count[t];
+    }
+};
+PresenterTimes g_presenter_times;
+} // namespace
+
 Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                      VAddr cpu_address) {
@@ -1412,6 +1499,12 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         end_was_down = end_down;
 #endif
     }
+    const bool time_passes = RytyUpscale::TemporalRequested() &&
+                             g_presenter_times.Ready(instance); // DLSS-GT7-001 (diagnosis)
+    if (time_passes) {
+        g_presenter_times.Begin(pass_cmdbuf, display->temporal.has_value() &&
+                                                 RytyUpscale::TemporalActive());
+    }
     if (const auto dlss_view = dlss_pass.Render(
             pass_cmdbuf, display->image, image_view, view_format, image_size, upscale_target,
             display->temporal ? &*display->temporal : nullptr);
@@ -1435,6 +1528,9 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     if (!scaled) {
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
+    if (time_passes) {
+        g_presenter_times.Mark(pass_cmdbuf, 1);
     }
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
@@ -1469,6 +1565,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
                    display->hud_white, hud_widgets);
+    if (time_passes) {
+        g_presenter_times.Mark(pass_cmdbuf, 2);
+        g_presenter_times.End();
+    }
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,
