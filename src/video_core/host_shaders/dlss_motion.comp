@@ -15,18 +15,25 @@
 // the scene (the World Map's icons and their labels, while its camera flies), but not with the
 // motion of the scene's pixels behind it: trees above and below a label moved 1 to 2 pixels a
 // frame apart, and the label took both (doubled, 2026-11-12). So the interface's own motion is
-// measured against the picture DLSS got in the frame before:
+// measured against the picture DLSS got in the frame before. The interface is drawn shifted by
+// each frame's jitter (Home): the frame before's picture is read where the interface was drawn
+// then (shifted by the jitters' difference, between its pixels), so an interface that stays put
+// matches with no motion exactly (without it, flat artwork found a pixel's shift here and there:
+// the title screen trembled and the map's checkered flag shimmered, 2026-11-12).
 //   stage 1, a group per 16x16 tile: where the tile holds enough interface, its interface pixels
-//            (every other one) are matched at 49 shifts around the scene's motion at the tile's
-//            centre and 9 around none; the best (none on a tie) is refined to a fraction of a
-//            pixel, and kept for the tile;
+//            (every other one) are matched with no motion, the scene's motion at the tile's
+//            centre, and that motion 2 pixels off each way. Unless a motion matches clearly
+//            better than none (Leaves), the tile stays put, and that is all it costs (a title
+//            screen's artwork: smooth gradients match any small shift about as well, and noise
+//            chose). Otherwise the 49 shifts around the best are matched, and the best refined to
+//            a fraction of a pixel;
 //   stage 0, a thread per pixel: at or next to the interface (DLSS takes a pixel's motion from
 //            its nearest neighbour in depth, and the interface has no depth of its own), the
 //            pixel takes its tile's motion; where the tile and its four neighbours disagree, the
-//            one whose shift matches the interface pixels of the 13x13 square around it best.
-// The shift measured is the picture's, jitter included: the difference of the two frames'
-// jitters (when the interface is drawn shifted by it) is taken out. With no picture before (the
-// first frame of a run), the interface has no motion.
+//            one that matches the interface pixels of the 13x13 square around it clearly best.
+//            The motions of those tiles that agree with it are averaged (a tile's is a few tenths
+//            of a pixel off: the map's flag shimmered where neighbouring tiles differed).
+// With no picture before (the first frame of a run), the interface has no motion.
 
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
@@ -40,8 +47,8 @@ layout(set = 0, binding = 2) uniform texture2D scene;    // the display before i
 layout(set = 0, binding = 3) uniform texture2D shown;    // the display as DLSS gets it
 layout(set = 0, binding = 4) uniform texture2D previous; // the frame before's, as DLSS got it
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D keep; // this frame's, for the next
-// Per tile: the interface's shift (where it was - where it is, pixels, as drawn), whether the tile
-// holds enough interface, and whether its interface stays put.
+// Per tile: the interface's motion (where it was - where it is, pixels), whether the tile holds
+// enough interface, and whether its interface stays put.
 layout(set = 0, binding = 6, rgba16f) uniform image2D tiles;
 
 layout(push_constant) uniform Constants {
@@ -55,15 +62,24 @@ layout(push_constant) uniform Constants {
 } constants;
 
 const int TILE = 16;
-const int SEARCH = 3;                          // around the scene's motion
-const int AROUND_SCENE = (2 * SEARCH + 1) * (2 * SEARCH + 1);
-const int CANDIDATES = AROUND_SCENE + 9;       // and around none
-const uint ENOUGH = 4;                         // interface taps of the 64 for a tile's own shift
+const int SEARCH = 3; // around the best of the first step
+const int SIDE = 2 * SEARCH + 1;
+const int FINE = SIDE * SIDE;
+const int FIRST = 6;  // no motion, the scene's, and the scene's 2 pixels off each way
+const uint ENOUGH = 4; // interface taps of the 64 for a tile's own motion
+
+// A motion is taken over none only when it matches clearly better: its cost under 60% of none's,
+// less a floor of noise for each pixel matched (replayed on the title screen, the garage and the
+// World Map's bursts, 2026-11-12: the artwork and the labels stay put, the map's icons move).
+bool Leaves(float cost, float still, float taps) {
+    return cost < 0.6 * still - 0.03 * taps;
+}
 
 shared vec3 tile_now[64];
 shared uint tile_drawn[64];
-shared float tile_cost[CANDIDATES];
+shared float tile_cost[FINE];
 shared uint tile_count;
+shared int tile_first;
 
 ivec2 Clamped(ivec2 at, ivec2 size) {
     return clamp(at, ivec2(0), size - 1);
@@ -85,12 +101,46 @@ vec2 SceneVector(ivec2 at) {
     return vector.x < -1000.0 ? vec2(0.0) : vector + constants.jitter;
 }
 
-ivec2 Candidate(int c, ivec2 seed) {
-    if (c < AROUND_SCENE) {
-        return seed + ivec2(c % (2 * SEARCH + 1) - SEARCH, c / (2 * SEARCH + 1) - SEARCH);
+// The frame before's picture where a pixel of this frame came from, when it moved by `motion`
+// (pixels): read between its pixels, since the interface was drawn shifted by another jitter.
+vec3 Before(ivec2 at, vec2 motion, ivec2 size) {
+    const vec2 where = vec2(at) + motion + constants.jitter_delta;
+    const ivec2 base = ivec2(floor(where));
+    const vec2 f = where - vec2(base);
+    const vec3 a = texelFetch(previous, Clamped(base, size), 0).rgb;
+    const vec3 b = texelFetch(previous, Clamped(base + ivec2(1, 0), size), 0).rgb;
+    const vec3 c = texelFetch(previous, Clamped(base + ivec2(0, 1), size), 0).rgb;
+    const vec3 d = texelFetch(previous, Clamped(base + ivec2(1, 1), size), 0).rgb;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float TileCost(ivec2 origin, vec2 motion, ivec2 size) {
+    float cost = 0.0;
+    for (int k = 0; k < 64; ++k) {
+        if (tile_drawn[k] == 0u) {
+            continue;
+        }
+        const ivec2 at = Clamped(origin + 2 * ivec2(k % 8, k / 8), size);
+        cost += Distance(tile_now[k], Before(at, motion, size));
     }
-    c -= AROUND_SCENE;
-    return ivec2(c % 3 - 1, c / 3 - 1);
+    return cost;
+}
+
+vec2 First(int c, vec2 seed) {
+    switch (c) {
+    case 0:
+        return vec2(0.0);
+    case 1:
+        return seed;
+    case 2:
+        return seed + vec2(2.0, 0.0);
+    case 3:
+        return seed - vec2(2.0, 0.0);
+    case 4:
+        return seed + vec2(0.0, 2.0);
+    default:
+        return seed - vec2(0.0, 2.0);
+    }
 }
 
 // The vertex of the parabola through three costs a pixel apart, as an offset from the middle.
@@ -122,63 +172,73 @@ void SearchTile() {
         }
         return;
     }
-    const ivec2 seed = ivec2(round(SceneVector(Clamped(origin + TILE / 2, size)) *
-                                   constants.to_pixels));
-    for (int c = int(lane); c < CANDIDATES; c += 64) {
-        const ivec2 shift = Candidate(c, seed);
-        float cost = 0.0;
-        for (int k = 0; k < 64; ++k) {
-            if (tile_drawn[k] == 0u) {
-                continue;
+    // Whole pixels: the motion found is refined below.
+    const vec2 seed =
+        round(SceneVector(Clamped(origin + TILE / 2, size)) * constants.to_pixels);
+    if (lane < FIRST) {
+        tile_cost[lane] = TileCost(origin, First(int(lane), seed), size);
+    }
+    barrier();
+    if (lane == 0) {
+        int best = 0; // no motion: kept unless another is clearly better
+        for (int c = 1; c < FIRST; ++c) {
+            if (tile_cost[c] < tile_cost[best]) {
+                best = c;
             }
-            const ivec2 at = Clamped(origin + 2 * ivec2(k % 8, k / 8) + shift, size);
-            cost += Distance(tile_now[k], texelFetch(previous, at, 0).rgb);
         }
-        tile_cost[c] = cost;
+        tile_first = Leaves(tile_cost[best], tile_cost[0], float(tile_count)) ? best : 0;
+    }
+    barrier();
+    const int first = tile_first;
+    if (first == 0) {
+        if (lane == 0) {
+            imageStore(tiles, tile, vec4(0.0, 0.0, 1.0, 1.0));
+        }
+        return;
+    }
+    const vec2 centre = First(first, seed);
+    if (lane < FINE) {
+        const vec2 offset = vec2(int(lane) % SIDE - SEARCH, int(lane) / SIDE - SEARCH);
+        tile_cost[lane] = TileCost(origin, centre + offset, size);
     }
     barrier();
     if (lane != 0) {
         return;
     }
-    int best = AROUND_SCENE + 4; // no shift: kept on a tie
-    for (int c = 0; c < CANDIDATES; ++c) {
+    int best = FINE / 2;
+    for (int c = 0; c < FINE; ++c) {
         if (tile_cost[c] < tile_cost[best]) {
             best = c;
         }
     }
-    const ivec2 shift = Candidate(best, seed);
-    if (shift == ivec2(0)) {
+    const int x = best % SIDE;
+    const int y = best / SIDE;
+    vec2 found = centre + vec2(x - SEARCH, y - SEARCH);
+    if (found == vec2(0.0)) {
         imageStore(tiles, tile, vec4(0.0, 0.0, 1.0, 1.0));
         return;
     }
-    vec2 refined = vec2(shift);
-    if (best < AROUND_SCENE) {
-        const int side = 2 * SEARCH + 1;
-        const int x = best % side;
-        const int y = best / side;
-        if (x > 0 && x < side - 1) {
-            refined.x += Vertex(tile_cost[best - 1], tile_cost[best], tile_cost[best + 1]);
-        }
-        if (y > 0 && y < side - 1) {
-            refined.y += Vertex(tile_cost[best - side], tile_cost[best], tile_cost[best + side]);
-        }
+    if (x > 0 && x < SIDE - 1) {
+        found.x += Vertex(tile_cost[best - 1], tile_cost[best], tile_cost[best + 1]);
     }
-    imageStore(tiles, tile, vec4(refined, 1.0, 0.0));
+    if (y > 0 && y < SIDE - 1) {
+        found.y += Vertex(tile_cost[best - SIDE], tile_cost[best], tile_cost[best + SIDE]);
+    }
+    imageStore(tiles, tile, vec4(found, 1.0, 0.0));
 }
 
 // How well the interface pixels of the 13x13 square around a pixel (every other one) match the
-// frame before at a shift.
-float Match(ivec2 at, ivec2 shift, ivec2 size) {
-    float cost = 0.0;
+// frame before with a motion: the cost and how many pixels were matched.
+vec2 Match(ivec2 at, vec2 motion, ivec2 size) {
+    vec2 result = vec2(0.0);
     for (int k = 0; k < 49; ++k) {
-        const ivec2 p = at + 2 * ivec2(k % 7 - 3, k / 7 - 3);
+        const ivec2 p = Clamped(at + 2 * ivec2(k % 7 - 3, k / 7 - 3), size);
         if (!InterfaceAt(p, size)) {
             continue;
         }
-        cost += Distance(texelFetch(shown, Clamped(p, size), 0).rgb,
-                         texelFetch(previous, Clamped(p + shift, size), 0).rgb);
+        result += vec2(Distance(texelFetch(shown, p, 0).rgb, Before(p, motion, size)), 1.0);
     }
-    return cost;
+    return result;
 }
 
 void Pixels() {
@@ -194,51 +254,65 @@ void Pixels() {
             beside = InterfaceAt(at + ivec2(k % 3 - 1, k / 3 - 1), size);
         }
         if (beside) {
-            // The shift taken (pixels, as drawn); none without the frame before.
-            vec2 shift = vec2(0.0);
+            // The interface's motion (pixels); none without the frame before.
+            vec2 moved = vec2(0.0);
             if (constants.have_previous > 0.5) {
                 const ivec2 grid = imageSize(tiles);
                 const ivec2 tile = at / TILE;
                 const ivec2 around[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0),
                                                  ivec2(0, -1), ivec2(0, 1));
-                // The distinct shifts of the tile and its neighbours (none included when one
-                // stays put); five at most.
-                vec2 shifts[5];
+                // The motions of the tile and its neighbours that hold interface (none for those
+                // that stay put), and the distinct ones among them (to the nearest pixel).
+                vec2 found[5];
+                int tiles_found = 0;
+                vec2 motions[5];
                 int count = 0;
                 for (int n = 0; n < 5; ++n) {
                     const vec4 t = imageLoad(tiles, clamp(tile + around[n], ivec2(0), grid - 1));
                     if (t.z < 0.5) {
                         continue;
                     }
-                    const vec2 s = t.w > 0.5 ? vec2(0.0) : t.xy;
+                    const vec2 m = t.w > 0.5 ? vec2(0.0) : t.xy;
+                    found[tiles_found++] = m;
                     bool seen = false;
-                    for (int m = 0; m < count; ++m) {
-                        seen = seen || ivec2(round(shifts[m])) == ivec2(round(s));
+                    for (int j = 0; j < count; ++j) {
+                        seen = seen || ivec2(round(motions[j])) == ivec2(round(m));
                     }
                     if (!seen) {
-                        shifts[count++] = s;
+                        motions[count++] = m;
                     }
                 }
                 if (count == 1) {
-                    shift = shifts[0];
+                    moved = motions[0];
                 } else if (count > 1) {
-                    float best = Match(at, ivec2(0), size);
-                    for (int m = 0; m < count; ++m) {
-                        const ivec2 whole = ivec2(round(shifts[m]));
-                        if (whole == ivec2(0)) {
+                    const vec2 still = Match(at, vec2(0.0), size);
+                    float best = still.x;
+                    for (int j = 0; j < count; ++j) {
+                        if (ivec2(round(motions[j])) == ivec2(0)) {
                             continue;
                         }
-                        const float cost = Match(at, whole, size);
-                        if (cost < best) {
+                        const float cost = Match(at, motions[j], size).x;
+                        if (cost < best && Leaves(cost, still.x, still.y)) {
                             best = cost;
-                            shift = shifts[m];
+                            moved = motions[j];
                         }
                     }
                 }
+                // The tiles that agree with the motion taken, averaged.
+                if (moved != vec2(0.0)) {
+                    const ivec2 key = ivec2(round(moved));
+                    vec2 sum = vec2(0.0);
+                    float agreeing = 0.0;
+                    for (int j = 0; j < tiles_found; ++j) {
+                        if (ivec2(round(found[j])) == key) {
+                            sum += found[j];
+                            agreeing += 1.0;
+                        }
+                    }
+                    moved = agreeing > 0.0 ? sum / agreeing : moved;
+                }
             }
-            // Staying put is exactly no motion; a shift loses the jitters' difference.
-            vector = shift == vec2(0.0) ? vec2(0.0)
-                                        : (shift - constants.jitter_delta) / constants.to_pixels;
+            vector = moved == vec2(0.0) ? vec2(0.0) : moved / constants.to_pixels;
         }
         imageStore(keep, at, vec4(texelFetch(shown, at, 0).rgb, 1.0));
     }

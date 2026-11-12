@@ -376,8 +376,8 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
     // mask, the least change taken for the interface (half a step of a 10-bit display's colour,
     // so equal pictures never count), whether the frame before's picture is there, the stage,
     // and the interface's shift in the frame before minus in this one (it is drawn shifted by the
-    // frame's jitter when Home leaves it so: the pictures' shift is the jitters' difference more
-    // than its motion).
+    // frame's jitter when Home leaves it so: the frame before's picture is read that much off,
+    // so an interface that stays put matches with no motion exactly).
     const bool ui_jittered = RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed);
     const std::array<float, 2> ui_shift{ui_jittered ? t.jitter[0] : 0.0f,
                                         ui_jittered ? t.jitter[1] : 0.0f};
