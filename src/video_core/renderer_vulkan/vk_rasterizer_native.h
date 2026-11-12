@@ -381,6 +381,10 @@ private:
         const Native::ImageEntry* result = nullptr; ///< the pass's result picture
         u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
         u32 halo_logged = 0;          ///< draws after the pass into its result, logged
+        bool hud_batch_open = false;  ///< HUD records wait in the HUD lists
+        bool display_draw_now = false; ///< the draw being recorded goes into a display buffer
+        u64 batches = 0;              ///< batches closed
+        u64 batched_draws = 0;        ///< HUD draws recorded so
         u64 mirror_frame = ~u64{0}; ///< the last such frame
         Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
         Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it
@@ -1348,9 +1352,16 @@ private:
     /// the main one (which draws them over black): neither list switches between the two
     /// pictures, so consecutive HUD draws stay in one pass without barriers between them.
     Stream hud_stream;
+    /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list of
+    /// their own too (the main list then draws them into the display as the game does).
+    Stream hud_black_stream;
     static bool HudStreamOn();
     void BeginHudStream();
     void SpliceHudStream(u64 tick);
+    void SpliceStream(Stream& s, u64 tick);
+    /// DLSS-GT7-001: the open batch of HUD draws runs (main list first, then the HUD lists).
+    void CloseHudBatch();
+    static bool HudBatchOn();
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001

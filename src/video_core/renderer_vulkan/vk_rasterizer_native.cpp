@@ -893,7 +893,35 @@ void NativeRenderer::BeginHudStream() {
 
 // Runs the HUD list after the main one (in the same command buffer, at the same tick).
 void NativeRenderer::SpliceHudStream(u64 tick) {
-    Stream& s = hud_stream;
+    SpliceStream(hud_stream, tick);
+    SpliceStream(hud_black_stream, tick); // DLSS-GT7-001
+    temporal.hud_batch_open = false;
+}
+
+bool NativeRenderer::HudBatchOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void NativeRenderer::CloseHudBatch() {
+    temporal.hud_batch_open = false;
+    if (++temporal.batches == 1 || temporal.batches % 6000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: HUD draws batched in their own lists: {} draws in {} batches",
+                    temporal.batched_draws, temporal.batches);
+    }
+    if (stream.list) {
+        Splice(); // the main list, then the HUD lists
+        return;
+    }
+    r.scheduler.EndRendering();
+    SpliceHudStream(r.scheduler.CurrentTick());
+}
+
+void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
     if (!s.list) {
         return;
     }
@@ -1384,12 +1412,19 @@ CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
     if (hud_stream.list == &list) {
         return hud_stream.cmd;
     }
+    if (hud_black_stream.list == &list) {
+        return hud_black_stream.cmd;
+    }
     ASSERT_MSG(list.NativeHandleSlot() == nullptr,
                "PERF-GT7-018: commands for a deferred list of no stream");
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
+    // DLSS-GT7-001: work other than a HUD draw of the open batch runs after the batch.
+    if (temporal.hud_batch_open && !temporal.display_draw_now) {
+        CloseHudBatch();
+    }
     Stream& s = stream;
     if (s.list) {
         return s;
@@ -8862,6 +8897,17 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     std::scoped_lock lock{mutex};
+    // DLSS-GT7-001: a draw into a display buffer may join the open batch of HUD draws (Begin).
+    struct DisplayDraw {
+        bool& flag;
+        ~DisplayDraw() {
+            flag = false;
+        }
+    } display_draw{temporal.display_draw_now};
+    {
+        const auto& cb0 = r.liverpool->DrawRegs().color_buffers[0];
+        temporal.display_draw_now = cb0 && IsDisplayAddress(cb0.Address());
+    }
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Draws}; // DIAG-GT7-005
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
@@ -9622,6 +9668,31 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // race's longest runs are ~300 draws, Daytona's ~145 a frame in all.)
         FlushLdsReaders(2);
     }
+    // DLSS-GT7-001: in a frame left as the game draws it, a HUD draw goes into the display in the
+    // main list as the game draws it, and into the HUD pictures in two lists of their own that
+    // run after the main one: consecutive HUD draws then stay in one pass each, instead of
+    // switching between three pictures at every draw (2026-11-12, the main menu: 1,450 passes
+    // and 360 pass barriers a frame instead of 350 and 24, 45 frames a second instead of 60).
+    // A draw that reads a display picture, and any other work, runs after the batch (Begin).
+    // RYGT_DLSS_TEMPORAL_HUD_BATCH=0: every HUD draw switches pictures as before.
+    bool hud_batched = false;
+    std::optional<RenderState> batched_black;
+    std::optional<RenderState> batched_white;
+    if (hud_mirrored && HudBatchOn() && hud_black_state && hud_white_state && !lds_reader) {
+        bool reads_display = false;
+        for (const auto* sampled : b.sampled) {
+            reads_display |= sampled && IsDisplayAddress(sampled->info.guest_address);
+        }
+        hud_batched = !reads_display;
+    }
+    if (temporal.hud_batch_open && !hud_batched) {
+        CloseHudBatch();
+        Begin();
+    }
+    if (hud_batched) {
+        batched_black = std::exchange(hud_black_state, std::nullopt);
+        batched_white = std::exchange(hud_white_state, std::nullopt);
+    }
     {
         PhaseClock part{stats.record_ns[1]};
         BeginRendering(hud_black_state ? *hud_black_state : targets.state);
@@ -9913,13 +9984,28 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             BeginRendering(targets.state);
             bind_state();
             record_draw();
-        } else if (hud_mirrored) {
+        } else if (hud_mirrored && !hud_batched) {
             // DLSS-GT7-001: the HUD draw into the display itself, as the game expects to read it.
             hud_unscaled = true;
             BeginRendering(targets.state);
             bind_state();
             record_draw();
             hud_unscaled = false;
+        }
+        if (hud_batched) {
+            // DLSS-GT7-001: the same draw over black and over white, in the HUD lists.
+            hud_black_state = batched_black; // bind_state sizes it for the HUD pictures
+            for (const bool white : {false, true}) {
+                Stream& side = white ? hud_stream : hud_black_stream;
+                std::swap(stream, side);
+                BeginHudStream();
+                BeginRendering(white ? *batched_white : *batched_black);
+                bind_state();
+                record_draw();
+                std::swap(stream, side);
+            }
+            temporal.hud_batch_open = true;
+            ++temporal.batched_draws;
         }
     }
     {
@@ -14275,8 +14361,10 @@ void NativeRenderer::Report() {
         targets_memo.valid = false;
         ForgetBindings(stream);
         ForgetBindings(hud_stream);
+        ForgetBindings(hud_black_stream);
         ++stream.serial;
         ++hud_stream.serial;
+        ++hud_black_stream.serial;
         // DIAG-GT7-002: the mode, and the window for the raw samples.
         RyDiag::SetProfileTag(u32(ab_window << 8) | (mode + 1));
     }
