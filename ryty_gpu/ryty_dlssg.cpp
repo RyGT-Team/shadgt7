@@ -672,8 +672,13 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
             RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_MVEC", &f[2]);
             return f;
         }();
-        const bool reset = t->reset || !last_temporal;
-        constants.jitterOffset = sl::float2(t->jitter[0] * factors[0], t->jitter[1] * factors[1]);
+        static u32 last_choice = 0;
+        const u32 choice_index = RytyUpscale::TemporalJitterIndex().load(std::memory_order_relaxed);
+        const auto& choice = RytyUpscale::TemporalJitterNow();
+        const bool reset = t->reset || !last_temporal || choice_index != last_choice;
+        last_choice = choice_index;
+        constants.jitterOffset = sl::float2(t->jitter[0] * factors[0] * choice.x,
+                                            t->jitter[1] * factors[1] * choice.y);
         constants.mvecScale =
             sl::float2(t->mvec_scale[0] * factors[2], t->mvec_scale[1] * factors[3]);
         constants.depthInverted = sl::Boolean::eTrue;

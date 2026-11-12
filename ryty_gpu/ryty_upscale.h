@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <iterator>
 #include <cstdlib>
 #include <cstring>
 
@@ -87,7 +88,9 @@ inline bool NativeAA() {
 // the frame's un-resolved colour, so DLSS, at the present, gets jittered frames it can
 // accumulate. Elsewhere (menus, a frame without that pass) DLSS runs as before. Measured and
 // written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
-//   RYGT_DLSS_TEMPORAL_KEY=0     no F9 key (F9 switches the prototype off and on while playing)
+//   RYGT_DLSS_TEMPORAL_KEY=0     no F9 and F10 keys (F9 switches the prototype off and on while
+//                                playing; F10 steps through the jitter's signs, see
+//                                TemporalJitterChoices)
 //   RYGT_DLSS_TEMPORAL_TAA=1     the game's anti-aliasing result is kept (DLSS still gets the data)
 //   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
 //                                read the un-resolved colour too (the first prototype)
@@ -142,6 +145,33 @@ inline bool TemporalReplacesTaa() {
         return env && env[0] == '1';
     }();
     return !keep;
+}
+
+/// The jitter's sign is not settled: the pass's shader reads at position - (c14*c20, c15*c21),
+/// which says the scene is shifted by the opposite, and GT Sport's DLSS pass (shadGT,
+/// ryty_gts_dlss.cpp) hands DLSS +(c20*c14, c21*c15) for the same pass. The frame dumps of
+/// 2026-11-04 and 11-11 do not tell them apart (measured shifts within the noise). F10 steps
+/// through the choices while playing; the right one gives a steady, sharp picture with the car
+/// at a standstill. Factors of the jitter NoteTemporalDraw notes, -(c14*c20, c15*c21).
+struct TemporalJitterChoice {
+    float x;
+    float y;
+    const char* name; ///< for the FPS counter and the log
+};
+inline constexpr TemporalJitterChoice TemporalJitterChoices[] = {
+    {1.0f, 1.0f, "A"},   // -(c14*c20, c15*c21): the prototype's first reading
+    {-1.0f, -1.0f, "B"}, // +(c14*c20, c15*c21): GT Sport's
+    {1.0f, -1.0f, "C"},
+    {-1.0f, 1.0f, "D"},
+    {0.0f, 0.0f, "0"},   // none given: DLSS takes every frame as centred
+};
+inline std::atomic<u32>& TemporalJitterIndex() {
+    static std::atomic<u32> index{0};
+    return index;
+}
+inline const TemporalJitterChoice& TemporalJitterNow() {
+    return TemporalJitterChoices[TemporalJitterIndex().load(std::memory_order_relaxed) %
+                                 std::size(TemporalJitterChoices)];
 }
 
 /// The two factors of RYGT_DLSS_TEMPORAL_JITTER or _MVEC (1,1 when unset or unreadable).
