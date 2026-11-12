@@ -130,6 +130,9 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        /// DLSS-GT7-001: hud_black (= hud_white) is the single HUD picture, what shows through
+        /// in its alpha.
+        bool hud_alpha = false;
         /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
         /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
         std::optional<RytyUpscale::TemporalInputs> temporal;
@@ -345,6 +348,14 @@ private:
         bool clear_pending = false;    ///< the next HUD draw clears both pictures first
         u64 race_frame = ~u64{0};      ///< the frame its HUD showed a race's maps
         u32 scale = 1;                 ///< DLSS-GT7-001: the pictures' size over the display's
+        // DLSS-GT7-001 (RYGT_DLSS_TEMPORAL_HUD_ALPHA=1): the single HUD picture and what rebuilds
+        // the display from it.
+        Native::ImageEntry* alpha = nullptr;         ///< colour over black, through in alpha
+        Native::ImageEntry* alpha_scene = nullptr;   ///< the display as the scene left it
+        Native::ImageEntry* alpha_display = nullptr; ///< the display the frame draws
+        bool alpha_dirty = false;       ///< interface drawn since the display was rebuilt
+        bool alpha_scene_valid = false; ///< alpha_scene holds this frame's scene
+        u32 alpha_scale = 0;            ///< the size alpha was made at
     };
     /// GT7-UW: small pictures drawn with a depth buffer, and the frame (a race HUD's track
     /// and course maps are drawn so every frame; menus' HUDs take none).
@@ -384,6 +395,8 @@ private:
         const Native::ImageEntry* result = nullptr; ///< the pass's result picture
         u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
         u32 halo_logged = 0;          ///< draws after the pass into its result, logged
+        u64 hud_alpha_rebuilds = 0;   ///< displays rebuilt from the single HUD picture
+        u64 hud_alpha_reacquired = 0; ///< pipelines looked up again for their target
         bool hud_batch_open = false;  ///< HUD records wait in the HUD lists
         bool display_draw_now = false; ///< the draw being recorded goes into a display buffer
         u64 batches = 0;              ///< batches closed
@@ -416,7 +429,10 @@ private:
     bool HudSplitNow() const;
     /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.
     u32 HudScale() const;
-    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1);
+    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1,
+                                       vk::Format format = vk::Format::eUndefined);
+    /// DLSS-GT7-001: the layer's display = interface + what shows through x scene.
+    void RebuildDisplayFromHud(HudLayer& layer);
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,

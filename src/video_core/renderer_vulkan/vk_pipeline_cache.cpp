@@ -63,6 +63,13 @@ extern thread_local u64 g_diag_compiling_hash;
 } // namespace Shader::Optimization
 namespace Vulkan {
 
+u32 TessLdsEmulation(const AmdGpu::Regs& regs);
+
+// DLSS-GT7-001 (vk_rasterizer_native.cpp): the single HUD picture's mode, display buffers, format.
+bool NativeHudAlphaOn();
+bool NativeIsDisplayAddress(VAddr address);
+vk::Format NativeHudAlphaFormat(const Instance& instance);
+
 u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     // FIX-227: hull shaders of draws with several patches a VGT group read their inputs from the
     // LDS emulation scratch buffer (the renderer runs a writer pass first), so input control
@@ -4031,6 +4038,23 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
     }
 
+    // DLSS-GT7-001 (RYGT_DLSS_TEMPORAL_HUD_ALPHA=1): a draw into a display buffer, with that one
+    // target, draws the interface into the single HUD picture (vk_rasterizer_native.cpp): its
+    // pipeline targets that picture's format and keeps what shows through in alpha
+    // (GraphicsPipeline). The frame's scene, the first such draw, asks for the display's own
+    // pipeline (hud_base). Worked out from the registers, so selection ahead finds it too.
+    if (NativeHudAlphaOn() && !S().draw_indirect_params.hud_base &&
+        key.num_color_attachments == 1 &&
+        key.color_buffers[0].data_format != AmdGpu::DataFormat::FormatInvalid &&
+        regs.color_buffers[0] && NativeIsDisplayAddress(regs.color_buffers[0].Address())) {
+        key.hud_alpha = 1;
+        key.color_buffers[0].data_format = AmdGpu::DataFormat::Format16_16_16_16;
+        key.color_buffers[0].num_format =
+            NativeHudAlphaFormat(instance) == vk::Format::eR16G16B16A16Unorm
+                ? AmdGpu::NumberFormat::Unorm
+                : AmdGpu::NumberFormat::Float;
+        key.write_masks[0] |= vk::ColorComponentFlagBits::eA;
+    }
     return true;
 }
 

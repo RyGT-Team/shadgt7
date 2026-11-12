@@ -17,6 +17,9 @@
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
+#include "video_core/host_shaders/fs_tri_vert.h"
+#include "video_core/host_shaders/hud_rebuild_frag.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <algorithm>
 #include <bit>
@@ -844,6 +847,171 @@ static bool IsDisplayAddress(VAddr address) {
 
 float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
 
+// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL_HUD_ALPHA=1 with RYGT_DLSS_TEMPORAL=1): the
+// interface is drawn once, into a single picture at twice the display's size, instead of into
+// the display and into black and white HUD pictures. Its colour is what the interface leaves over
+// black; its alpha, multiplied by each draw's destination factor (GraphicsPipeline), is what of
+// the picture under it still shows. The presenter lays it over DLSS's picture; where the game
+// reads its display back, and at the end of the frame, the display is rebuilt from it and from
+// the scene (RebuildDisplayFromHud). Measured on 2026-11-12 on the title screen: the interface
+// drawn beside the game's cost the GPU ~3.4 ms a frame (46 frames a second instead of 60).
+bool NativeHudAlphaOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_ALPHA");
+        const char* split = std::getenv("RYGT_HUD_SPLIT");
+        return env && env[0] == '1' && RytyUpscale::TemporalRequested() &&
+               !(split && split[0] == '0') && RytyDisplayAspect() <= 0.0f;
+    }();
+    return on;
+}
+
+bool NativeIsDisplayAddress(VAddr address) {
+    return IsDisplayAddress(address);
+}
+
+vk::Format NativeHudAlphaFormat(const Instance& instance) {
+    static const vk::Format format = [&] {
+        constexpr auto need = vk::FormatFeatureFlagBits::eColorAttachmentBlend |
+                              vk::FormatFeatureFlagBits::eSampledImage;
+        const auto props =
+            instance.GetPhysicalDevice().getFormatProperties(vk::Format::eR16G16B16A16Unorm);
+        const vk::Format chosen = (props.optimalTilingFeatures & need) == need
+                                      ? vk::Format::eR16G16B16A16Unorm
+                                      : vk::Format::eR16G16B16A16Sfloat;
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: the single HUD picture is {}",
+                    vk::to_string(chosen));
+        return chosen;
+    }();
+    return format;
+}
+
+namespace {
+// DLSS-GT7-001: the pass that rebuilds a display from the HUD picture (hud_rebuild.frag), made
+// on first use for the display's format.
+struct HudRebuildPass {
+    vk::Format format{};
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+    vk::UniqueSampler linear;
+    vk::UniqueSampler nearest;
+    bool failed = false;
+
+    bool Ready(vk::Device device, vk::Format wanted) {
+        if (failed) {
+            return false;
+        }
+        if (pipeline && format == wanted) {
+            return true;
+        }
+        pipeline.reset();
+        if (!set_layout) {
+            const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+                {.binding = 0,
+                 .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                 .descriptorCount = 1,
+                 .stageFlags = vk::ShaderStageFlagBits::eFragment},
+                {.binding = 1,
+                 .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                 .descriptorCount = 1,
+                 .stageFlags = vk::ShaderStageFlagBits::eFragment},
+            }};
+            auto [r1, sl] = device.createDescriptorSetLayoutUnique({
+                .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+                .bindingCount = static_cast<u32>(bindings.size()),
+                .pBindings = bindings.data(),
+            });
+            if (r1 != vk::Result::eSuccess) {
+                failed = true;
+                return false;
+            }
+            auto [r2, pl] =
+                device.createPipelineLayoutUnique({.setLayoutCount = 1, .pSetLayouts = &sl.get()});
+            const auto sampler = [&](vk::Filter filter) {
+                return device.createSamplerUnique({
+                    .magFilter = filter,
+                    .minFilter = filter,
+                    .mipmapMode = vk::SamplerMipmapMode::eNearest,
+                    .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+                    .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+                    .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+                    .maxLod = 0.0f,
+                });
+            };
+            auto [r3, lin] = sampler(vk::Filter::eLinear);
+            auto [r4, near] = sampler(vk::Filter::eNearest);
+            if (r1 != vk::Result::eSuccess || r2 != vk::Result::eSuccess ||
+                r3 != vk::Result::eSuccess || r4 != vk::Result::eSuccess) {
+                failed = true;
+                return false;
+            }
+            set_layout = std::move(sl);
+            layout = std::move(pl);
+            linear = std::move(lin);
+            nearest = std::move(near);
+        }
+        const vk::ShaderModule vs = CompileSPV(FS_TRI_VERT, device);
+        const vk::ShaderModule fs = CompileSPV(HUD_REBUILD_FRAG, device);
+        if (!vs || !fs) {
+            failed = true;
+            return false;
+        }
+        const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{{
+            {.stage = vk::ShaderStageFlagBits::eVertex, .module = vs, .pName = "main"},
+            {.stage = vk::ShaderStageFlagBits::eFragment, .module = fs, .pName = "main"},
+        }};
+        const vk::PipelineVertexInputStateCreateInfo vertex_input{};
+        const vk::PipelineInputAssemblyStateCreateInfo assembly{
+            .topology = vk::PrimitiveTopology::eTriangleList};
+        const vk::PipelineViewportStateCreateInfo viewport{.viewportCount = 1,
+                                                           .scissorCount = 1};
+        const vk::PipelineRasterizationStateCreateInfo raster{
+            .polygonMode = vk::PolygonMode::eFill,
+            .cullMode = vk::CullModeFlagBits::eNone,
+            .frontFace = vk::FrontFace::eCounterClockwise,
+            .lineWidth = 1.0f};
+        const vk::PipelineMultisampleStateCreateInfo multisample{
+            .rasterizationSamples = vk::SampleCountFlagBits::e1};
+        const vk::PipelineColorBlendAttachmentState blend{
+            .blendEnable = false,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+        const vk::PipelineColorBlendStateCreateInfo color_blend{.attachmentCount = 1,
+                                                                .pAttachments = &blend};
+        const std::array<vk::DynamicState, 2> dynamic_states{vk::DynamicState::eViewport,
+                                                             vk::DynamicState::eScissor};
+        const vk::PipelineDynamicStateCreateInfo dynamic{
+            .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
+            .pDynamicStates = dynamic_states.data()};
+        const vk::PipelineRenderingCreateInfo rendering{.colorAttachmentCount = 1,
+                                                        .pColorAttachmentFormats = &wanted};
+        auto [r5, made] = device.createGraphicsPipelineUnique(
+            {}, vk::GraphicsPipelineCreateInfo{.pNext = &rendering,
+                                               .stageCount = static_cast<u32>(stages.size()),
+                                               .pStages = stages.data(),
+                                               .pVertexInputState = &vertex_input,
+                                               .pInputAssemblyState = &assembly,
+                                               .pViewportState = &viewport,
+                                               .pRasterizationState = &raster,
+                                               .pMultisampleState = &multisample,
+                                               .pColorBlendState = &color_blend,
+                                               .pDynamicState = &dynamic,
+                                               .layout = *layout});
+        device.destroyShaderModule(vs);
+        device.destroyShaderModule(fs);
+        if (r5 != vk::Result::eSuccess) {
+            LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the display rebuild pass could not be made");
+            failed = true;
+            return false;
+        }
+        pipeline = std::move(made);
+        format = wanted;
+        return true;
+    }
+};
+HudRebuildPass g_hud_rebuild;
+} // namespace
+
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HUD_SPLIT");
@@ -979,9 +1147,13 @@ u32 NativeRenderer::HudScale() const {
                : 1;
 }
 
-Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale) {
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale,
+                                                   vk::Format format) {
     auto* entry = new Native::ImageEntry{};
     entry->info = like.info;
+    if (format != vk::Format::eUndefined) {
+        entry->info.pixel_format = format; // DLSS-GT7-001: the single HUD picture
+    }
     entry->info.size.width *= scale;
     entry->info.size.height *= scale;
     Native::MadeImage made = MakeImage(entry->info, true);
@@ -9297,7 +9469,63 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
         hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
     }
-    if (HudSplitNow() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+    // DLSS-GT7-001 (RYGT_DLSS_TEMPORAL_HUD_ALPHA=1): the frame's first draw into a display buffer
+    // is the scene, drawn into the display; the later ones, the interface, go once into the
+    // single HUD picture (made at twice the display's size, cleared to 0, 0, 0, 1 by the frame's
+    // first). Their pipelines target that picture (hud_alpha in the key): the scene's is
+    // looked up again for the display, an interface draw's when selection gave the other.
+    const bool hud_alpha_mode = NativeHudAlphaOn();
+    bool hud_alpha_draw = false;
+    bool hud_alpha_display_draw = false;
+    if (hud_alpha_mode && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        hud_alpha_display_draw = true;
+        HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
+        if (layer.composite_frame != frame) {
+            layer.composite_frame = frame;
+            layer.clear_pending = true;
+            layer.alpha_dirty = false;
+            layer.alpha_scene_valid = false;
+            layer.alpha_display = const_cast<Native::ImageEntry*>(targets.colors[0]);
+        } else {
+            const u32 scale = HudScale();
+            if (!layer.alpha || layer.alpha_scale != scale) {
+                if (layer.alpha) {
+                    temporal.retired.push_back(layer.alpha);
+                }
+                layer.alpha = MakeHudPicture(*targets.colors[0], scale,
+                                             NativeHudAlphaFormat(r.instance));
+                layer.alpha_scale = scale;
+                layer.scale = scale;
+            }
+            VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                    r.liverpool->DrawCbExtent(0)};
+            desc.view_info.format = NativeHudAlphaFormat(r.instance);
+            const vk::ImageView view =
+                layer.alpha ? View(*layer.alpha, desc.view_info, ViewUse::Attachment)
+                            : vk::ImageView{};
+            if (view) {
+                hud_black_state = targets.state;
+                auto& c0 = hud_black_state->color_attachments[0];
+                c0.image_view = view;
+                c0.is_clear = layer.clear_pending ? 1u : 0u;
+                c0.clear_value = {0u, 0u, 0u, std::bit_cast<u32>(1.0f)};
+                layer.clear_pending = false;
+                layer.hud_frame = frame;
+                layer.alpha_dirty = true;
+                hud_layer = &layer;
+                hud_alpha_draw = true;
+                if (layer.alpha_scale > 1) {
+                    hud_scale = layer.alpha_scale;
+                    hud_black_state->width = static_cast<u16>(hud_black_state->width * hud_scale);
+                    hud_black_state->height =
+                        static_cast<u16>(hud_black_state->height * hud_scale);
+                }
+            }
+        }
+    }
+    if (!hud_alpha_mode && HudSplitNow() && targets.colors[0] &&
+        targets.state.num_color_attachments == 1 &&
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
         HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
         if (layer.composite_frame != frame) {
@@ -9367,6 +9595,32 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // own list, or it samples the scratch as a later piece left it (colours off in menus,
         // seen by the user on 2026-11-12; my reading of the cause, not measured).
         second_inline = true;
+    }
+    // DLSS-GT7-001: the pipeline the target needs (see hud_alpha_mode above).
+    if (hud_alpha_display_draw && pipeline->GetGraphicsKey().hud_alpha != (hud_alpha_draw ? 1u : 0u)) {
+        DrawIndirectParams again = params;
+        again.hud_base = !hud_alpha_draw;
+        pipeline = r.AcquireGraphicsPipelineWaiting(
+            again, std::chrono::steady_clock::now() + std::chrono::milliseconds{20});
+        prepared = nullptr; // its bindings were worked out for the other pipeline
+        trusted = false;
+        ++temporal.hud_alpha_reacquired;
+        if (!pipeline) {
+            ++stats.skipped;
+            return;
+        }
+    } else if (!hud_alpha_display_draw && pipeline->GetGraphicsKey().hud_alpha) {
+        // Not a draw into a display buffer after all (an MRT or a resolve): the plain pipeline.
+        DrawIndirectParams again = params;
+        again.hud_base = true;
+        pipeline = r.AcquireGraphicsPipelineWaiting(
+            again, std::chrono::steady_clock::now() + std::chrono::milliseconds{20});
+        prepared = nullptr;
+        trusted = false;
+        if (!pipeline) {
+            ++stats.skipped;
+            return;
+        }
     }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         if (r.FrameDumpCollecting()) {
@@ -9456,6 +9710,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
             if (!indirect) { // NAT-161: an indirect draw's counts are in GPU memory
                 CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
+            }
+        }
+    }
+    // DLSS-GT7-001 (single HUD picture): a draw that reads a display picture finds the interface
+    // in it (blurred panels, page copies).
+    if (hud_alpha_mode) {
+        for (const auto* sampled : b.sampled) {
+            if (!sampled || !IsDisplayAddress(sampled->info.guest_address)) {
+                continue;
+            }
+            const auto it = hud_layers.find(sampled->info.guest_address);
+            if (it != hud_layers.end() && it->second.alpha_dirty &&
+                it->second.composite_frame == frame) {
+                RebuildDisplayFromHud(it->second);
+                ++temporal.hud_alpha_rebuilds;
             }
         }
     }
@@ -10159,13 +10428,17 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     temporal.seen_frame = frame;
     const bool fresh = frame - temporal.run_start < 30;
     const u32 hud_mode = RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed);
+    // With the single HUD picture (RYGT_DLSS_TEMPORAL_HUD_ALPHA=1) neither is needed: the display
+    // is rebuilt where the game reads it.
+    const bool hud_alpha = NativeHudAlphaOn();
     const bool mirror =
-        hud_mode == 1 ||
-        (hud_mode == 0 && !menus_too &&
-         (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh)) ||
-          (mirror_mode == 0 && race_hud && read_back)));
-    const bool left = hud_mode == 0 && !menus_too && mirror_mode == 0 && !race_hud &&
-                      (read_back || fresh);
+        !hud_alpha &&
+        (hud_mode == 1 ||
+         (hud_mode == 0 && !menus_too &&
+          (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh)) ||
+           (mirror_mode == 0 && race_hud && read_back))));
+    const bool left = !hud_alpha && hud_mode == 0 && !menus_too && mirror_mode == 0 &&
+                      !race_hud && (read_back || fresh);
     if (left != temporal.left && temporal.left_changes++ < 64) {
         LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
                     !left ? "the temporal pass is taken"
@@ -10290,6 +10563,97 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (!late && !mirror) {
         ApplyTemporalReplace();
     }
+}
+
+void NativeRenderer::RebuildDisplayFromHud(HudLayer& layer) {
+    Native::ImageEntry* display = layer.alpha_display;
+    if (!display || !layer.alpha || !display->image) {
+        layer.alpha_dirty = false;
+        return;
+    }
+    // The scene, before the first rebuild of the frame puts the interface into the display.
+    if (!layer.alpha_scene_valid) {
+        if (!TemporalPicture(layer.alpha_scene, *display)) {
+            layer.alpha_dirty = false;
+            return;
+        }
+        CopyPicture(*display, *layer.alpha_scene);
+        layer.alpha_scene_valid = true;
+    }
+    const vk::Format display_format = static_cast<vk::Format>(display->image->Desc().format);
+    const vk::Device device = r.instance.GetDevice();
+    if (!g_hud_rebuild.Ready(device, display_format)) {
+        layer.alpha_dirty = false;
+        return;
+    }
+    VideoCore::ImageViewInfo target_info{};
+    target_info.format = display_format;
+    VideoCore::ImageViewInfo hud_info{};
+    hud_info.format = NativeHudAlphaFormat(r.instance);
+    VideoCore::ImageViewInfo scene_info{};
+    scene_info.format = static_cast<vk::Format>(layer.alpha_scene->image->Desc().format);
+    const vk::ImageView target = View(*display, target_info, ViewUse::Attachment);
+    const vk::ImageView hud = View(*layer.alpha, hud_info, ViewUse::Sampled);
+    const vk::ImageView scene = View(*layer.alpha_scene, scene_info, ViewUse::Sampled);
+    if (!target || !hud || !scene) {
+        layer.alpha_dirty = false;
+        return;
+    }
+    Stream& s = Begin();
+    EndRendering();
+    GlobalBarrier(); // the interface and the scene copy are written
+    const u32 width = display->info.size.width;
+    const u32 height = display->info.size.height;
+    const vk::Pipeline pipeline = *g_hud_rebuild.pipeline;
+    const vk::PipelineLayout layout = *g_hud_rebuild.layout;
+    const vk::Sampler linear = *g_hud_rebuild.linear;
+    const vk::Sampler nearest = *g_hud_rebuild.nearest;
+    CmdBuf{s.cmd}.Run([=](vk::CommandBuffer cmd) {
+        const vk::RenderingAttachmentInfo color{
+            .imageView = target,
+            .imageLayout = vk::ImageLayout::eGeneral,
+            .loadOp = vk::AttachmentLoadOp::eDontCare,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+        };
+        cmd.beginRendering(vk::RenderingInfo{
+            .renderArea = {{0, 0}, {width, height}},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color,
+        });
+        cmd.setViewport(0, vk::Viewport{0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f});
+        cmd.setScissor(0, vk::Rect2D{{0, 0}, {width, height}});
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        const std::array<vk::DescriptorImageInfo, 2> images{{
+            {.sampler = linear, .imageView = hud, .imageLayout = vk::ImageLayout::eGeneral},
+            {.sampler = nearest, .imageView = scene, .imageLayout = vk::ImageLayout::eGeneral},
+        }};
+        const std::array<vk::WriteDescriptorSet, 2> writes{{
+            {.dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+             .pImageInfo = &images[0]},
+            {.dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+             .pImageInfo = &images[1]},
+        }};
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0, writes);
+        cmd.draw(3, 1, 0, 0);
+        cmd.endRendering();
+    });
+    // The stream's own record of what is bound no longer holds.
+    s.rendering = false;
+    s.dynamic.Invalidate();
+    s.pipeline = vk::Pipeline{};
+    s.so_known = false;
+    s.vertex_state_known = false;
+    ForgetBindings(s);
+    Written(display);
+    s.buffers_written = true;
+    ++s.commands;
+    GlobalBarrier(); // the display is written before what reads it
+    layer.alpha_dirty = false;
 }
 
 void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {
@@ -13273,6 +13637,26 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                     info.guest_address);
         ReadDrawProbes();
     }
+    // DLSS-GT7-001 (single HUD picture): the display the frame shows holds its interface too,
+    // for whatever reads it later (a page copy, a screenshot); DLSS gets the scene (below).
+    HudLayer* alpha_layer = nullptr;
+    if (NativeHudAlphaOn()) {
+        const auto it = hud_layers.find(info.guest_address);
+        if (it != hud_layers.end() && it->second.alpha && it->second.hud_frame + 1 == frame) {
+            alpha_layer = &it->second;
+            if (alpha_layer->alpha_dirty) {
+                RebuildDisplayFromHud(*alpha_layer);
+            }
+            static u64 next_report = 0;
+            if (frame >= next_report) {
+                next_report = frame + 600;
+                LOG_WARNING(Render_Vulkan,
+                            "DLSS-GT7-001: single HUD picture: {} display rebuilds, {} pipelines "
+                            "looked up again so far",
+                            temporal.hud_alpha_rebuilds, temporal.hud_alpha_reacquired);
+            }
+        }
+    }
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
                     entry->info.size.width, entry->info.size.height};
@@ -13286,6 +13670,26 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
             display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
             display.hud_race = it->second.race_frame + 1 == frame;
+        }
+    }
+    // DLSS-GT7-001 (single HUD picture): the HUD picture over DLSS's picture of the scene.
+    if (alpha_layer) {
+        VideoCore::ImageViewInfo hud_view{};
+        hud_view.format = NativeHudAlphaFormat(r.instance);
+        const vk::ImageView hud = View(*alpha_layer->alpha, hud_view, ViewUse::Sampled);
+        if (hud) {
+            display.hud_black = hud;
+            display.hud_white = hud;
+            display.hud_alpha = true;
+            display.hud_race = alpha_layer->race_frame + 1 == frame;
+            if (alpha_layer->alpha_scene_valid && alpha_layer->alpha_scene) {
+                if (const vk::ImageView scene =
+                        View(*alpha_layer->alpha_scene, view_info, ViewUse::Sampled)) {
+                    display.image =
+                        vk::Image{Handle<VkImage_T>(alpha_layer->alpha_scene->image->NativeHandle())};
+                    display.view = scene;
+                }
+            }
         }
     }
     // DLSS-GT7-001: a result no draw came to replace stays the game's.

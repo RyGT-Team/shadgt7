@@ -1563,6 +1563,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                    {rect[0], rect[1], rect[2], rect[3]}});
         }
     }
+    hud_settings.hud_alpha = display->hud_alpha ? 1u : 0u; // DLSS-GT7-001
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
                    display->hud_white, hud_widgets);
     if (time_passes) {

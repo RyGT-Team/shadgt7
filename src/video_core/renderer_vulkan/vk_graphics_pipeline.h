@@ -54,6 +54,9 @@ struct GraphicsPipelineKey {
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
         u32 alpha_to_coverage : 1; // FIX-220
+        /// DLSS-GT7-001: an interface draw into the single HUD picture (vk_rasterizer_native.cpp):
+        /// its target is that picture's format, and its alpha keeps what shows through.
+        u32 hud_alpha : 1;
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;

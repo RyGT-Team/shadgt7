@@ -36,6 +36,9 @@ public:
         u32 hud = 0;
         float hud_x0 = 0.0f;
         float hud_x1 = 1.0f;
+        /// DLSS-GT7-001: the HUD is one picture, colour over black and what shows through in
+        /// alpha (hud_black and hud_white are then the same picture).
+        u32 hud_alpha = 0;
     };
 
     /// FIX-GT7-145: the format of a frame shown on an HDR10 output, the swapchain's own 10 bits.
