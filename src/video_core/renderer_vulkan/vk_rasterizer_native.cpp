@@ -9243,14 +9243,27 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
+    // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
-        if (!hud_layer || hud_layer->race_frame == frame) {
+        const bool for_layer = hud_layer && hud_layer->race_frame != frame;
+        const bool for_temporal =
+            RytyUpscale::TemporalRequested() && temporal.race_hud_frame != frame &&
+            targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        if (!for_layer && !for_temporal) {
             return;
         }
         for (const auto* sampled : b.sampled) {
+            if (!sampled) {
+                continue;
+            }
             const auto it = hud_depth_drawn.find(sampled->info.guest_address);
             if (it != hud_depth_drawn.end() && it->second == frame) {
-                hud_layer->race_frame = frame;
+                if (for_layer) {
+                    hud_layer->race_frame = frame;
+                }
+                if (for_temporal) {
+                    temporal.race_hud_frame = frame;
+                }
                 return;
             }
         }
@@ -9860,6 +9873,27 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     constexpr u64 Gt7TemporalAa = 0xcfa125dd;
     const Shader::Info* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     if (!fs || fs->pgm_hash != Gt7TemporalAa) {
+        return;
+    }
+    // Only in a race. The game runs the same pass behind menus that have a 3D scene (the title
+    // screen over the world map, seen by the user on 2026-11-12), and such a page reads the
+    // display picture back while it draws: with its interface kept in the HUD pictures the page
+    // read the bare scene, and the title's artwork was lost to the map. Outside a race the pass
+    // is left alone and DLSS runs as without the prototype. A race is told as GT7-UW tells it,
+    // by its HUD's track and course maps, seen in one of the last two frames; so a race's first
+    // frames are not taken either. RYGT_DLSS_TEMPORAL_MENUS=1: every frame with the pass.
+    static const bool menus_too = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENUS");
+        return env && env[0] == '1';
+    }();
+    const bool race = temporal.race_hud_frame != ~u64{0} && frame - temporal.race_hud_frame <= 2;
+    if (race != temporal.race && temporal.race_changes++ < 16) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    race ? "a race's HUD is shown, the temporal pass is taken"
+                         : "no race's HUD, the temporal pass is left to the game");
+    }
+    temporal.race = race;
+    if (!race && !menus_too) {
         return;
     }
     const auto refuse = [&](const char* why) {

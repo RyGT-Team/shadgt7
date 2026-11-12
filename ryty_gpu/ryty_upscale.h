@@ -86,13 +86,15 @@ inline bool NativeAA() {
 // with a motion-vector target, and resolves it with its own temporal anti-aliasing pass (pixel
 // shader 0xcfa125dd); the native renderer notes that pass's inputs and replaces its result with
 // the frame's un-resolved colour, so DLSS, at the present, gets jittered frames it can
-// accumulate. Elsewhere (menus, a frame without that pass) DLSS runs as before. Measured and
+// accumulate. Elsewhere (menus, a frame without that pass, outside a race) DLSS runs as before. Measured and
 // written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
 //   RYGT_DLSS_TEMPORAL_KEY=0     no keys (Page Up switches the prototype off and on while
 //                                playing; Page Down steps through the jitter's signs, see
 //                                TemporalJitterChoices). Not function keys: the emulator's own
 //                                hotkeys take them all (F9 pauses the game, F10 hides the FPS
 //                                counter), which the first builds' F9 and F10 ran into.
+//   RYGT_DLSS_TEMPORAL_MENUS=1   also outside a race (menus with a 3D scene: their pages come
+//                                out wrong, see NoteTemporalDraw)
 //   RYGT_DLSS_TEMPORAL_TAA=1     the game's anti-aliasing result is kept (DLSS still gets the data)
 //   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
 //                                read the un-resolved colour too (the first prototype)

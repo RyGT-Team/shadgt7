@@ -368,6 +368,11 @@ private:
         u64 seen = 0;     ///< passes noted
         u64 replaced = 0; ///< results replaced with the un-resolved colour
         u64 refused = 0;  ///< passes whose inputs or constants did not fit
+        /// The frame a draw into a display buffer last showed a race's HUD maps; the pass is
+        /// only taken in a race (NoteTemporalDraw).
+        u64 race_hud_frame = ~u64{0};
+        bool race = false;    ///< as of the last pass seen
+        u32 race_changes = 0; ///< logged
     };
     TemporalCapture temporal;
     /// Called at the end of a draw: notes the pass's inputs and replaces its result.
