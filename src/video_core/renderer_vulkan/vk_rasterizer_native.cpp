@@ -9466,8 +9466,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
         if (temporal.scene_draw_frame != frame) {
             temporal.scene_draw_frame = frame;
-        } else if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
-            halo_shift = true;
+        } else {
+            // The interface's first draw: the display as it is now (the scene alone) is kept,
+            // so DLSS's motion can be none where the interface drew (End switches it). One copy
+            // and two barriers a frame.
+            if (temporal.ui_scene_frame != frame &&
+                RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
+                const u32 slot = static_cast<u32>(frame & 1);
+                if (Native::ImageEntry* scene =
+                        TemporalPicture(temporal.ui_scene[slot], *targets.colors[0])) {
+                    CopyPicture(*targets.colors[0], *scene);
+                    temporal.ui_scene_frame = frame;
+                    temporal.ui_scene_slot = slot;
+                    temporal.ui_scene_address = targets.colors[0]->info.guest_address;
+                }
+            }
+            if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
+                halo_shift = true;
+            }
         }
     }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
@@ -13779,6 +13795,16 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         inputs.mvec_scale[0] = temporal.mvec_scale[0];
         inputs.mvec_scale[1] = temporal.mvec_scale[1];
         inputs.reset = temporal.reset;
+        // A menu frame whose interface went through DLSS: the display before its interface,
+        // seen through the display's own view (same channel order as what DLSS gets).
+        const Native::ImageEntry* ui_scene = temporal.ui_scene[temporal.ui_scene_slot];
+        if (ui_scene && temporal.ui_scene_frame + 1 == frame &&
+            temporal.ui_scene_address == entry->info.guest_address &&
+            ui_scene->info.size.width == entry->info.size.width &&
+            ui_scene->info.size.height == entry->info.size.height &&
+            RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
+            inputs.ui_scene_view = View(*ui_scene, view_info, ViewUse::Sampled);
+        }
         if (inputs.depth_view && inputs.motion_view) {
             display.temporal = inputs;
         }

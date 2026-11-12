@@ -73,21 +73,30 @@ bool MotionFixOn() {
     return on;
 }
 
-/// Records the pass into cmdbuf; false when the game's vectors must be used as they are.
+/// Records the pass into cmdbuf; false when the game's vectors must be used as they are. input:
+/// the colour DLSS gets (shader read-only layout), compared with t.ui_scene_view when there is one.
 bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
-               const RytyUpscale::TemporalInputs& t) {
+               const RytyUpscale::TemporalInputs& t, vk::ImageView input) {
     MotionFix& fix = g_motion_fix;
     if (fix.failed || !MotionFixOn() || t.mvec_scale[0] == 0.0f || t.mvec_scale[1] == 0.0f) {
         return false;
     }
     if (!fix.pipeline) {
-        const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 4> bindings{{
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
             {.binding = 1,
              .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 2,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 3,
+             .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
         }};
@@ -105,7 +114,7 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
         const vk::PushConstantRange range{
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
             .offset = 0,
-            .size = 2 * sizeof(float),
+            .size = 4 * sizeof(float),
         };
         auto [layout_result, layout] =
             device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
@@ -208,7 +217,18 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
         .imageView = *fix.view,
         .imageLayout = vk::ImageLayout::eGeneral,
     };
-    const std::array<vk::WriteDescriptorSet, 2> writes{{
+    // Without the display before its interface, the colour is compared with itself (no mask).
+    const bool mask = t.ui_scene_view && input;
+    const vk::DescriptorImageInfo shown{
+        .imageView = input ? input : t.motion_view,
+        .imageLayout = input ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorImageInfo scene = mask ? vk::DescriptorImageInfo{
+                                                     .imageView = t.ui_scene_view,
+                                                     .imageLayout = vk::ImageLayout::eGeneral,
+                                                 }
+                                               : shown;
+    const std::array<vk::WriteDescriptorSet, 4> writes{{
         {.dstBinding = 0,
          .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eSampledImage,
@@ -217,12 +237,31 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
          .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eStorageImage,
          .pImageInfo = &target},
+        {.dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &scene},
+        {.dstBinding = 3,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &shown},
     }};
     // jitter (pixels) = -(c14*c20, c15*c21) and scale = -(c14, c15) / size: back to (c20, c21).
-    const std::array<float, 2> jitter{
+    // Then the mask, and the least change taken for the interface (half a step of a 10-bit
+    // display's colour, so equal pictures never count).
+    const std::array<float, 4> jitter{
         t.jitter[0] / (t.mvec_scale[0] * static_cast<float>(t.size.width)),
         t.jitter[1] / (t.mvec_scale[1] * static_cast<float>(t.size.height)),
+        mask ? 1.0f : 0.0f,
+        0.5f / 1023.0f,
     };
+    static u64 masked_frames = 0;
+    if (mask && masked_frames++ % 600 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: no motion handed to DLSS where the menu's interface drew "
+                    "({} frames so)",
+                    masked_frames);
+    }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fix.pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fix.layout, 0, writes);
     cmdbuf.pushConstants(*fix.layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -944,7 +983,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         mvec = Texture(t->motion, t->motion_view, vk::ImageLayout::eGeneral, input_size,
                        t->motion_format,
                        vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment);
-        if (FixMotion(device, allocator, cmdbuf, *t)) {
+        if (FixMotion(device, allocator, cmdbuf, *t, input)) {
             mvec = Texture(g_motion_fix.image, *g_motion_fix.view,
                            vk::ImageLayout::eShaderReadOnlyOptimal, input_size,
                            vk::Format::eR16G16Sfloat,

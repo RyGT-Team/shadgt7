@@ -400,6 +400,12 @@ private:
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
         u32 through_changes = 0;      ///< logged
+        /// The display as it was before its interface, in such frames (two, by frame parity:
+        /// the presenter may still read the last one while the next frame draws).
+        std::array<Native::ImageEntry*, 2> ui_scene{};
+        u64 ui_scene_frame = ~u64{0}; ///< the frame the last one was taken in
+        u32 ui_scene_slot = 0;        ///< which
+        VAddr ui_scene_address = 0;   ///< the display buffer it was taken from
         u64 hud_alpha_reacquired = 0; ///< pipelines looked up again for their target
         bool hud_batch_open = false;  ///< HUD records wait in the HUD lists
         bool display_draw_now = false; ///< the draw being recorded goes into a display buffer

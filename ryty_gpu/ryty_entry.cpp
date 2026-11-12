@@ -293,10 +293,13 @@ void DrawFpsCounter() {
         const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;
         std::snprintf(
             text + written, sizeof(text) - written,
-            " | DLSS %s (Page Haut) | interface des menus %s (Debut)",
+            " | DLSS %s (Page Haut) | interface des menus %s (Debut), %s (Fin)",
             !wanted ? "classique" : used ? "TEMPOREL" : "temporel en attente",
             Vulkan::RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed) ? "decalee"
-                                                                                   : "fixe");
+                                                                                   : "fixe",
+            Vulkan::RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)
+                ? "immobile"
+                : "avec la scene");
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImVec2 origin = ImGui::GetMainViewport()->Pos;

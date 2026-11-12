@@ -1490,10 +1490,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         static bool end_was_down = false;
         const bool end_down = key && (GetAsyncKeyState(0x23 /* End */) & 0x8000) != 0;
         if (end_down && !end_was_down) {
-            const bool full = !RytyUpscale::TemporalHudFull().load(std::memory_order_relaxed);
-            RytyUpscale::TemporalHudFull().store(full, std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: End, HUD pictures {} (frame {})",
-                        full ? "at twice the display's size" : "at the display's size",
+            const bool on = !RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalUiMask().store(on, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: End, menu interface {} (frame {})",
+                        on ? "without motion for DLSS" : "with the scene's motion",
                         DebugState.GetFrameNum());
         }
         end_was_down = end_down;

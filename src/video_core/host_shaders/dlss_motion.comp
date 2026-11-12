@@ -7,6 +7,10 @@
 // back out as it reads them (history at position - jitter - motion). DLSS wants the motion alone:
 // the frame's jitter, in the vectors' own unit, is added back here. A vector under -1000 is the
 // game's mark for "no history" (mirrors, monitors): no motion is given there.
+// In a menu whose interface goes into DLSS's picture (mask on), the display before its interface
+// is compared with the display DLSS gets: where they differ, or next to such a pixel (DLSS takes
+// a pixel's motion from its nearest neighbour in depth, and the interface has no depth of its
+// own), no motion either, so the static labels stay put while the scene under them moves.
 
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
@@ -16,9 +20,20 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform texture2D game_motion;
 layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
 
+layout(set = 0, binding = 2) uniform texture2D scene; // the display before its interface
+layout(set = 0, binding = 3) uniform texture2D shown; // the display as DLSS gets it
+
 layout(push_constant) uniform Constants {
     vec2 jitter; // the frame's jitter constants (c20, c21), in the vectors' unit
+    float mask;  // 1: no motion where the interface drew
+    float threshold;
 } constants;
+
+bool InterfaceAt(ivec2 at, ivec2 size) {
+    at = clamp(at, ivec2(0), size - 1);
+    const vec3 d = abs(texelFetch(shown, at, 0).rgb - texelFetch(scene, at, 0).rgb);
+    return max(max(d.r, d.g), d.b) > constants.threshold;
+}
 
 void main() {
     const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
@@ -27,5 +42,17 @@ void main() {
     }
     vec2 vector = texelFetch(game_motion, at, 0).xy;
     vector = vector.x < -1000.0 ? vec2(0.0) : vector + constants.jitter;
+    if (constants.mask > 0.5) {
+        const ivec2 size = imageSize(motion);
+        bool drawn = false;
+        for (int y = -1; y <= 1 && !drawn; ++y) {
+            for (int x = -1; x <= 1 && !drawn; ++x) {
+                drawn = InterfaceAt(at + ivec2(x, y), size);
+            }
+        }
+        if (drawn) {
+            vector = vec2(0.0);
+        }
+    }
     imageStore(motion, at, vec4(vector, 0.0, 0.0));
 }

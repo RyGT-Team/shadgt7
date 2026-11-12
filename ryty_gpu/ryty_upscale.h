@@ -115,6 +115,9 @@ struct TemporalInputs {
     float jitter[2];     ///< this frame's jitter in pixels: the scene's shift, x right, y down
     float mvec_scale[2]; ///< motion * scale = (previous - current position) / picture size
     bool reset;          ///< the frame before had no such pass (a camera cut): history starts over
+    /// A menu frame whose interface went through DLSS: the display as it was before its interface
+    /// (same view as the display's), so the motion pass finds where the interface drew. Else null.
+    vk::ImageView ui_scene_view;
 };
 
 /// RYGT_DLSS_TEMPORAL=1 was set for this run.
@@ -216,6 +219,17 @@ inline std::atomic<u32>& TemporalHaloMode() {
 /// Home while playing (2026-11-12, to judge which DLSS keeps the sharper and steadier).
 inline std::atomic<bool>& TemporalUiJitter() {
     static std::atomic<bool> on{true};
+    return on;
+}
+
+/// In such menus, where the interface drew the motion handed to DLSS is none (true): the static
+/// labels stay put while the camera turns (the garage's smeared behind it, 2026-11-12). Switched
+/// with End while playing; RYGT_DLSS_TEMPORAL_UI_MASK=0 starts with it off.
+inline std::atomic<bool>& TemporalUiMask() {
+    static std::atomic<bool> on{[] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_UI_MASK");
+        return !(env && env[0] == '0');
+    }()};
     return on;
 }
 
