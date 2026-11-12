@@ -9468,8 +9468,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             temporal.scene_draw_frame = frame;
         } else {
             // The interface's first draw: the display as it is now (the scene alone) is kept,
-            // so DLSS's motion can be none where the interface drew (End switches it). One copy
-            // and two barriers a frame.
+            // so DLSS's motion pass finds where the interface drew and gives it no motion where
+            // it stays put on the screen (End switches it; dlss_motion.comp). One copy and two
+            // barriers a frame.
             if (temporal.ui_scene_frame != frame &&
                 RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
                 const u32 slot = static_cast<u32>(frame & 1);
