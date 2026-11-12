@@ -291,7 +291,7 @@ void DrawFpsCounter() {
         written < static_cast<int>(sizeof(text))) {
         const bool wanted = Vulkan::RytyUpscale::TemporalActive();
         const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;
-        std::snprintf(text + written, sizeof(text) - written, " | DLSS %s (F9) | jitter %s (F10)",
+        std::snprintf(text + written, sizeof(text) - written, " | DLSS %s (Page Haut) | jitter %s (Page Bas)",
                       !wanted ? "classique" : used ? "TEMPOREL" : "temporel en attente",
                       Vulkan::RytyUpscale::TemporalJitterNow().name);
     }

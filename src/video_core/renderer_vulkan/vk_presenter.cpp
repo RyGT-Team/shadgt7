@@ -1362,7 +1362,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool scaled = false;
     const vk::Extent2D upscale_target =
         RytyUpscale::Target(image_size, {frame->width, frame->height});
-    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): F9 switches it off and on while playing.
+    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): Page Up switches it off and on while playing.
     if (RytyUpscale::TemporalRequested()) {
         static const bool key = [] {
             const char* env = std::getenv("RYGT_DLSS_TEMPORAL_KEY");
@@ -1372,22 +1372,22 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         // The key's state now, and a press when it goes down (the "pressed since the last
         // call" bit is shared with every other program that asks).
         static bool was_down = false;
-        const bool down = key && (GetAsyncKeyState(0x78 /* F9 */) & 0x8000) != 0;
+        const bool down = key && (GetAsyncKeyState(0x21 /* Page Up */) & 0x8000) != 0;
         if (down && !was_down) {
             const bool on = !RytyUpscale::TemporalSwitch().load(std::memory_order_relaxed);
             RytyUpscale::TemporalSwitch().store(on, std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: F9, temporal DLSS {}", on ? "on" : "off");
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Up, temporal DLSS {}", on ? "on" : "off");
         }
         was_down = down;
-        // F10: the next choice of jitter signs (ryty_upscale.h).
+        // Page Down: the next choice of jitter signs (ryty_upscale.h).
         static bool next_was_down = false;
-        const bool next_down = key && (GetAsyncKeyState(0x79 /* F10 */) & 0x8000) != 0;
+        const bool next_down = key && (GetAsyncKeyState(0x22 /* Page Down */) & 0x8000) != 0;
         if (next_down && !next_was_down) {
             const u32 index = (RytyUpscale::TemporalJitterIndex().load(std::memory_order_relaxed) +
                                1) % static_cast<u32>(std::size(RytyUpscale::TemporalJitterChoices));
             RytyUpscale::TemporalJitterIndex().store(index, std::memory_order_relaxed);
             const auto& choice = RytyUpscale::TemporalJitterChoices[index];
-            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: F10, jitter choice {} (factors {}, {})",
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Down, jitter choice {} (factors {}, {})",
                         choice.name, choice.x, choice.y);
         }
         next_was_down = next_down;

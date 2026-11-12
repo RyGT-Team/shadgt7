@@ -88,9 +88,11 @@ inline bool NativeAA() {
 // the frame's un-resolved colour, so DLSS, at the present, gets jittered frames it can
 // accumulate. Elsewhere (menus, a frame without that pass) DLSS runs as before. Measured and
 // written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
-//   RYGT_DLSS_TEMPORAL_KEY=0     no F9 and F10 keys (F9 switches the prototype off and on while
-//                                playing; F10 steps through the jitter's signs, see
-//                                TemporalJitterChoices)
+//   RYGT_DLSS_TEMPORAL_KEY=0     no keys (Page Up switches the prototype off and on while
+//                                playing; Page Down steps through the jitter's signs, see
+//                                TemporalJitterChoices). Not function keys: the emulator's own
+//                                hotkeys take them all (F9 pauses the game, F10 hides the FPS
+//                                counter), which the first builds' F9 and F10 ran into.
 //   RYGT_DLSS_TEMPORAL_TAA=1     the game's anti-aliasing result is kept (DLSS still gets the data)
 //   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
 //                                read the un-resolved colour too (the first prototype)
@@ -153,7 +155,7 @@ inline bool TemporalReplacesTaa() {
 /// partie-20261112-091150-jitter-dlss), and by eye the user found choice A the steadiest. So the
 /// scene's shift, which is what DLSS takes as its jitter, is -(c14*c20, c15*c21): choice A,
 /// what NoteTemporalDraw notes. GT Sport's DLSS pass (shadGT, ryty_gts_dlss.cpp) hands DLSS the
-/// opposite for the same pass. F10 still steps through the other signs while playing, for
+/// opposite for the same pass. Page Down still steps through the other signs while playing, for
 /// comparison. Factors of the noted jitter.
 struct TemporalJitterChoice {
     float x;
