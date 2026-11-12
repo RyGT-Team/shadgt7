@@ -9283,6 +9283,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         hud_white_state = kept_result_state;
         second_inline = true;
     }
+    if (hud_mirrored) {
+        // A menu's interface draws its pieces through one scratch picture, written again for
+        // each piece: the record over white must run where it stands, not later in the HUD's
+        // own list, or it samples the scratch as a later piece left it (colours off in menus,
+        // seen by the user on 2026-11-12; my reading of the cause, not measured).
+        second_inline = true;
+    }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         if (r.FrameDumpCollecting()) {
             SnapPass(targets); // DIAG-226 (diagnosis)
