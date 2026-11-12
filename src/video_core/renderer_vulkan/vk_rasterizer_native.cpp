@@ -10135,7 +10135,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     temporal.race = race;
     static const int mirror_mode = [] {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIRROR");
-        return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 1;
+        return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 0;
     }();
     // 2026-11-12: three records a HUD draw took the main menu from 60 to 57 frames a second,
     // which a G-SYNC screen shows as flicker. Only where it is needed, then: while the interface
@@ -10143,15 +10143,37 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // the display, as the title screen's artwork, must find it whole in its first frame).
     // Elsewhere the HUD stays out of the display, its record over white run in place outside a
     // race (a menu's pieces share one scratch picture). Page Down forces one way (ryty_upscale.h).
-    if (temporal.frame == ~u64{0} || temporal.frame + 1 < frame) {
+    //
+    // Measured the same day on the title screen: even so, drawing the interface beside the game's
+    // costs the GPU about 3.4 ms a frame there (it alternates ~50 times a frame between a scratch
+    // picture and the display, and each time the GPU must drain before the scratch is drawn
+    // again): 46 frames a second instead of 60. The quick way chosen by the user: outside a race,
+    // where the interface reads the display back or a scene has just started, the pass is left to
+    // the game (classic DLSS there; the title screen's 3D map is hidden behind its artwork
+    // anyway). A race keeps the frames left as drawn while its HUD reads the display back (a
+    // race is held by the game's own pace, the cost does not show there). RYGT_DLSS_TEMPORAL_
+    // MIRROR=1: such menu frames left as drawn and drawn beside (the way before), =2 every frame.
+    if (temporal.seen_frame == ~u64{0} || temporal.seen_frame + 1 < frame) {
         temporal.run_start = frame;
     }
+    temporal.seen_frame = frame;
     const bool fresh = frame - temporal.run_start < 30;
     const u32 hud_mode = RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed);
     const bool mirror =
         hud_mode == 1 ||
         (hud_mode == 0 && !menus_too &&
-         (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh))));
+         (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh)) ||
+          (mirror_mode == 0 && race_hud && read_back)));
+    const bool left = hud_mode == 0 && !menus_too && mirror_mode == 0 && !race_hud &&
+                      (read_back || fresh);
+    if (left != temporal.left && temporal.left_changes++ < 64) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    !left ? "the temporal pass is taken"
+                    : read_back
+                        ? "the interface reads the display back: classic DLSS for this frame"
+                        : "a scene has just started: classic DLSS for this frame");
+    }
+    temporal.left = left;
     temporal.white_inline = hud_mode == 2 || (hud_mode == 0 && !race_hud);
     static bool mirror_logged = false;
     static u32 mirror_changes = 0;
@@ -10163,7 +10185,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
                     temporal.mirrored);
     }
     mirror_logged = mirror;
-    if (mirror_mode == 0 && hud_mode == 0 && !race && !menus_too) {
+    if (left) {
         return;
     }
     const auto refuse = [&](const char* why) {
