@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// DLSS-GT7-001 (ryty_gpu/ryty_dlssg.cpp): GT7's motion vectors, made fit for DLSS. The game
+// writes, for each pixel, where it is in this frame as drawn (with the frame's sub-pixel jitter)
+// minus where it was in the frame before without jitter; its own temporal pass takes the jitter
+// back out as it reads them (history at position - jitter - motion). DLSS wants the motion alone:
+// the frame's jitter, in the vectors' own unit, is added back here. A vector under -1000 is the
+// game's mark for "no history" (mirrors, monitors): no motion is given there.
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D game_motion;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
+
+layout(push_constant) uniform Constants {
+    vec2 jitter; // the frame's jitter constants (c20, c21), in the vectors' unit
+} constants;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, imageSize(motion)))) {
+        return;
+    }
+    vec2 vector = texelFetch(game_motion, at, 0).xy;
+    vector = vector.x < -1000.0 ? vec2(0.0) : vector + constants.jitter;
+    imageStore(motion, at, vec4(vector, 0.0, 0.0));
+}
