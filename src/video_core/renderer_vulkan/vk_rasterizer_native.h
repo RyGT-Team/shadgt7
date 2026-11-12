@@ -373,6 +373,18 @@ private:
         u64 race_hud_frame = ~u64{0};
         /// The frame a draw last sampled a display picture (the interface reading it back).
         u64 display_read_frame = ~u64{0};
+        /// Outside a race the game's pictures are left as it draws them, and the tone-mapped
+        /// un-resolved scene DLSS needs is drawn beside them (NoteTemporalDraw).
+        bool mirror = false;        ///< the frame being drawn is such a frame
+        u64 mirror_frame = ~u64{0}; ///< the last such frame
+        Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
+        Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it
+        /// The result picture, while it holds the un-resolved colour.
+        const Native::ImageEntry* swapped_out = nullptr;
+        u64 raw_frame = ~u64{0}; ///< the frame raw_display was last drawn in
+        VAddr raw_address = 0;   ///< the display buffer it stands for
+        u64 mirrored = 0;        ///< frames drawn so
+        std::vector<Native::ImageEntry*> retired; ///< pictures of another size, kept alive
         bool race = false;    ///< as of the last pass seen
         u32 race_changes = 0; ///< logged
     };
@@ -381,6 +393,13 @@ private:
     void NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
                           const DrawBindings& b);
     void ApplyTemporalReplace();
+    /// DLSS-GT7-001, frames left as the game draws them: the pass's result is put aside and
+    /// holds the un-resolved colour until the tone mapping has been drawn for DLSS; then back.
+    bool TemporalSwapIn();
+    void TemporalSwapOut();
+    void CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to);
+    /// A picture of the prototype's own like another, made again when the size changes.
+    Native::ImageEntry* TemporalPicture(Native::ImageEntry*& slot, const Native::ImageEntry& like);
     /// DLSS-GT7-001: the HUD split for this frame: a wide screen's, or a frame with the pass.
     bool HudSplitNow() const;
     /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.

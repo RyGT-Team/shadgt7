@@ -9166,13 +9166,53 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     // DLSS-GT7-001: the temporal pass's result is replaced before the first draw into it or
     // into a display buffer.
+    // In a frame left as the game draws it (temporal.mirror), the result is only lent: it holds
+    // the un-resolved colour from here until the tone mapping, which is drawn first into the
+    // prototype's own display picture (what DLSS will see), then, with the game's result back,
+    // into the game's. A draw into the result in between (the flares) is drawn into the kept
+    // result too.
+    std::optional<RenderState> raw_scene_state;
+    std::optional<RenderState> kept_result_state;
     if (temporal.pending_out) {
-        bool due = targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        const bool to_display =
+            targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        bool to_out = false;
         for (const auto* color : targets.colors) {
-            due |= color == temporal.pending_out;
+            to_out |= color == temporal.pending_out;
         }
-        if (due) {
+        if ((to_display || to_out) && !temporal.mirror) {
             ApplyTemporalReplace();
+        } else if (to_display || to_out) {
+            const bool single = targets.state.num_color_attachments == 1;
+            if (TemporalSwapIn()) {
+                const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                              r.liverpool->DrawCbExtent(0)};
+                if (to_display) {
+                    Native::ImageEntry* raw =
+                        single ? TemporalPicture(temporal.raw_display, *targets.colors[0])
+                               : nullptr;
+                    const vk::ImageView view =
+                        raw ? View(*raw, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
+                    if (view) {
+                        raw_scene_state = targets.state;
+                        raw_scene_state->color_attachments[0].image_view = view;
+                    } else {
+                        TemporalSwapOut(); // nothing for DLSS in this frame
+                    }
+                    temporal.pending_color = nullptr;
+                    temporal.pending_out = nullptr;
+                } else if (single && targets.colors[0] == temporal.pending_out) {
+                    const vk::ImageView view =
+                        View(*temporal.kept, desc.view_info, ViewUse::Attachment);
+                    if (view) {
+                        kept_result_state = targets.state;
+                        kept_result_state->color_attachments[0].image_view = view;
+                    }
+                }
+            } else {
+                temporal.pending_color = nullptr;
+                temporal.pending_out = nullptr;
+            }
         }
     }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
@@ -9228,6 +9268,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 }
             }
         }
+    }
+    // DLSS-GT7-001: the two records above go the way a HUD draw's do: first into the first
+    // state, then again into the second. A HUD draw of a frame left as the game draws it is
+    // recorded a third time, into the display itself, at its own size.
+    bool second_inline = false;
+    bool hud_unscaled = false;
+    const bool hud_mirrored =
+        hud_black_state && hud_layer && temporal.mirror && temporal.frame == frame;
+    if (raw_scene_state) {
+        hud_black_state = raw_scene_state;
+    }
+    if (kept_result_state) {
+        hud_white_state = kept_result_state;
+        second_inline = true;
     }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         if (r.FrameDumpCollecting()) {
@@ -9551,7 +9605,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             r.ctx->attachment_feedback_loop |= vk::ImageAspectFlagBits::eDepth;
         }
         r.UpdateViewportScissorState();
-        if (hud_scale > 1 && hud_black_state) {
+        if (hud_scale > 1 && hud_black_state && !hud_unscaled) {
             // DLSS-GT7-001: the HUD's pictures are hud_scale times the display's size.
             const float k = static_cast<float>(hud_scale);
             auto viewports = s.dynamic.viewports;
@@ -9781,7 +9835,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                      b.push.quad_sample_mask.data());
         }
         lds_snap_address = 0;
-        if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
+        if (hud_white_state && HudStreamOn() && !stream.wrapped_list && !second_inline) {
             // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
             std::swap(stream, hud_stream);
             BeginHudStream();
@@ -9794,6 +9848,25 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             // stay bound across the change of attachment).
             BeginRendering(*hud_white_state);
             record_draw();
+        }
+        if (raw_scene_state) {
+            // DLSS-GT7-001: the tone mapping is drawn for DLSS; now for the game, with its own
+            // result back.
+            EndRendering();
+            TemporalSwapOut();
+            temporal.raw_frame = frame;
+            temporal.raw_address = targets.colors[0]->info.guest_address;
+            ++temporal.mirrored;
+            BeginRendering(targets.state);
+            bind_state();
+            record_draw();
+        } else if (hud_mirrored) {
+            // DLSS-GT7-001: the HUD draw into the display itself, as the game expects to read it.
+            hud_unscaled = true;
+            BeginRendering(targets.state);
+            bind_state();
+            record_draw();
+            hud_unscaled = false;
         }
     }
     {
@@ -9896,6 +9969,11 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // (menus that draw a course map pass for one, hence the second rule); a read of the display
     // keeps the prototype off for half a second. RYGT_DLSS_TEMPORAL_MENUS=1: every frame with
     // the pass.
+    // Since the same day those frames are taken another way (temporal.mirror): the game's
+    // pictures are left as it draws them, so what it reads back is its own, and the tone mapping
+    // and the HUD are drawn a second time beside them for DLSS (Draw). That costs a record more
+    // a HUD draw, which is why a race keeps the first way. RYGT_DLSS_TEMPORAL_MIRROR=0: such
+    // frames are left to the game as before; =2: every frame goes this way, races too.
     static const bool menus_too = [] {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENUS");
         return env && env[0] == '1';
@@ -9913,7 +9991,12 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
                                 : "no race's HUD, the temporal pass is left to the game");
     }
     temporal.race = race;
-    if (!race && !menus_too) {
+    static const int mirror_mode = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIRROR");
+        return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 1;
+    }();
+    const bool mirror = mirror_mode == 2 || (mirror_mode == 1 && !race && !menus_too);
+    if (!race && !menus_too && !mirror) {
         return;
     }
     const auto refuse = [&](const char* why) {
@@ -10008,11 +10091,73 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_BLOOM");
         return !(env && env[0] == '0');
     }();
+    temporal.mirror = mirror;
+    if (mirror) {
+        temporal.mirror_frame = frame;
+    }
     temporal.pending_color = color;
     temporal.pending_out = out;
-    if (!late) {
+    if (!late && !mirror) {
         ApplyTemporalReplace();
     }
+}
+
+void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1};
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .dstSubresource = layers,
+        .extent{to.info.size.width, to.info.size.height, 1},
+    };
+    CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(from.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral,
+                            vk::Image{Handle<VkImage_T>(to.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, copy);
+    s.buffers_written = true;
+    ++s.commands;
+}
+
+Native::ImageEntry* NativeRenderer::TemporalPicture(Native::ImageEntry*& slot,
+                                                    const Native::ImageEntry& like) {
+    if (slot && (slot->info.size.width != like.info.size.width ||
+                 slot->info.size.height != like.info.size.height ||
+                 slot->image->Desc().format != like.image->Desc().format)) {
+        temporal.retired.push_back(slot); // commands recorded may still name it
+        slot = nullptr;
+    }
+    if (!slot) {
+        slot = MakeHudPicture(like);
+    }
+    return slot;
+}
+
+bool NativeRenderer::TemporalSwapIn() {
+    if (temporal.swapped_out) {
+        return true;
+    }
+    const Native::ImageEntry* color = temporal.pending_color;
+    const Native::ImageEntry* out = temporal.pending_out;
+    if (!color || !out || !TemporalPicture(temporal.kept, *out)) {
+        return false;
+    }
+    CopyPicture(*out, *temporal.kept);
+    CopyPicture(*color, *out);
+    temporal.swapped_out = out;
+    return true;
+}
+
+void NativeRenderer::TemporalSwapOut() {
+    const Native::ImageEntry* out = std::exchange(temporal.swapped_out, nullptr);
+    if (!out || !temporal.kept) {
+        return;
+    }
+    CopyPicture(*temporal.kept, *out);
+    Written(out);
 }
 
 void NativeRenderer::ApplyTemporalReplace() {
@@ -12955,9 +13100,34 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     // DLSS-GT7-001: a result no draw came to replace stays the game's.
     temporal.pending_color = nullptr;
     temporal.pending_out = nullptr;
+    if (temporal.swapped_out) {
+        TemporalSwapOut(); // no tone mapping came: the result goes back as it was
+    }
+    // DLSS-GT7-001: a frame left as the game drew it is shown from the prototype's own display
+    // picture (the tone-mapped un-resolved scene), with the HUD pictures laid over it as in a
+    // race. Without that picture the game's display is shown as it is, HUD and all.
+    const bool mirror_frame =
+        temporal.mirror_frame != ~u64{0} && temporal.mirror_frame + 1 == frame;
+    bool raw_shown = false;
+    if (mirror_frame && temporal.raw_display && temporal.raw_frame + 1 == frame &&
+        temporal.raw_address == entry->info.guest_address &&
+        temporal.raw_display->info.size.width == entry->info.size.width &&
+        temporal.raw_display->info.size.height == entry->info.size.height) {
+        if (const vk::ImageView raw = View(*temporal.raw_display, view_info, ViewUse::Sampled)) {
+            display.image =
+                vk::Image{Handle<VkImage_T>(temporal.raw_display->image->NativeHandle())};
+            display.view = raw;
+            raw_shown = true;
+        }
+    }
+    if (mirror_frame && !raw_shown) {
+        display.hud_black = vk::ImageView{};
+        display.hud_white = vk::ImageView{};
+    }
     // DLSS-GT7-001: the depth and motion vectors of the frame just finished, when it had the
     // game's temporal pass and they are the display's size.
-    if (RytyUpscale::TemporalActive() && temporal.frame + 1 == frame && temporal.depth &&
+    if (RytyUpscale::TemporalActive() && (!mirror_frame || raw_shown) &&
+        temporal.frame + 1 == frame && temporal.depth &&
         temporal.motion && temporal.depth->info.size.width == entry->info.size.width &&
         temporal.depth->info.size.height == entry->info.size.height) {
         VideoCore::ImageViewInfo depth_info{};
