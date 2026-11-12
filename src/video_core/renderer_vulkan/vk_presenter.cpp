@@ -1480,11 +1480,11 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         static bool home_was_down = false;
         const bool home_down = key && (GetAsyncKeyState(0x24 /* Home */) & 0x8000) != 0;
         if (home_down && !home_was_down) {
-            const u32 mode = (RytyUpscale::TemporalHaloMode().load(std::memory_order_relaxed) + 1) %
-                             static_cast<u32>(std::size(RytyUpscale::TemporalHaloModes));
-            RytyUpscale::TemporalHaloMode().store(mode, std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Home, light glows {} (frame {})",
-                        RytyUpscale::TemporalHaloModes[mode], DebugState.GetFrameNum());
+            const bool on = !RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalUiJitter().store(on, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Home, menu interface {} (frame {})",
+                        on ? "shifted by the jitter" : "where the game draws it",
+                        DebugState.GetFrameNum());
         }
         home_was_down = home_down;
         static bool end_was_down = false;

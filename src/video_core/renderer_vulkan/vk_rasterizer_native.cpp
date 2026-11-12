@@ -1125,7 +1125,9 @@ void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
 // temporal pass (a race). Menus keep their pictures as they are drawn: split, their 2D pages
 // came out wrong (seen by the user on 2026-11-11).
 bool NativeRenderer::HudSplitNow() const {
-    return HudSplitOn() && (RytyDisplayAspect() > 0.0f || temporal.frame == frame);
+    // DLSS-GT7-001: not in a menu frame whose interface goes through DLSS (NoteTemporalDraw).
+    return HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
+                            (temporal.frame == frame && temporal.through_frame != frame));
 }
 
 // DLSS-GT7-001: the prototype's HUD pictures are twice the display's size, and the HUD's draws
@@ -9456,6 +9458,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                         RytyUpscale::TemporalHaloModes[halo_mode % 3]);
         }
     }
+    // DLSS-GT7-001: in a menu frame whose interface goes through DLSS, the interface (the draws
+    // into the display after the frame's first, the scene) is drawn shifted by the frame's jitter
+    // like the scene, so DLSS gathers it as it gathers the scene (Home switches it).
+    if (temporal.through_frame == frame && temporal.frame == frame && targets.colors[0] &&
+        targets.state.num_color_attachments == 1 &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        if (temporal.scene_draw_frame != frame) {
+            temporal.scene_draw_frame = frame;
+        } else if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
+            halo_shift = true;
+        }
+    }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
     // drawn into the display's black and white HUD pictures instead.
     std::optional<RenderState> hud_black_state;
@@ -10437,8 +10451,31 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
          (hud_mode == 0 && !menus_too &&
           (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh)) ||
            (mirror_mode == 0 && race_hud && read_back))));
-    const bool left = !hud_alpha && hud_mode == 0 && !menus_too && mirror_mode == 0 &&
-                      !race_hud && (read_back || fresh);
+    // Menus (no race HUD), since the same day: the interface is not split off; it stays in the
+    // display DLSS gets, drawn shifted by the frame's jitter like the scene (Draw; Home switches
+    // it). The game's pages read their display as the game drew it, and no record is added: the
+    // menus cost what the classic DLSS costs (the title screen held 60 frames a second only that
+    // way; with the interface drawn apart it fell to 45, whatever the way). Animated interface
+    // pieces may leave trails, since they carry the scene's motion.
+    // RYGT_DLSS_TEMPORAL_MENU_CLASSIC=1: classic DLSS where a menu reads its display back (the
+    // quick way of earlier the same day).
+    static const bool menu_classic = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENU_CLASSIC");
+        return env && env[0] == '1';
+    }();
+    const bool through =
+        !menu_classic && !hud_alpha && hud_mode == 0 && !menus_too && mirror_mode == 0 && !race_hud;
+    if (through) {
+        temporal.through_frame = frame;
+    }
+    if (through != temporal.through && temporal.through_changes++ < 64) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    through ? "a menu: its interface goes through DLSS"
+                            : "a race's HUD: drawn apart at twice the size");
+    }
+    temporal.through = through;
+    const bool left = menu_classic && !hud_alpha && hud_mode == 0 && !menus_too &&
+                      mirror_mode == 0 && !race_hud && (read_back || fresh);
     if (left != temporal.left && temporal.left_changes++ < 64) {
         LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
                     !left ? "the temporal pass is taken"

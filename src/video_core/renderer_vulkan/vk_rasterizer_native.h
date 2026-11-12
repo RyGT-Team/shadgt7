@@ -396,6 +396,10 @@ private:
         u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
         u32 halo_logged = 0;          ///< draws after the pass into its result, logged
         u64 hud_alpha_rebuilds = 0;   ///< displays rebuilt from the single HUD picture
+        u64 through_frame = ~u64{0};  ///< the last menu frame whose interface goes through DLSS
+        u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
+        bool through = false;         ///< logged
+        u32 through_changes = 0;      ///< logged
         u64 hud_alpha_reacquired = 0; ///< pipelines looked up again for their target
         bool hud_batch_open = false;  ///< HUD records wait in the HUD lists
         bool display_draw_now = false; ///< the draw being recorded goes into a display buffer

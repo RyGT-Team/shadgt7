@@ -211,6 +211,14 @@ inline std::atomic<u32>& TemporalHaloMode() {
     return mode;
 }
 
+/// In menus the interface stays in the picture DLSS gets (no HUD pictures there): drawn shifted
+/// by the frame's jitter like the scene under it (true), or where the game puts it. Switched with
+/// Home while playing (2026-11-12, to judge which DLSS keeps the sharper and steadier).
+inline std::atomic<bool>& TemporalUiJitter() {
+    static std::atomic<bool> on{true};
+    return on;
+}
+
 /// The HUD pictures at twice the display's size (true) or at its size, switched with End while
 /// playing: the 4K pictures cost four times the fill for every interface draw, drawn two or three
 /// times over (2026-11-12, the main menu at 45 frames a second instead of 60).
