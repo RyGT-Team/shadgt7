@@ -14,9 +14,11 @@
 // moves (the garage's labels, with the camera turning round the car), some follows the scene
 // (the World Map's icons, pinned to places on the map while its camera flies). For each pixel at
 // or next to the interface (DLSS takes a pixel's motion from its nearest neighbour in depth, and
-// the interface has no depth of its own), the interface's pixels around it are matched against
-// the picture DLSS got in the frame before, once where they are and once where the scene's motion
-// says they came from: no motion when staying put matches better, the scene's motion otherwise.
+// the interface has no depth of its own), the interface's pixels around it (every other pixel of
+// a 13x13 square: a 3x3 one chose wrongly for 10 to 44% of a map icon's pixels inside its flat
+// black and white squares, 2026-11-12) are matched against the picture DLSS got in the frame
+// before, once where they are and once where the scene's motion says they came from: no motion
+// when staying put matches better, the scene's motion otherwise.
 // The first frame of a run has no picture before: no motion there. This frame's picture is kept
 // for the next.
 
@@ -78,11 +80,11 @@ void main() {
                 const ivec2 from = at + ivec2(round(vector * constants.to_pixels));
                 float staying = 0.0;
                 float following = 0.0;
-                for (int k = 0; k < 9; ++k) {
-                    if (!drawn[k]) {
+                for (int k = 0; k < 49; ++k) {
+                    const ivec2 offset = 2 * ivec2(k % 7 - 3, k / 7 - 3);
+                    if (!InterfaceAt(at + offset, size)) {
                         continue;
                     }
-                    const ivec2 offset = ivec2(k % 3 - 1, k / 3 - 1);
                     const vec3 now = texelFetch(shown, Clamped(at + offset, size), 0).rgb;
                     staying += Distance(now, texelFetch(previous, Clamped(at + offset, size), 0).rgb);
                     following +=
