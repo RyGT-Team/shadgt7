@@ -9616,6 +9616,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     };
     note_race_hud();
+    // DLSS-GT7-001: a draw that reads a display picture back (GT7's interface copies what is
+    // under a panel or a page into its scratch picture, for frosted panels and whole pages).
+    if (RytyUpscale::TemporalRequested() && temporal.display_read_frame != frame) {
+        for (const auto* sampled : b.sampled) {
+            if (sampled && IsDisplayAddress(sampled->info.guest_address)) {
+                temporal.display_read_frame = frame;
+                break;
+            }
+        }
+    }
     // FIX-227: hull shaders that read other patches' LS outputs (GCN LDS) get them from a
     // scratch buffer: the draw first runs as a writer pass (each patch stores its inputs, nothing
     // is drawn), then, after a barrier, as itself.
@@ -9875,22 +9885,32 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (!fs || fs->pgm_hash != Gt7TemporalAa) {
         return;
     }
-    // Only in a race. The game runs the same pass behind menus that have a 3D scene (the title
-    // screen over the world map, seen by the user on 2026-11-12), and such a page reads the
-    // display picture back while it draws: with its interface kept in the HUD pictures the page
-    // read the bare scene, and the title's artwork was lost to the map. Outside a race the pass
-    // is left alone and DLSS runs as without the prototype. A race is told as GT7-UW tells it,
-    // by its HUD's track and course maps, seen in one of the last two frames; so a race's first
-    // frames are not taken either. RYGT_DLSS_TEMPORAL_MENUS=1: every frame with the pass.
+    // Only in a race, and only while the interface does not read the display back. The game
+    // runs the same pass behind menus that have a 3D scene (the title screen over the world
+    // map, the layout cards over the globe, the pre-race page; seen by the user on 2026-11-12),
+    // and their pages and frosted panels copy the display picture while they draw: with the
+    // interface kept in the HUD pictures they copied the bare scene (the title's artwork lost
+    // to the map, cards showing the globe, panels shimmering with the un-resolved frames).
+    // There the pass is left alone and DLSS runs as without the prototype. A race is told as
+    // GT7-UW tells it, by its HUD's track and course maps, seen in one of the last two frames
+    // (menus that draw a course map pass for one, hence the second rule); a read of the display
+    // keeps the prototype off for half a second. RYGT_DLSS_TEMPORAL_MENUS=1: every frame with
+    // the pass.
     static const bool menus_too = [] {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENUS");
         return env && env[0] == '1';
     }();
-    const bool race = temporal.race_hud_frame != ~u64{0} && frame - temporal.race_hud_frame <= 2;
-    if (race != temporal.race && temporal.race_changes++ < 16) {
+    const bool race_hud =
+        temporal.race_hud_frame != ~u64{0} && frame - temporal.race_hud_frame <= 2;
+    const bool read_back =
+        temporal.display_read_frame != ~u64{0} && frame - temporal.display_read_frame <= 30;
+    const bool race = race_hud && !read_back;
+    if (race != temporal.race && temporal.race_changes++ < 32) {
         LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
-                    race ? "a race's HUD is shown, the temporal pass is taken"
-                         : "no race's HUD, the temporal pass is left to the game");
+                    race ? "a race's HUD and no read of the display, the temporal pass is taken"
+                    : read_back ? "the interface reads the display back, the temporal pass is "
+                                  "left to the game"
+                                : "no race's HUD, the temporal pass is left to the game");
     }
     temporal.race = race;
     if (!race && !menus_too) {

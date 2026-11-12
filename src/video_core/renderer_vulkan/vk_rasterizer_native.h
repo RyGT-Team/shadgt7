@@ -371,6 +371,8 @@ private:
         /// The frame a draw into a display buffer last showed a race's HUD maps; the pass is
         /// only taken in a race (NoteTemporalDraw).
         u64 race_hud_frame = ~u64{0};
+        /// The frame a draw last sampled a display picture (the interface reading it back).
+        u64 display_read_frame = ~u64{0};
         bool race = false;    ///< as of the last pass seen
         u32 race_changes = 0; ///< logged
     };
