@@ -9459,6 +9459,34 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     }
+    // DLSS-GT7-001: in a frame left as the game draws it, a HUD draw goes into the display in the
+    // main list as the game draws it, and into the HUD pictures in two lists of their own that
+    // run after the main one: consecutive HUD draws then stay in one pass each, instead of
+    // switching between three pictures at every draw (2026-11-12, the main menu: 1,450 passes
+    // and 360 pass barriers a frame instead of 350 and 24, 45 frames a second instead of 60).
+    // A draw that reads a display picture, and any other work, runs after the batch (Begin).
+    // Decided before the draw's barrier and its pictures' preparation: with the HUD pictures as
+    // its target the main list saw a change of pass at every draw and put a barrier there
+    // (the first try on 2026-11-12 halved the passes, but kept 365 barriers a frame).
+    // RYGT_DLSS_TEMPORAL_HUD_BATCH=0: every HUD draw switches pictures as before.
+    bool hud_batched = false;
+    std::optional<RenderState> batched_black;
+    std::optional<RenderState> batched_white;
+    if (hud_mirrored && HudBatchOn() && hud_black_state && hud_white_state && !regs.stage_enable.hs_en) {
+        bool reads_display = false;
+        for (const auto* sampled : b.sampled) {
+            reads_display |= sampled && IsDisplayAddress(sampled->info.guest_address);
+        }
+        hud_batched = !reads_display;
+    }
+    if (temporal.hud_batch_open && !hud_batched) {
+        CloseHudBatch();
+        Begin();
+    }
+    if (hud_batched) {
+        batched_black = std::exchange(hud_black_state, std::nullopt);
+        batched_white = std::exchange(hud_white_state, std::nullopt);
+    }
     {
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages(b); // PERF-109
@@ -9667,31 +9695,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // The run's slices stay apart in the 128 MB ring; a reader takes ~7 KB. (The demo
         // race's longest runs are ~300 draws, Daytona's ~145 a frame in all.)
         FlushLdsReaders(2);
-    }
-    // DLSS-GT7-001: in a frame left as the game draws it, a HUD draw goes into the display in the
-    // main list as the game draws it, and into the HUD pictures in two lists of their own that
-    // run after the main one: consecutive HUD draws then stay in one pass each, instead of
-    // switching between three pictures at every draw (2026-11-12, the main menu: 1,450 passes
-    // and 360 pass barriers a frame instead of 350 and 24, 45 frames a second instead of 60).
-    // A draw that reads a display picture, and any other work, runs after the batch (Begin).
-    // RYGT_DLSS_TEMPORAL_HUD_BATCH=0: every HUD draw switches pictures as before.
-    bool hud_batched = false;
-    std::optional<RenderState> batched_black;
-    std::optional<RenderState> batched_white;
-    if (hud_mirrored && HudBatchOn() && hud_black_state && hud_white_state && !lds_reader) {
-        bool reads_display = false;
-        for (const auto* sampled : b.sampled) {
-            reads_display |= sampled && IsDisplayAddress(sampled->info.guest_address);
-        }
-        hud_batched = !reads_display;
-    }
-    if (temporal.hud_batch_open && !hud_batched) {
-        CloseHudBatch();
-        Begin();
-    }
-    if (hud_batched) {
-        batched_black = std::exchange(hud_black_state, std::nullopt);
-        batched_white = std::exchange(hud_white_state, std::nullopt);
     }
     {
         PhaseClock part{stats.record_ns[1]};
