@@ -222,9 +222,10 @@ inline std::atomic<bool>& TemporalUiJitter() {
     return on;
 }
 
-/// In such menus, where the interface drew the motion handed to DLSS is none (true): the static
-/// labels stay put while the camera turns (the garage's smeared behind it, 2026-11-12). Switched
-/// with End while playing; RYGT_DLSS_TEMPORAL_UI_MASK=0 starts with it off.
+/// In such menus, where the interface drew and stays put on the screen, the motion handed to DLSS
+/// is none (true): the labels stay put while the camera turns (the garage's smeared behind it,
+/// 2026-11-12), while what follows the scene (the World Map's icons) keeps the scene's motion
+/// (dlss_motion.comp). Switched with End while playing; RYGT_DLSS_TEMPORAL_UI_MASK=0 starts off.
 inline std::atomic<bool>& TemporalUiMask() {
     static std::atomic<bool> on{[] {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_UI_MASK");
