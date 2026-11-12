@@ -11,16 +11,22 @@
 // In a menu whose interface goes into DLSS's picture (mask on), the interface has no motion of
 // its own: the display before its interface is compared with the display DLSS gets, and where
 // they differ the interface drew. Some of it stays put on the screen while the scene under it
-// moves (the garage's labels, with the camera turning round the car), some follows the scene
-// (the World Map's icons, pinned to places on the map while its camera flies). For each pixel at
-// or next to the interface (DLSS takes a pixel's motion from its nearest neighbour in depth, and
-// the interface has no depth of its own), the interface's pixels around it (every other pixel of
-// a 13x13 square: a 3x3 one chose wrongly for 10 to 44% of a map icon's pixels inside its flat
-// black and white squares, 2026-11-12) are matched against the picture DLSS got in the frame
-// before, once where they are and once where the scene's motion says they came from: no motion
-// when staying put matches better, the scene's motion otherwise.
-// The first frame of a run has no picture before: no motion there. This frame's picture is kept
-// for the next.
+// moves (the garage's labels, the camera turning round the car), some moves in one piece with
+// the scene (the World Map's icons and their labels, while its camera flies), but not with the
+// motion of the scene's pixels behind it: trees above and below a label moved 1 to 2 pixels a
+// frame apart, and the label took both (doubled, 2026-11-12). So the interface's own motion is
+// measured against the picture DLSS got in the frame before:
+//   stage 1, a group per 16x16 tile: where the tile holds enough interface, its interface pixels
+//            (every other one) are matched at 49 shifts around the scene's motion at the tile's
+//            centre and 9 around none; the best (none on a tie) is refined to a fraction of a
+//            pixel, and kept for the tile;
+//   stage 0, a thread per pixel: at or next to the interface (DLSS takes a pixel's motion from
+//            its nearest neighbour in depth, and the interface has no depth of its own), the
+//            pixel takes its tile's motion; where the tile and its four neighbours disagree, the
+//            one whose shift matches the interface pixels of the 13x13 square around it best.
+// The shift measured is the picture's, jitter included: the difference of the two frames'
+// jitters (when the interface is drawn shifted by it) is taken out. With no picture before (the
+// first frame of a run), the interface has no motion.
 
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
@@ -34,15 +40,30 @@ layout(set = 0, binding = 2) uniform texture2D scene;    // the display before i
 layout(set = 0, binding = 3) uniform texture2D shown;    // the display as DLSS gets it
 layout(set = 0, binding = 4) uniform texture2D previous; // the frame before's, as DLSS got it
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D keep; // this frame's, for the next
+// Per tile: the interface's shift (where it was - where it is, pixels, as drawn), whether the tile
+// holds enough interface, and whether its interface stays put.
+layout(set = 0, binding = 6, rgba16f) uniform image2D tiles;
 
 layout(push_constant) uniform Constants {
-    vec2 jitter;     // the frame's jitter constants (c20, c21), in the vectors' unit
-    vec2 to_pixels;  // vector * to_pixels = where the pixel was - where it is, in pixels
-    float mask;      // 1: the interface's motion is chosen as above
-    float threshold; // the least difference taken for the interface
+    vec2 jitter;         // the frame's jitter constants (c20, c21), in the vectors' unit
+    vec2 to_pixels;      // vector * to_pixels = where the pixel was - where it is, in pixels
+    float mask;          // 1: the interface's motion is measured as above
+    float threshold;     // the least difference taken for the interface
     float have_previous; // 1: previous holds the frame before's picture
-    float unused;
+    float stage;         // 1: the tiles' search, 0: the pixels
+    vec2 jitter_delta;   // the interface's shift in the frame before - in this one, pixels
 } constants;
+
+const int TILE = 16;
+const int SEARCH = 3;                          // around the scene's motion
+const int AROUND_SCENE = (2 * SEARCH + 1) * (2 * SEARCH + 1);
+const int CANDIDATES = AROUND_SCENE + 9;       // and around none
+const uint ENOUGH = 4;                         // interface taps of the 64 for a tile's own shift
+
+shared vec3 tile_now[64];
+shared uint tile_drawn[64];
+shared float tile_cost[CANDIDATES];
+shared uint tile_count;
 
 ivec2 Clamped(ivec2 at, ivec2 size) {
     return clamp(at, ivec2(0), size - 1);
@@ -59,44 +80,175 @@ float Distance(vec3 a, vec3 b) {
     return d.r + d.g + d.b;
 }
 
-void main() {
+vec2 SceneVector(ivec2 at) {
+    const vec2 vector = texelFetch(game_motion, at, 0).xy;
+    return vector.x < -1000.0 ? vec2(0.0) : vector + constants.jitter;
+}
+
+ivec2 Candidate(int c, ivec2 seed) {
+    if (c < AROUND_SCENE) {
+        return seed + ivec2(c % (2 * SEARCH + 1) - SEARCH, c / (2 * SEARCH + 1) - SEARCH);
+    }
+    c -= AROUND_SCENE;
+    return ivec2(c % 3 - 1, c / 3 - 1);
+}
+
+// The vertex of the parabola through three costs a pixel apart, as an offset from the middle.
+float Vertex(float left, float middle, float right) {
+    const float bend = left - 2.0 * middle + right;
+    return bend > 1e-6 ? clamp(0.5 * (left - right) / bend, -0.5, 0.5) : 0.0;
+}
+
+void SearchTile() {
+    const ivec2 size = imageSize(motion);
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy);
+    const ivec2 origin = tile * TILE;
+    const uint lane = gl_LocalInvocationIndex;
+    if (lane == 0) {
+        tile_count = 0;
+    }
+    barrier();
+    const ivec2 tap = Clamped(origin + 2 * ivec2(gl_LocalInvocationID.xy), size);
+    tile_now[lane] = texelFetch(shown, tap, 0).rgb;
+    const bool drawn = InterfaceAt(tap, size);
+    tile_drawn[lane] = drawn ? 1u : 0u;
+    if (drawn) {
+        atomicAdd(tile_count, 1u);
+    }
+    barrier();
+    if (tile_count < ENOUGH) {
+        if (lane == 0) {
+            imageStore(tiles, tile, vec4(0.0));
+        }
+        return;
+    }
+    const ivec2 seed = ivec2(round(SceneVector(Clamped(origin + TILE / 2, size)) *
+                                   constants.to_pixels));
+    for (int c = int(lane); c < CANDIDATES; c += 64) {
+        const ivec2 shift = Candidate(c, seed);
+        float cost = 0.0;
+        for (int k = 0; k < 64; ++k) {
+            if (tile_drawn[k] == 0u) {
+                continue;
+            }
+            const ivec2 at = Clamped(origin + 2 * ivec2(k % 8, k / 8) + shift, size);
+            cost += Distance(tile_now[k], texelFetch(previous, at, 0).rgb);
+        }
+        tile_cost[c] = cost;
+    }
+    barrier();
+    if (lane != 0) {
+        return;
+    }
+    int best = AROUND_SCENE + 4; // no shift: kept on a tie
+    for (int c = 0; c < CANDIDATES; ++c) {
+        if (tile_cost[c] < tile_cost[best]) {
+            best = c;
+        }
+    }
+    const ivec2 shift = Candidate(best, seed);
+    if (shift == ivec2(0)) {
+        imageStore(tiles, tile, vec4(0.0, 0.0, 1.0, 1.0));
+        return;
+    }
+    vec2 refined = vec2(shift);
+    if (best < AROUND_SCENE) {
+        const int side = 2 * SEARCH + 1;
+        const int x = best % side;
+        const int y = best / side;
+        if (x > 0 && x < side - 1) {
+            refined.x += Vertex(tile_cost[best - 1], tile_cost[best], tile_cost[best + 1]);
+        }
+        if (y > 0 && y < side - 1) {
+            refined.y += Vertex(tile_cost[best - side], tile_cost[best], tile_cost[best + side]);
+        }
+    }
+    imageStore(tiles, tile, vec4(refined, 1.0, 0.0));
+}
+
+// How well the interface pixels of the 13x13 square around a pixel (every other one) match the
+// frame before at a shift.
+float Match(ivec2 at, ivec2 shift, ivec2 size) {
+    float cost = 0.0;
+    for (int k = 0; k < 49; ++k) {
+        const ivec2 p = at + 2 * ivec2(k % 7 - 3, k / 7 - 3);
+        if (!InterfaceAt(p, size)) {
+            continue;
+        }
+        cost += Distance(texelFetch(shown, Clamped(p, size), 0).rgb,
+                         texelFetch(previous, Clamped(p + shift, size), 0).rgb);
+    }
+    return cost;
+}
+
+void Pixels() {
     const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     const ivec2 size = imageSize(motion);
     if (any(greaterThanEqual(at, size))) {
         return;
     }
-    vec2 vector = texelFetch(game_motion, at, 0).xy;
-    vector = vector.x < -1000.0 ? vec2(0.0) : vector + constants.jitter;
+    vec2 vector = SceneVector(at);
     if (constants.mask > 0.5) {
-        bool drawn[9];
         bool beside = false;
-        for (int k = 0; k < 9; ++k) {
-            drawn[k] = InterfaceAt(at + ivec2(k % 3 - 1, k / 3 - 1), size);
-            beside = beside || drawn[k];
+        for (int k = 0; k < 9 && !beside; ++k) {
+            beside = InterfaceAt(at + ivec2(k % 3 - 1, k / 3 - 1), size);
         }
         if (beside) {
-            bool stays = true;
+            // The shift taken (pixels, as drawn); none without the frame before.
+            vec2 shift = vec2(0.0);
             if (constants.have_previous > 0.5) {
-                const ivec2 from = at + ivec2(round(vector * constants.to_pixels));
-                float staying = 0.0;
-                float following = 0.0;
-                for (int k = 0; k < 49; ++k) {
-                    const ivec2 offset = 2 * ivec2(k % 7 - 3, k / 7 - 3);
-                    if (!InterfaceAt(at + offset, size)) {
+                const ivec2 grid = imageSize(tiles);
+                const ivec2 tile = at / TILE;
+                const ivec2 around[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0),
+                                                 ivec2(0, -1), ivec2(0, 1));
+                // The distinct shifts of the tile and its neighbours (none included when one
+                // stays put); five at most.
+                vec2 shifts[5];
+                int count = 0;
+                for (int n = 0; n < 5; ++n) {
+                    const vec4 t = imageLoad(tiles, clamp(tile + around[n], ivec2(0), grid - 1));
+                    if (t.z < 0.5) {
                         continue;
                     }
-                    const vec3 now = texelFetch(shown, Clamped(at + offset, size), 0).rgb;
-                    staying += Distance(now, texelFetch(previous, Clamped(at + offset, size), 0).rgb);
-                    following +=
-                        Distance(now, texelFetch(previous, Clamped(from + offset, size), 0).rgb);
+                    const vec2 s = t.w > 0.5 ? vec2(0.0) : t.xy;
+                    bool seen = false;
+                    for (int m = 0; m < count; ++m) {
+                        seen = seen || ivec2(round(shifts[m])) == ivec2(round(s));
+                    }
+                    if (!seen) {
+                        shifts[count++] = s;
+                    }
                 }
-                stays = staying <= following;
+                if (count == 1) {
+                    shift = shifts[0];
+                } else if (count > 1) {
+                    float best = Match(at, ivec2(0), size);
+                    for (int m = 0; m < count; ++m) {
+                        const ivec2 whole = ivec2(round(shifts[m]));
+                        if (whole == ivec2(0)) {
+                            continue;
+                        }
+                        const float cost = Match(at, whole, size);
+                        if (cost < best) {
+                            best = cost;
+                            shift = shifts[m];
+                        }
+                    }
+                }
             }
-            if (stays) {
-                vector = vec2(0.0);
-            }
+            // Staying put is exactly no motion; a shift loses the jitters' difference.
+            vector = shift == vec2(0.0) ? vec2(0.0)
+                                        : (shift - constants.jitter_delta) / constants.to_pixels;
         }
         imageStore(keep, at, vec4(texelFetch(shown, at, 0).rgb, 1.0));
     }
     imageStore(motion, at, vec4(vector, 0.0, 0.0));
+}
+
+void main() {
+    if (constants.stage > 0.5) {
+        SearchTile();
+    } else {
+        Pixels();
+    }
 }

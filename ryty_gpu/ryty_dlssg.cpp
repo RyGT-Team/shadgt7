@@ -67,6 +67,12 @@ struct MotionFix {
     std::array<vk::UniqueImageView, 2> picture_views;
     u32 next_picture = 0;       ///< the one this frame's goes into
     bool have_previous = false; ///< the other holds the frame before's
+    /// The interface's own shift per 16x16 tile (dlss_motion.comp, stage 1).
+    VideoCore::UniqueImage tiles;
+    vk::UniqueImageView tiles_view;
+    vk::Extent2D tiles_size{};
+    /// The interface's shift in the last masked frame (the jitter, when it is drawn shifted).
+    std::array<float, 2> last_ui_shift{};
 };
 MotionFix g_motion_fix;
 
@@ -87,7 +93,7 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
         return false;
     }
     if (!fix.pipeline) {
-        const std::array<vk::DescriptorSetLayoutBinding, 6> bindings{{
+        const std::array<vk::DescriptorSetLayoutBinding, 7> bindings{{
             {.binding = 0,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1,
@@ -112,6 +118,10 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
              .descriptorType = vk::DescriptorType::eStorageImage,
              .descriptorCount = 1,
              .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 6,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
         }};
         auto [set_result, set_layout] =
             device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
@@ -127,7 +137,7 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
         const vk::PushConstantRange range{
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
             .offset = 0,
-            .size = 8 * sizeof(float),
+            .size = 10 * sizeof(float),
         };
         auto [layout_result, layout] =
             device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
@@ -222,6 +232,34 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
             }
             fix.picture_views[i] = std::move(picture_view);
         }
+        // The tiles' shifts: a 16x16 tile a texel.
+        fix.tiles_view.reset();
+        fix.tiles.Destroy();
+        fix.tiles = VideoCore::UniqueImage(device, allocator);
+        fix.tiles_size = vk::Extent2D{(t.size.width + 15) / 16, (t.size.height + 15) / 16};
+        fix.tiles.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR16G16B16A16Sfloat,
+            .extent{.width = fix.tiles_size.width, .height = fix.tiles_size.height, .depth = 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eStorage,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        auto [tiles_result, tiles_view] = device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = fix.tiles,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR16G16B16A16Sfloat,
+            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                              .levelCount = 1,
+                              .layerCount = 1},
+        });
+        if (tiles_result != vk::Result::eSuccess) {
+            fix.failed = true;
+            return false;
+        }
+        fix.tiles_view = std::move(tiles_view);
         fix.have_previous = false;
         fix.next_picture = 0;
         fresh_pictures = true;
@@ -252,14 +290,17 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
     };
     // The kept pictures stay in the general layout once made (the frame before's picture is read
     // after the barrier above, this frame's written after it: it names every command before).
-    std::array<vk::ImageMemoryBarrier2, 3> image_barriers{to_write, to_write, to_write};
+    std::array<vk::ImageMemoryBarrier2, 4> image_barriers{to_write, to_write, to_write, to_write};
     u32 image_barrier_count = 1;
     if (fresh_pictures) {
-        for (u32 i = 0; i < 2; ++i) {
+        for (const vk::Image made :
+             {static_cast<vk::Image>(fix.pictures[0]), static_cast<vk::Image>(fix.pictures[1]),
+              static_cast<vk::Image>(fix.tiles)}) {
             image_barriers[image_barrier_count] = to_write;
             image_barriers[image_barrier_count].dstAccessMask =
-                vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderSampledRead;
-            image_barriers[image_barrier_count].image = fix.pictures[i];
+                vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead |
+                vk::AccessFlagBits2::eShaderSampledRead;
+            image_barriers[image_barrier_count].image = made;
             ++image_barrier_count;
         }
     }
@@ -296,7 +337,11 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
         .imageView = *fix.picture_views[fix.next_picture],
         .imageLayout = vk::ImageLayout::eGeneral,
     };
-    const std::array<vk::WriteDescriptorSet, 6> writes{{
+    const vk::DescriptorImageInfo tiles{
+        .imageView = *fix.tiles_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const std::array<vk::WriteDescriptorSet, 7> writes{{
         {.dstBinding = 0,
          .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eSampledImage,
@@ -321,30 +366,61 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
          .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eStorageImage,
          .pImageInfo = &keep},
+        {.dstBinding = 6,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &tiles},
     }};
     // jitter (pixels) = -(c14*c20, c15*c21) and scale = -(c14, c15) / size: back to (c20, c21).
     // Then the vectors' unit in pixels (vector * scale * size = where it was - where it is), the
     // mask, the least change taken for the interface (half a step of a 10-bit display's colour,
-    // so equal pictures never count), and whether the frame before's picture is there.
-    const std::array<float, 8> jitter{
+    // so equal pictures never count), whether the frame before's picture is there, the stage,
+    // and the interface's shift in the frame before minus in this one (it is drawn shifted by the
+    // frame's jitter when Home leaves it so: the pictures' shift is the jitters' difference more
+    // than its motion).
+    const bool ui_jittered = RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed);
+    const std::array<float, 2> ui_shift{ui_jittered ? t.jitter[0] : 0.0f,
+                                        ui_jittered ? t.jitter[1] : 0.0f};
+    const bool search = mask && fix.have_previous;
+    std::array<float, 10> jitter{
         t.jitter[0] / (t.mvec_scale[0] * static_cast<float>(t.size.width)),
         t.jitter[1] / (t.mvec_scale[1] * static_cast<float>(t.size.height)),
         t.mvec_scale[0] * static_cast<float>(t.size.width),
         t.mvec_scale[1] * static_cast<float>(t.size.height),
         mask ? 1.0f : 0.0f,
         0.5f / 1023.0f,
-        mask && fix.have_previous ? 1.0f : 0.0f,
+        search ? 1.0f : 0.0f,
         0.0f,
+        fix.last_ui_shift[0] - ui_shift[0],
+        fix.last_ui_shift[1] - ui_shift[1],
     };
     static u64 masked_frames = 0;
     if (mask && masked_frames++ % 600 == 0) {
         LOG_WARNING(Render_Vulkan,
-                    "DLSS-GT7-001: the menu's interface handed to DLSS still where it stays put, "
-                    "with the scene's motion where it follows it ({} frames so)",
+                    "DLSS-GT7-001: the menu's interface handed to DLSS with its own motion, "
+                    "measured per tile against the frame before ({} frames so)",
                     masked_frames);
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fix.pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fix.layout, 0, writes);
+    if (search) {
+        // Stage 1: the interface's shift per tile; stage 0 reads it.
+        jitter[7] = 1.0f;
+        cmdbuf.pushConstants(*fix.layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             static_cast<u32>(sizeof(jitter)), jitter.data());
+        cmdbuf.dispatch(fix.tiles_size.width, fix.tiles_size.height, 1);
+        const vk::MemoryBarrier2 tiles_written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &tiles_written,
+        });
+        jitter[7] = 0.0f;
+    }
     cmdbuf.pushConstants(*fix.layout, vk::ShaderStageFlagBits::eCompute, 0,
                          static_cast<u32>(sizeof(jitter)), jitter.data());
     cmdbuf.dispatch((t.size.width + 7) / 8, (t.size.height + 7) / 8, 1);
@@ -352,6 +428,7 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
     fix.have_previous = mask;
     if (mask) {
         fix.next_picture ^= 1;
+        fix.last_ui_shift = ui_shift;
     }
     const vk::ImageMemoryBarrier2 to_read{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
