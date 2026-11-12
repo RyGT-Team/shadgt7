@@ -147,12 +147,14 @@ inline bool TemporalReplacesTaa() {
     return !keep;
 }
 
-/// The jitter's sign is not settled: the pass's shader reads at position - (c14*c20, c15*c21),
-/// which says the scene is shifted by the opposite, and GT Sport's DLSS pass (shadGT,
-/// ryty_gts_dlss.cpp) hands DLSS +(c20*c14, c21*c15) for the same pass. The frame dumps of
-/// 2026-11-04 and 11-11 do not tell them apart (measured shifts within the noise). F10 steps
-/// through the choices while playing; the right one gives a steady, sharp picture with the car
-/// at a standstill. Factors of the jitter NoteTemporalDraw notes, -(c14*c20, c15*c21).
+/// The jitter's sign, measured on 2026-11-12: with the car at a standstill, 126 pairs of frames
+/// in a row of the un-resolved scene moved by -1.0 x the change of (c14*c20, c15*c21) on both
+/// axes (correlation -0.97; dev\captures\lire-jitter-dlss.py on
+/// partie-20261112-091150-jitter-dlss), and by eye the user found choice A the steadiest. So the
+/// scene's shift, which is what DLSS takes as its jitter, is -(c14*c20, c15*c21): choice A,
+/// what NoteTemporalDraw notes. GT Sport's DLSS pass (shadGT, ryty_gts_dlss.cpp) hands DLSS the
+/// opposite for the same pass. F10 still steps through the other signs while playing, for
+/// comparison. Factors of the noted jitter.
 struct TemporalJitterChoice {
     float x;
     float y;
