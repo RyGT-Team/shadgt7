@@ -40,7 +40,6 @@ endfunction()
 
 add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
 add_host_shader(dlss_motion.comp dlss_motion_comp)
-add_host_shader(hud_rebuild.frag hud_rebuild_frag)
 add_host_shader(ms_image_blit.frag ms_image_blit_frag)
 add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
 add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)

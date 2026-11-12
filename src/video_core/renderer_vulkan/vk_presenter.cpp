@@ -1457,18 +1457,23 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         }();
 #ifdef _WIN32
         // The key's state now, and a press when it goes down (the "pressed since the last
-        // call" bit is shared with every other program that asks).
+        // call" bit is shared with every other program that asks). Only while the game's window
+        // is in front: a key pressed in another program changes nothing here.
+        DWORD foreground_pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
+        const bool keys = key && foreground_pid == GetCurrentProcessId();
         static bool was_down = false;
-        const bool down = key && (GetAsyncKeyState(0x21 /* Page Up */) & 0x8000) != 0;
+        const bool down = keys && (GetAsyncKeyState(0x21 /* Page Up */) & 0x8000) != 0;
         if (down && !was_down) {
             const bool on = !RytyUpscale::TemporalSwitch().load(std::memory_order_relaxed);
             RytyUpscale::TemporalSwitch().store(on, std::memory_order_relaxed);
             LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Up, temporal DLSS {}", on ? "on" : "off");
         }
         was_down = down;
-        // Page Down: the next way of drawing the HUD; Home: the next DLSS model (ryty_upscale.h).
+        // Page Down: the next way of drawing the HUD; Home: the menus' interface shifted by the
+        // jitter or not; End: its motion mask (ryty_upscale.h).
         static bool next_was_down = false;
-        const bool next_down = key && (GetAsyncKeyState(0x22 /* Page Down */) & 0x8000) != 0;
+        const bool next_down = keys && (GetAsyncKeyState(0x22 /* Page Down */) & 0x8000) != 0;
         if (next_down && !next_was_down) {
             const u32 mode = (RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed) + 1) %
                              static_cast<u32>(std::size(RytyUpscale::TemporalHudModes));
@@ -1478,7 +1483,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         }
         next_was_down = next_down;
         static bool home_was_down = false;
-        const bool home_down = key && (GetAsyncKeyState(0x24 /* Home */) & 0x8000) != 0;
+        const bool home_down = keys && (GetAsyncKeyState(0x24 /* Home */) & 0x8000) != 0;
         if (home_down && !home_was_down) {
             const bool on = !RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed);
             RytyUpscale::TemporalUiJitter().store(on, std::memory_order_relaxed);
@@ -1488,7 +1493,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         }
         home_was_down = home_down;
         static bool end_was_down = false;
-        const bool end_down = key && (GetAsyncKeyState(0x23 /* End */) & 0x8000) != 0;
+        const bool end_down = keys && (GetAsyncKeyState(0x23 /* End */) & 0x8000) != 0;
         if (end_down && !end_was_down) {
             const bool on = !RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed);
             RytyUpscale::TemporalUiMask().store(on, std::memory_order_relaxed);
@@ -1563,7 +1568,6 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                    {rect[0], rect[1], rect[2], rect[3]}});
         }
     }
-    hud_settings.hud_alpha = display->hud_alpha ? 1u : 0u; // DLSS-GT7-001
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
                    display->hud_white, hud_widgets);
     if (time_passes) {

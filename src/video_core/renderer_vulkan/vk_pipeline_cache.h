@@ -80,9 +80,6 @@ struct DrawIndirectParams {
     bool tessellate_quads{};
     /// FIX-192: an indirect draw, whose vertex and instance ids the shader unbiases.
     bool is_indirect{};
-    /// DLSS-GT7-001: a draw into a display buffer that keeps the display as its target (the
-    /// frame's scene) while interface draws go to the single HUD picture.
-    bool hud_base{};
 };
 
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.

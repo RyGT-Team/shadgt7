@@ -286,7 +286,10 @@ bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdb
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+        // (the kept pictures and the tiles are written again as storage images)
+        .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead |
+                         vk::AccessFlagBits2::eShaderStorageRead |
+                         vk::AccessFlagBits2::eShaderStorageWrite,
     };
     // The kept pictures stay in the general layout once made (the frame before's picture is read
     // after the barrier above, this frame's written after it: it names every command before).
@@ -1212,6 +1215,9 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         last_temporal = ran_temporal;
         RytyUpscale::TemporalStatus().store(ran_temporal ? 1 : 0, std::memory_order_relaxed);
     }
+    // DLSS-GT7-001: from the next frame on the native renderer may replace the game's
+    // anti-aliasing for DLSS (ryty_upscale.h), unless Streamline refused the inputs.
+    RytyUpscale::TemporalUsable().store(ok && !temporal_refused, std::memory_order_relaxed);
     return ok;
 }
 

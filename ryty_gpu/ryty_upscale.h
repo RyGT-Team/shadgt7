@@ -5,11 +5,14 @@
 
 #include <atomic>
 #include <cmath>
-#include <iterator>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <string_view>
 
+#include "common/logging/log.h"
 #include "common/types.h"
+#include "core/libraries/kernel/process.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 // ryGT: the size DLSS and FSR 3.1 scale the game picture to (RYGT_UPSCALE_QUALITY, set by the
@@ -86,17 +89,22 @@ inline bool NativeAA() {
 // with a motion-vector target, and resolves it with its own temporal anti-aliasing pass (pixel
 // shader 0xcfa125dd); the native renderer notes that pass's inputs and replaces its result with
 // the frame's un-resolved colour, so DLSS, at the present, gets jittered frames it can
-// accumulate. Elsewhere (menus, a frame without that pass, outside a race) DLSS runs as before. Measured and
-// written up in RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
+// accumulate. In a race the HUD is drawn apart (twice the size) and laid over DLSS's picture; in
+// menus with a 3D scene the interface stays in the picture, shifted by the jitter (NoteTemporalDraw).
+// A frame without that pass is scaled as before. Measured and written up in
+// RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
+// Nothing is changed in the game's pictures unless Streamline's DLSS scales them and takes the
+// inputs (TemporalUsable): with FSR, the plain scaling, the NGX plugin or a refusal the game
+// draws as without the prototype. Off in the PS4 Pro mode on a 4K TV (TemporalRequested).
 //   RYGT_DLSS_TEMPORAL_KEY=0     no keys (Page Up switches the prototype off and on while
 //                                playing; Page Down steps through the ways the HUD is drawn,
-//                                Home through the light glows' ways, End switches the HUD pictures'
-//                                size). Not function keys: the emulator's own
-//                                hotkeys take them all (F9 pauses the game, F10 hides the FPS
+//                                Home shifts the menus' interface by the jitter or not, End
+//                                switches the menus' interface motion mask). Only read while
+//                                the game's window is in front. Not function keys: the emulator's
+//                                own hotkeys take them all (F9 pauses the game, F10 hides the FPS
 //                                counter), which the first builds' F9 and F10 ran into.
 //   RYGT_DLSS_TEMPORAL_MENUS=1   also outside a race (menus with a 3D scene: their pages come
 //                                out wrong, see NoteTemporalDraw)
-//   RYGT_DLSS_TEMPORAL_TAA=1     the game's anti-aliasing result is kept (DLSS still gets the data)
 //   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
 //                                read the un-resolved colour too (the first prototype)
 //   RYGT_DLSS_TEMPORAL_HUD_SCALE=1  the HUD is drawn at the game's size, not twice it
@@ -120,13 +128,37 @@ struct TemporalInputs {
     vk::ImageView ui_scene_view;
 };
 
-/// RYGT_DLSS_TEMPORAL=1 was set for this run.
+/// RYGT_DLSS_TEMPORAL=1 was set for this run, and the game does not run in the PS4 Pro mode on a
+/// 4K TV. There GT7 draws 3200x1800 in a checkerboard and rebuilds the full picture with its own
+/// temporal compute pass (cs 0x7aa5f0ad): no 0xcfa125dd pass to replace, and DLSS's history on
+/// top of the game's would accumulate twice (trails doubled where nothing moves, as rain). DLSS
+/// scales that picture as a single frame, as without the prototype. The Pro mode on a 1080p TV
+/// (RYGT_NEO_TV=1080) draws 1920x1080 without the checkerboard and keeps the prototype. First
+/// called while drawing, after the game's parameters are read (sceKernelIsNeoMode keeps its
+/// first answer).
 inline bool TemporalRequested() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
-        return env && env[0] == '1';
+        if (!(env && env[0] == '1')) {
+            return false;
+        }
+        const char* tv = std::getenv("RYGT_NEO_TV");
+        if (Libraries::Kernel::sceKernelIsNeoMode() && !(tv && std::string_view{tv} == "1080")) {
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: off in the PS4 Pro mode on a 4K TV (the "
+                                       "game rebuilds its checkerboard itself); classic DLSS");
+            return false;
+        }
+        return true;
     }();
     return on;
+}
+
+/// Set by the presenter's DLSS pass: Streamline's DLSS scaled the last frame and has not refused
+/// the temporal inputs. False until a first frame is scaled, and whenever DLSS is not what scales
+/// the picture (FSR, the plain scaling, the NGX plugin, a size DLSS cannot take, a failure).
+inline std::atomic<bool>& TemporalUsable() {
+    static std::atomic<bool> usable{false};
+    return usable;
 }
 
 inline std::atomic<bool>& TemporalSwitch() {
@@ -141,18 +173,10 @@ inline std::atomic<int>& TemporalStatus() {
     return status;
 }
 
-/// The prototype is requested and not switched off with its key.
+/// The prototype is requested, not switched off with its key, and DLSS can take its inputs.
 inline bool TemporalActive() {
-    return TemporalRequested() && TemporalSwitch().load(std::memory_order_relaxed);
-}
-
-/// The game's anti-aliasing result is replaced with the un-resolved colour.
-inline bool TemporalReplacesTaa() {
-    static const bool keep = [] {
-        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_TAA");
-        return env && env[0] == '1';
-    }();
-    return !keep;
+    return TemporalRequested() && TemporalSwitch().load(std::memory_order_relaxed) &&
+           TemporalUsable().load(std::memory_order_relaxed);
 }
 
 /// The jitter's sign, measured on 2026-11-12: with the car at a standstill, 126 pairs of frames

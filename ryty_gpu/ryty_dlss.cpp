@@ -182,13 +182,20 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
                            vk::Format input_format, vk::Extent2D input_size,
                            vk::Extent2D output_size,
                            const RytyUpscale::TemporalInputs* temporal) {
+    // DLSS-GT7-001: the game's pictures are only changed for DLSS while Streamline's DLSS scales
+    // them and takes the inputs (set again by RytyDlssG::Upscale).
+    auto& temporal_usable = RytyUpscale::TemporalUsable();
     if ((!g_plugin.ready && !g_streamline) || failed) {
+        temporal_usable.store(false, std::memory_order_relaxed);
         return input;
     }
     const bool supported =
         g_streamline ? RytyDlssG::UpscaleSupports(input_size, output_size)
                      : g_plugin.supports(input_size.width, input_size.height, output_size.width,
                                          output_size.height) != 0;
+    if (!supported || !g_streamline) {
+        temporal_usable.store(false, std::memory_order_relaxed); // the NGX plugin takes none
+    }
     if (!supported) {
         return input;
     }
@@ -259,6 +266,7 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
         LOG_ERROR(Render_Vulkan, "ryGT DLSS: {}; falling back to FSR",
                   g_streamline ? std::string{"Streamline's DLSS failed"} : LastError());
         failed = true;
+        temporal_usable.store(false, std::memory_order_relaxed);
     }
 
     const vk::ImageMemoryBarrier2 return_barrier{

@@ -27,7 +27,6 @@ layout (push_constant) uniform settings {
     bool hud;
     float hud_x0;
     float hud_x1;
-    bool hud_alpha; // DLSS-GT7-001: one HUD picture, what shows through in its alpha
 } pp;
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
@@ -82,12 +81,9 @@ void main() {
         if (shown) {
             // Over black the HUD left its colour times its coverage; over white also
             // 1 - coverage. Blended as the game blends it, in the display buffer's encoding.
-            const vec4 hud_px = texture(hudBlack, hud_uv);
-            const vec3 black = hud_px.rgb;
+            const vec3 black = texture(hudBlack, hud_uv).rgb;
             const vec3 white = texture(hudWhite, hud_uv).rgb;
-            const float coverage =
-                pp.hud_alpha ? clamp(1.0 - hud_px.a, 0.0, 1.0)
-                             : clamp(1.0 - dot(white - black, vec3(1.0 / 3.0)), 0.0, 1.0);
+            const float coverage = clamp(1.0 - dot(white - black, vec3(1.0 / 3.0)), 0.0, 1.0);
             color_linear.rgb = color_linear.rgb * (1.0 - coverage) + black;
         }
     }
