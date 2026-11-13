@@ -36,6 +36,8 @@ struct CeilingRecord {
 
 /// PERF-GT7-160: the ceiling file holds one `<key> <ceiling> <clean_runs>` line per GPU + driver.
 namespace CompileCeiling {
+/// PERF-GT7-160: seconds bound by builds that make a run count.
+inline constexpr u32 MinBoundSeconds = 10;
 /// Key as `<vendor hex>-<device hex>-<driver hex>`, without spaces.
 std::string Key(u32 vendor, u32 device, u32 driver);
 /// Never throws: a missing file or a corrupt line yields no record.

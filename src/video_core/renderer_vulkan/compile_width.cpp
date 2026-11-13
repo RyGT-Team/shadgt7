@@ -12,7 +12,6 @@
 namespace Vulkan {
 
 namespace {
-constexpr u32 MinBoundSeconds = 10; // PERF-GT7-160: seconds bound by builds that make a run count.
 constexpr u32 CleanRunsToRaise = 3; // PERF-GT7-160: counted runs before the ceiling grows.
 } // namespace
 

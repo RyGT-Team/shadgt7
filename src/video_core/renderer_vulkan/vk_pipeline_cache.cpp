@@ -927,10 +927,12 @@ public:
     static void StoreCleanRun() {
         std::scoped_lock lk{learn_mutex};
         PipelineBuildWorkers* const workers = learning;
-        if (!workers || dirty.load() || workers->clean_run_stored) {
+        if (!workers || workers->clean_run_stored) {
             return;
         }
+        // PERF-GT7-160: set before any return, so a later call from the destructor stays silent.
         workers->clean_run_stored = true;
+        const bool was_dirty = dirty.load();
         std::chrono::steady_clock::duration bound;
         {
             std::scoped_lock extra_lk{workers->extra_mutex};
@@ -938,15 +940,29 @@ public:
             bound = workers->bound_total;
         }
         const u32 seconds = u32(std::chrono::duration_cast<std::chrono::seconds>(bound).count());
+        const CeilingRecord old_record = workers->ceiling_record;
         const CeilingRecord next =
-            CompileCeiling::AfterCleanRun(workers->ceiling_record, seconds, Widest());
-        if (next == workers->ceiling_record) {
+            was_dirty ? old_record
+                      : CompileCeiling::AfterCleanRun(old_record, seconds, Widest());
+        // PERF-GT7-160: the one line per run that says why the file did or did not change.
+        if (was_dirty) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-GT7-160: run end {}: {} s bound (needs {}), dirty, not counted {}/{}",
+                        workers->ceiling_key, seconds, CompileCeiling::MinBoundSeconds,
+                        old_record.ceiling, old_record.clean_runs);
+            return;
+        }
+        if (next == old_record) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-GT7-160: run end {}: {} s bound (needs {}), unchanged {}/{}",
+                        workers->ceiling_key, seconds, CompileCeiling::MinBoundSeconds,
+                        old_record.ceiling, old_record.clean_runs);
             return;
         }
         LOG_WARNING(Render_Vulkan,
-                    "PERF-GT7-160: ceiling record {} {}/{} -> {}/{} (clean run, {} s bound)",
-                    workers->ceiling_key, workers->ceiling_record.ceiling,
-                    workers->ceiling_record.clean_runs, next.ceiling, next.clean_runs, seconds);
+                    "PERF-GT7-160: run end {}: {} s bound (needs {}), stored {}/{}->{}/{}",
+                    workers->ceiling_key, seconds, CompileCeiling::MinBoundSeconds,
+                    old_record.ceiling, old_record.clean_runs, next.ceiling, next.clean_runs);
         CompileCeiling::Store(workers->ceiling_file, workers->ceiling_key, next);
     }
 
