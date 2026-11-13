@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <array>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <cwctype>
 #include <iterator>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -30,6 +32,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
+#include "common/hd_ui_options.h"
 #include "common/ryty_config.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -38,7 +41,10 @@
 #include "core/file_format/psf.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/gt7_preset_options.h"
+#include "ryty_gpu/ryty_gt7_dlss_camera.h"
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
+#include "ryty_gpu/native/entry_hook.h"
+#include "ryty_gpu/ryty_ui_cache_hires.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -1946,6 +1952,11 @@ void InstallFatalErrorDiag(u8* base) {
 }
 } // namespace
 
+namespace {
+#include "ryty_gpu/ryty_hd_ui_assets.inl"
+#include "ryty_gpu/ryty_ui_cache_hires.inl"
+} // namespace
+
 
 // PERF-GT7-113: GT7's file cipher. The game decrypts what it reads (ChaCha20: 20 rounds, a 32-bit
 // block counter in state word 12, 16 state words at +8 of the cipher object) one 64-byte block at
@@ -2576,11 +2587,14 @@ void Install(u8* base) {
 } // namespace Gt7Presets
 
 void RytyApplyGamePatches() {
+    Vulkan::Gt7Temporal::InstallCameraHook();
     Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     Gt7Presets::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GT7-014
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallHdUiAssetsGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    PavilionCache::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops

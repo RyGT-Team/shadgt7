@@ -26,6 +26,7 @@
 #include "common/diagnostics.h"
 #include "common/types.h"
 #include "ryty_gpu/native/same_texel.h"
+#include "ryty_gpu/ryty_gt7_dlss.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -129,8 +130,16 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        /// GPU.hd_ui: the proxy to show instead of `view` (scene scaled, UI drawn at the output
+        /// size), at `output_size`; null without one.
+        vk::ImageView output_view{};
+        vk::Extent2D output_size{};
     };
-    std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
+    /// `window` is the size the presenter's frame has (GPU.hd_ui sizes its proxy from it).
+    /// `hdr_encoded`: the display buffer holds PQ, which the game's composite produces after the
+    /// scene (GPU.temporal_dlss reconstructs linear scenes only).
+    std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
+                                       vk::Extent2D window, bool hdr_encoded = false);
 
     /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
     void DumpFrame(const std::filesystem::path& dir);
@@ -178,12 +187,20 @@ private:
     struct Targets {
         RenderState state{};
         std::array<const Native::ImageEntry*, 8> colors{};
+        std::array<vk::Format, 8> color_formats{}; ///< GPU.hd_ui: the formats the views have
         std::array<DrawnRange, 8> color_ranges{}; ///< FIX-208
         const Native::ImageEntry* depth = nullptr;
+        u32 ui_color_feedback = 0;   ///< GPU.hd_ui: the colors the draw also samples or stores
+        u32 ui_auxiliary_mask = 0;   ///< GPU.hd_ui: the extra colors that draw into proxies
+        bool ui_side_effects = false;
+        bool ui_depth_feedback = false;
+        bool ui_depth_proxy = false; ///< GPU.hd_ui: the draw's depth is a proxy
+        bool ui_depth_write = false;
     };
 
     /// The bindings of one draw or dispatch.
     struct DrawBindings {
+        std::optional<Gt7DlssPass::Metadata> temporal; ///< the game's TAA constants (GPU.temporal_dlss)
         Pipeline::DescriptorWrites writes;
         Pipeline::WriteSets write_sets; ///< SHD-002: the set of each write
         boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffers;
@@ -717,6 +734,28 @@ private:
                                                           bool mirror = false);
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    /// GPU.hd_ui (vk_ui_hires.h): a draw into a display buffer after the scene composite goes to
+    /// the buffer's output-size proxy; draws and copies that read the buffer get the proxy's
+    /// picture first.
+    void PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
+                         const AmdGpu::Regs& regs);
+    void FinishUiTargets(const Targets& targets);
+    void PrepareMapIcons(const Targets& targets, const GraphicsPipeline& pipeline,
+                         const AmdGpu::Regs& regs, DrawBindings& b);
+    /// GPU.temporal_dlss (vk_gt7_temporal.inl): the freshness of a native picture, the capture of
+    /// the game's TAA inputs, the scene binding of the post chain, and the draw notes.
+    u64 TemporalInputVersion(const Native::ImageEntry& entry, u64 scene_frame);
+    void CaptureTemporalInputs(const AmdGpu::Regs&, const GraphicsPipeline&, const Targets&,
+                               const DrawBindings&);
+    vk::DescriptorImageInfo* TemporalSceneBinding(const AmdGpu::Regs&, const GraphicsPipeline&,
+                                                  const Targets&, DrawBindings&);
+    void NoteTemporalDraw(const AmdGpu::Regs&, const GraphicsPipeline*, const Targets*,
+                          const DrawBindings*, const char*);
+    std::unique_ptr<Gt7DlssPass> temporal_dlss;
+    u64 temporal_write_ps = 0;
+    void ResolveUiDisplay(VAddr address, bool keep);
+    void SyncUiReads(std::span<const Shader::Info* const> stages);
+    void SyncUiRange(VAddr address, u64 size, bool keep);
     /// DIAG-GT7-001: GPU timestamps of the main stream's lists.
     static bool GpuTimeOn();
     void GpuTimeBegin(Stream& s);
@@ -1291,6 +1330,8 @@ private:
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
+    u64 ui_draws = 0;    ///< GPU.hd_ui (log once)
+    u64 ui_resolves = 0;
     /// NAT-142: guest memory the GPU reads or writes in place (64 KB pages, every 8th frame):
     /// vertex buffers, indices, read-only storage through the page table, other storage
     /// buffers read, storage buffers written; NAT-150: then what is bound from video memory

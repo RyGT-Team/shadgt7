@@ -15,6 +15,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
+#include "ryty_gpu/ryty_dlssg.h"
 
 namespace Vulkan::RytyDlss {
 
@@ -34,6 +35,24 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device 
 
 /// Releases DLSS; the device must be idle.
 void Shutdown();
+
+/// Whether DLSS can scale input_size to output_size now.
+bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size);
+
+// GPU.temporal_dlss: a guest scene frame can claim SR only once.
+void BeginNativeFrame(u64 frame);
+// One spatial fallback may follow a successful temporal evaluation whose final scene composite
+// is unavailable. A failed SDK evaluation never gets the permission.
+bool PermitSpatialFallback(u64 frame);
+bool TemporalSupports(vk::Extent2D input, vk::Extent2D output);
+bool EvaluateTemporal(vk::CommandBuffer cmd, const RytyDlssG::TemporalFrame& frame);
+
+/// GPU.hd_ui: scales the game picture (readable by shaders, in the shader-read layout) into an
+/// R16G16B16A16 output image with storage usage, left in the general layout. False when DLSS is
+/// off or failed.
+bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
+               vk::ImageView output, vk::Extent2D output_size);
 
 /// Scales the game picture into an output image at the window size, like the FSR pass.
 class Pass {

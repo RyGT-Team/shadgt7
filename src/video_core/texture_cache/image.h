@@ -32,7 +32,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
 namespace VideoCore {
 
 /// Release GPU-completed recycled images unused for at least 30 seconds.
-void TrimUnusedRecycledImages(VmaAllocator allocator);
+void TrimUnusedRecycledImages(VmaAllocator allocator, bool force = false);
 u64 RecycledImageBytes();
 
 enum ImageFlagBits : u32 {
@@ -123,14 +123,17 @@ struct UniqueImage {
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          size_bytes{std::exchange(other.size_bytes, 0)} {}
     UniqueImage& operator=(UniqueImage&& other) {
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        device = other.device;
+        size_bytes = std::exchange(other.size_bytes, 0);
         return *this;
     }
 

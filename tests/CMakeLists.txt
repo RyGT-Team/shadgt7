@@ -23,6 +23,11 @@ target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
 include(GoogleTest)
 gtest_discover_tests(shadps4_stencil_test)
 
+add_executable(shadps4_hd_ui_test test_hd_ui.cpp)
+target_include_directories(shadps4_hd_ui_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_hd_ui_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_hd_ui_test)
+
 add_executable(shadps4_ryty_config_test test_ryty_config.cpp)
 target_include_directories(shadps4_ryty_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_ryty_config_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers)
@@ -632,3 +637,7 @@ foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS LINK_L
     endif()
 endforeach()
 add_test(NAME wave64_guard_regression COMMAND shadgt_wave64_guard_regression)
+
+add_executable(shadps4_gt7_dlss_recovery_test test_gt7_dlss_recovery.cpp)
+target_include_directories(shadps4_gt7_dlss_recovery_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME gt7_dlss_recovery COMMAND shadps4_gt7_dlss_recovery_test)
