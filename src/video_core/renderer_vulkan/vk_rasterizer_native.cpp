@@ -9393,7 +9393,51 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         for (const auto* color : targets.colors) {
             to_out |= color == temporal.pending_out;
         }
-        if ((to_display || to_out) && !temporal.mirror) {
+        // DLSS-GT7-003: a draw into the result before the tone mapping (GT7's motion blur in a
+        // pre-race, a replay or a TV camera; its light glows in a race). The result used to be
+        // replaced right here, so whatever the game read from it afterwards was the un-resolved
+        // colour: the bloom, when it comes after the motion blur, and its halos then blinked
+        // with the jitter (RECHERCHE-SCINTILLEMENT-LUMIERES-GT7.md, C1). Now the game's result
+        // stays resolved until the tone mapping, and the draw is recorded twice: into the result
+        // as the game draws it, and into a copy of the un-resolved colour, which is what replaces
+        // the result at the tone mapping. RYGT_DLSS_TEMPORAL_BLOOM=1: as before.
+        bool beside = false;
+        if (to_out && !to_display && TemporalKeepsResolved() &&
+            targets.state.num_color_attachments == 1 &&
+            targets.colors[0] == temporal.pending_out) {
+            if (temporal.raw_result_frame != frame) {
+                if (Native::ImageEntry* raw =
+                        TemporalPicture(temporal.raw_result, *temporal.pending_out)) {
+                    CopyPicture(*temporal.pending_color, *raw);
+                    temporal.pending_color = raw;
+                    temporal.raw_result_frame = frame;
+                }
+            }
+            if (temporal.raw_result_frame == frame) {
+                const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                              r.liverpool->DrawCbExtent(0)};
+                if (const vk::ImageView view =
+                        View(*temporal.raw_result, desc.view_info, ViewUse::Attachment)) {
+                    kept_result_state = targets.state;
+                    kept_result_state->color_attachments[0].image_view = view;
+                    beside = true;
+                    ++temporal.beside_draws;
+                    if (temporal.beside_logged < 8) {
+                        ++temporal.beside_logged;
+                        const Shader::Info* fs =
+                            pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                        LOG_WARNING(Render_Vulkan,
+                                    "DLSS-GT7-003: frame {}: a draw into the anti-aliased picture "
+                                    "before the tone mapping (ps {:#x}, {} vertices): the game "
+                                    "keeps its resolved picture, DLSS's copy gets the draw too",
+                                    frame, fs ? fs->pgm_hash : 0, regs.num_indices);
+                    }
+                }
+            }
+        }
+        if (beside) {
+            // (the result is replaced, or lent, at the tone mapping)
+        } else if ((to_display || to_out) && !temporal.mirror) {
             ApplyTemporalReplace();
         } else if (to_display || to_out) {
             const bool single = targets.state.num_color_attachments == 1;
@@ -10520,8 +10564,9 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     // The game's bloom and exposure passes read the pass's result right after it, at a quarter
     // of its size and less: they keep the game's resolved picture (steady from frame to frame;
     // on the un-resolved one the highlights of car bodies flickered, seen by the user on
-    // 2026-11-11), and the result is replaced before the next draw into it or into a display
-    // buffer, which is the tone mapping. RYGT_DLSS_TEMPORAL_BLOOM=0: replaced at once.
+    // 2026-11-11), and the result is replaced before the first draw into a display buffer, which
+    // is the tone mapping (DLSS-GT7-003, Draw). RYGT_DLSS_TEMPORAL_BLOOM=1: before the next draw
+    // into the result too, as until 2026-11-13; =0: replaced at once.
     static const bool late = [] {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_BLOOM");
         return !(env && env[0] == '0');
@@ -10535,6 +10580,14 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (!late && !mirror) {
         ApplyTemporalReplace();
     }
+}
+
+bool NativeRenderer::TemporalKeepsResolved() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_BLOOM");
+        return !(env && (env[0] == '0' || env[0] == '1'));
+    }();
+    return on;
 }
 
 void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {

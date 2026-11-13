@@ -116,6 +116,10 @@ inline bool NativeAA() {
 //                                out wrong, see NoteTemporalDraw)
 //   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
 //                                read the un-resolved colour too (the first prototype)
+//   RYGT_DLSS_TEMPORAL_BLOOM=1   the result is replaced before the first draw into it, so a bloom
+//                                that comes after the game's motion blur reads the un-resolved
+//                                colour (until 2026-11-13; lights shimmered in pre-races). By
+//                                default it stays resolved until the tone mapping (DLSS-GT7-003)
 //   RYGT_DLSS_TEMPORAL_HUD_SCALE=1  the HUD is drawn at the game's size, not twice it
 //   RYGT_DLSS_TEMPORAL_JITTER=x,y  factors applied to the jitter (default 1,1; -1 flips an axis)
 //   RYGT_DLSS_TEMPORAL_MVEC=x,y    factors applied to the motion vectors (default 1,1)

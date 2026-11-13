@@ -401,6 +401,12 @@ private:
         u64 mirror_frame = ~u64{0}; ///< the last such frame
         Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
         Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it
+        /// DLSS-GT7-003: the un-resolved colour with the game's draws into the result since the
+        /// pass (motion blur, glows), while the result itself stays resolved for the game.
+        Native::ImageEntry* raw_result = nullptr;
+        u64 raw_result_frame = ~u64{0}; ///< the frame it was last started in
+        u64 beside_draws = 0;           ///< draws recorded into it too
+        u32 beside_logged = 0;          ///< logged
         /// The result picture, while it holds the un-resolved colour.
         const Native::ImageEntry* swapped_out = nullptr;
         u64 raw_frame = ~u64{0}; ///< the frame raw_display was last drawn in
@@ -424,6 +430,9 @@ private:
     /// holds the un-resolved colour until the tone mapping has been drawn for DLSS; then back.
     bool TemporalSwapIn();
     void TemporalSwapOut();
+    /// DLSS-GT7-003: the result stays resolved until the tone mapping (default; off with
+    /// RYGT_DLSS_TEMPORAL_BLOOM=0 or 1).
+    static bool TemporalKeepsResolved();
     void CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to);
     /// A picture of the prototype's own like another, made again when the size changes.
     /// size: the picture's size, when not like's.
