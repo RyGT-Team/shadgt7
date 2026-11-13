@@ -1300,8 +1300,40 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     return handle;
 }
 
+// DLSS-GT7-002: the bias temporal DLSS adds to a guest sampler (ryty_upscale.h), zero for those
+// it does not apply to. As in RyGT-Team/shadgt7 PR 42, it goes to the samplers of material
+// textures: filtered linearly over a mip chain. Shadow compares, point samplers and single-level
+// samplers keep the game's bias.
+// FIX-GT7-182: so does a sampler some instruction reads at an explicit level. Vulkan adds a
+// sampler's mipLodBias to explicit levels too ("LOD Operation"), and a level the shader computed
+// (GT7's roughness-to-mip reflection lookups) is not the screen-space footprint the bias
+// corrects: biased, dry roads looked wet. RYGT_DLSS_BIAS_EXPLICIT_LOD=1 biases those too.
+static float TemporalSamplerBias(const AmdGpu::Sampler& sampler, bool is_depth,
+                                 bool explicit_lod) {
+    const float bias = RytyUpscale::TemporalMipBias().load(std::memory_order_relaxed);
+    if (bias == 0.0f || is_depth) {
+        return 0.0f;
+    }
+    static const bool bias_explicit = [] {
+        const char* env = std::getenv("RYGT_DLSS_BIAS_EXPLICIT_LOD");
+        return env && env[0] == '1';
+    }();
+    if (explicit_lod && !bias_explicit) {
+        return 0.0f;
+    }
+    const auto linear = [](AmdGpu::Filter f) {
+        return f == AmdGpu::Filter::Bilinear || f == AmdGpu::Filter::AnisoLinear;
+    };
+    const bool material = sampler.mip_filter != AmdGpu::MipFilter::None &&
+                          sampler.MaxLod() > sampler.MinLod() && linear(sampler.xy_min_filter) &&
+                          linear(sampler.xy_mag_filter) &&
+                          sampler.filter_mode == AmdGpu::FilterMode::Blend;
+    return material ? bias : 0.0f;
+}
+
 vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
-                                       AmdGpu::BorderColorBuffer border, bool is_depth) {
+                                       AmdGpu::BorderColorBuffer border, bool is_depth,
+                                       bool explicit_lod) {
     auto sharp = original;
     if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
         sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
@@ -1312,7 +1344,9 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
         std::array<u64, 2> sharp;
         u64 extra;
         vk::Sampler sampler;
+        float resolution_bias{};
     };
+    const float resolution_bias = TemporalSamplerBias(sharp, is_depth, explicit_lod);
     static thread_local std::array<CachedSampler, 256> cached{};
     static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
     CachedSampler* cache = nullptr;
@@ -1322,21 +1356,24 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
     if (NextOn()) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
-        if (cache->sampler && cache->sharp == raw && cache->extra == extra) {
+        if (cache->sampler && cache->sharp == raw && cache->extra == extra &&
+            cache->resolution_bias == resolution_bias) {
             return cache->sampler;
         }
     }
-    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
+    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth, resolution_bias);
     if (cache) {
-        *cache = {raw, extra, sampler};
+        *cache = {raw, extra, sampler, resolution_bias};
     }
     return sampler;
 }
 
 vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
-                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+                                        AmdGpu::BorderColorBuffer border, bool is_depth,
+                                        float resolution_bias) {
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
+                     (u64(std::bit_cast<u32>(resolution_bias)) << 16) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
                      (custom ? u64(border.Address()) << 1 : 0);
     std::scoped_lock lock{sampler_mutex};
@@ -1397,6 +1434,12 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         // Vulkan bounds the bias's absolute value; sampler.cpp only bounds it from above.
         const float max_bias = r.instance.MaxSamplerLodBias();
         const float bias = std::clamp(state.LodBias() + texture_lod_bias, -max_bias, max_bias);
+        state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
+    }
+    if (resolution_bias != 0.0f) {
+        // DLSS-GT7-002: the sampler's own state carries the bias, so the pool keys on it.
+        const float max_bias = r.instance.MaxSamplerLodBias();
+        const float bias = std::clamp(state.LodBias() + resolution_bias, -max_bias, max_bias);
         state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
     }
     struct Key {
@@ -7286,7 +7329,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                         u32(ssharp.xy_mag_filter.Value()), ssharp.MinLod(), ssharp.MaxLod(),
                         u32(ssharp.lod_bias.Value()));
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth,
+                                       sampler.explicit_lod),
+                            VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -11254,7 +11299,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth,
+                                       sampler.explicit_lod),
+                            VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{

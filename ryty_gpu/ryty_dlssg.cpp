@@ -1214,6 +1214,9 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         ++(ran_temporal ? temporal_frames : flat_frames);
         last_temporal = ran_temporal;
         RytyUpscale::TemporalStatus().store(ran_temporal ? 1 : 0, std::memory_order_relaxed);
+        if (ran_temporal) {
+            RytyUpscale::NoteTemporalScale(input_size, output_size); // DLSS-GT7-002
+        }
     }
     // DLSS-GT7-001: from the next frame on the native renderer may replace the game's
     // anti-aliasing for DLSS (ryty_upscale.h), unless Streamline refused the inputs.

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -297,6 +298,46 @@ inline void TemporalFactors(const char* name, float out[2]) {
                 out[1] = y;
             }
         }
+    }
+}
+
+/// DLSS-GT7-002 (test of 2026-11-13): the texture LOD bias NVIDIA's guide asks for with DLSS,
+/// log2(render width / display width) - 1, so -2 from 1920 to 3840, on the samplers RyGT-Team/
+/// shadgt7 PR 42 gives it to. The scene is drawn at half the display's size: without the bias
+/// the game picks its mips for 1080p and DLSS has nothing finer to rebuild (leaves, grass).
+/// Zero until DLSS has taken a frame with the game's depth, motion vectors and jitter, so a run
+/// without the prototype samples as before; then kept for the run, as menus alternate frames
+/// with and without the pass and a bias that followed them would swap every sampler each time.
+///   RYGT_DLSS_TEMPORAL_MIP_BIAS=0   no bias
+///   RYGT_DLSS_TEMPORAL_MIP_EXTRA=x  the term added to the ratio (default -1; from -2 to 0)
+inline std::atomic<float>& TemporalMipBias() {
+    static std::atomic<float> bias{0.0f};
+    return bias;
+}
+
+/// Called by the presenter's DLSS pass after a frame scaled with the temporal inputs.
+inline void NoteTemporalScale(vk::Extent2D render, vk::Extent2D display) {
+    static const bool wanted = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIP_BIAS");
+        return !(env && env[0] == '0');
+    }();
+    static const float extra = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIP_EXTRA");
+        const float value = env && *env ? std::strtof(env, nullptr) : -1.0f;
+        return std::isfinite(value) ? std::clamp(value, -2.0f, 0.0f) : -1.0f;
+    }();
+    if (!wanted || render.width == 0 || display.width <= render.width) {
+        return;
+    }
+    const float value =
+        std::log2(static_cast<float>(render.width) / static_cast<float>(display.width)) + extra;
+    auto& bias = TemporalMipBias();
+    if (bias.load(std::memory_order_relaxed) != value) {
+        bias.store(value, std::memory_order_relaxed);
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-002: texture bias {:.2f} on the material samplers from now on "
+                    "({}x{} scaled to {}x{})",
+                    value, render.width, render.height, display.width, display.height);
     }
 }
 

@@ -52,7 +52,8 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // 17 (FIX-GT7-043): the Info's FMask list has another layout, holds every read as an FMask and
 // their key another meaning. Older entries are not read: their Info can't be read at this layout.
 // 18 (FIX-GT7-043): an FMask's T# is kept as the way to fetch it.
-static constexpr u32 ShaderMetaVersion = 18u;
+// 19 (FIX-GT7-182): samplers record whether they are read at an explicit level.
+static constexpr u32 ShaderMetaVersion = 19u;
 } // namespace Serialization
 
 namespace Vulkan {

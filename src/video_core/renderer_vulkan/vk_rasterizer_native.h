@@ -438,11 +438,14 @@ private:
                                        vk::Extent2D size = {});
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
+    /// explicit_lod (FIX-GT7-182): the shader reads this S# at a level it chose, which must not
+    /// get the DLSS texture bias (DLSS-GT7-002).
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                           bool is_depth);
-    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool).
+                           bool is_depth, bool explicit_lod = false);
+    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool), with the
+    /// DLSS texture bias SamplerFor chose for it.
     vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                            bool is_depth);
+                            bool is_depth, float resolution_bias);
 
     Stream& Begin();
     /// PERF-GT7-018: a list for the stream, with its commands going where RingOn says.
