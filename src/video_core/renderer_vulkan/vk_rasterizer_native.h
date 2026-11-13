@@ -465,6 +465,11 @@ private:
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
     /// FIX-GT7-135: the last DrawMustNotSkip waits for a never-drawn level of a texture.
     bool one_off_texture_level = false;
+    /// FIX-GT7-153: the last DrawMustNotSkip's depth target is a circuit's shadow map (see
+    /// kept_shadow_map.h): its draw waits, without a deadline when `first` (the map not drawn
+    /// within the last frames) or out of play.
+    bool one_off_kept_shadow = false;
+    bool one_off_kept_shadow_first = false;
     /// FIX-GT7-135: the texture (address, level >= 1) whose level `target` is; {0, -1}: none.
     std::pair<VAddr, s32> TextureLevelOf(const VideoCore::ImageInfo& target);
     /// FIX-GT7-102: time the current frame's draws waited for one-off pipelines; past the
@@ -1076,6 +1081,8 @@ private:
     void ProbeDisplay(const Native::ImageEntry& entry);
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
+    /// FIX-GT7-153: bytes of circuit shadow maps kept past their idle time (a budget of their own).
+    u64 kept_shadow_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
     /// PERF-GT7-044: the small pictures drawn this frame, written back when it ends.
     std::vector<Native::ImageEntry*> frame_writebacks;
@@ -1415,6 +1422,8 @@ private:
         u64 one_off_exempt = 0; ///< PERF-GT7-023: draws into exempt pictures, skipped
         u64 one_off_budget_skips = 0; ///< FIX-GT7-102: skipped once the frame's budget was spent
         u64 one_off_harmful_waits = 0; ///< FIX-GT7-121: waited whatever the budget
+        u64 kept_shadow_waits = 0, kept_shadow_wait_ns = 0, kept_shadow_wait_max_ns = 0,
+            kept_shadow_skips = 0; ///< FIX-GT7-153
         u64 writeback_befores = 0, precise_writebacks = 0; ///< FIX-203
         /// DIAG-188: a direct dispatch's recorder time by part (pipeline, bindings, images,
         /// barrier with write-backs, recording, notes), and the write-backs' share.
