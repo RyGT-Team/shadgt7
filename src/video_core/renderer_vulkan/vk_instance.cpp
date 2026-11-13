@@ -17,6 +17,7 @@
 #include "core/libraries/kernel/process.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/compile_width.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
@@ -1423,6 +1424,10 @@ void Instance::ReportDeviceLost() const {
             std::fputs("GPU device lost with shader objects on; next start uses pipelines\n", file);
             std::fclose(file);
         }
+    }
+    // PERF-GT7-160: builds running at the loss lower the next run's compile ceiling.
+    if (const auto hook = g_device_lost_hook.load()) {
+        hook();
     }
     if (device_fault && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
         const VkDevice dev = static_cast<VkDevice>(*device);

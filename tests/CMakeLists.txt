@@ -146,6 +146,13 @@ target_compile_features(shadps4_build_queue_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_build_queue_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_build_queue_test)
 
+add_executable(shadps4_compile_width_test test_compile_width.cpp
+               ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/compile_width.cpp)
+target_include_directories(shadps4_compile_width_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_compile_width_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_compile_width_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_compile_width_test)
+
 add_executable(shadps4_driver_cache_file_test test_driver_cache_file.cpp)
 target_include_directories(shadps4_driver_cache_file_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_driver_cache_file_test PRIVATE cxx_std_23)
