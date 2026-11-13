@@ -49,11 +49,13 @@
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
 #undef far
+#include "core/libraries/kernel/process.h"
 #include "core/debug_state.h"
 #include "video_core/renderdoc.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "video_core/renderer_vulkan/kept_shadow_map.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "ryty_gpu/ryty_diag.h"
@@ -3066,6 +3068,47 @@ bool OneOffPlaceExempt(u32 safe, u32 harmful) {
     return harmful == 0 && safe >= OneOffPlaceSafeCount;
 }
 
+// FIX-GT7-153 (RYGT_KEPT_SHADOW_MAPS=0: as before): GT7 draws one shadow map of the whole circuit
+// per track (see kept_shadow_map.h), at one of a few addresses, and keeps it: the scene samples it
+// beyond the real-time cascades. Two things lost it on a cold first race, for the whole visit (no
+// shadow past ~100 m in a hood view, shadows "appearing" as they enter the cascades, until the
+// track was entered again):
+//  - PERF-GT7-023 learns kept pictures by their exact kind (size included) or by their address, and
+//    only after one was skipped and sampled; until then the map's draws waited only the frame's
+//    budget (FIX-GT7-102/109) and were skipped while their new pipelines built. A draw into it now
+//    waits whatever was learned: without a deadline at its first drawing (the map not drawn within
+//    the last frames: the whole map at a load, ~2,000 draws in one frame at Le Mans) and out of
+//    play; a redraw in play keeps the frame's budget (FIX-GT7-109). Measured on an RTX 4070 only:
+//    10-12 ms per new depth-only pipeline, ~40 ms in one loading frame at Le Mans.
+//  - Drawn during a load that then went on for hundreds of frames of compiles, nothing sampled it
+//    for 120 frames and NAT-108 dropped it; see EvictImages.
+// A draw whose colour target was not drawn lately takes the general rule first (the map passes are
+// depth-only).
+bool KeptShadowMapsOn() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_KEPT_SHADOW_MAPS");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+bool KeptShadowMapTarget(const AmdGpu::Regs& regs) {
+    const auto& db = regs.depth_buffer;
+    return KeptShadowMapsOn() &&
+           IsKeptShadowMapShape(db.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z16, db.Pitch(),
+                                db.Height(), regs.depth_view.NumSlices(), db.NumSamples());
+}
+
+// The same pictures once drawn, from their memory layout (not the draw's extent), with or without
+// stencil, as KeptShadowMapTarget reads the registers.
+bool KeptShadowMapImage(const VideoCore::ImageInfo& info) {
+    const bool z16 = info.props.is_depth && (info.pixel_format == vk::Format::eD16Unorm ||
+                                             info.pixel_format == vk::Format::eD16UnormS8Uint);
+    return KeptShadowMapsOn() &&
+           IsKeptShadowMapShape(z16, info.pitch, info.mips_layout[0].height, info.resources.layers,
+                                info.num_samples);
+}
+
 // The family of a kind: its format and tiling, whatever its size.
 template <typename Kind>
 Kind FamilyOf(Kind kind) {
@@ -3525,6 +3568,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     };
     one_off_hits.clear(); // DIAG-GT7-008
     one_off_texture_level = false; // FIX-GT7-135
+    one_off_kept_shadow = false;   // FIX-GT7-153
+    one_off_kept_shadow_first = false;
+    bool target_recent = false; // FIX-GT7-153: the frame window as drawn_lately read it, last call
     OneOffHit described{};
     // FIX-GT7-131: a colour target counts as drawn lately only through a picture of its own memory
     // layout (pitch, texel size, tiling, samples). Another layout at the same address (GT7's scratch
@@ -3562,6 +3608,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     }();
     s32 target_cb = -1; // FIX-GT7-135: the colour buffer drawn_lately looks at (-1: depth)
     const auto drawn_lately = [&](VAddr address) {
+        target_recent = false; // FIX-GT7-153
         const Native::ImageEntry* entry = registry->FindExisting(
             address, [&](const Native::ImageEntry& e) {
                 return !e.from_cpu && e.image != nullptr &&
@@ -3648,6 +3695,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             return env && *env ? std::strtoull(env, nullptr, 10) : u64{64};
         }();
         const bool lately = earlier != 0 && frame - earlier <= window;
+        target_recent = lately; // FIX-GT7-153
         if (!lately) {
             note(earlier == 0 ? 0 : frame - earlier);
             if (OneOffTrackOn()) {
@@ -3699,8 +3747,17 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                      .tile = u32(db.GetTileMode())};
     }
     if (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
-        regs.depth_buffer.DepthValid() && !drawn_lately(regs.depth_buffer.DepthAddress())) {
-        return true;
+        regs.depth_buffer.DepthValid()) {
+        const bool lately = drawn_lately(regs.depth_buffer.DepthAddress());
+        if (KeptShadowMapTarget(regs)) {
+            // FIX-GT7-153: waits whatever its kind; without a deadline at its first drawing.
+            one_off_kept_shadow = true;
+            one_off_kept_shadow_first = !target_recent;
+            return true;
+        }
+        if (!lately) {
+            return true;
+        }
     }
     return false;
 }
@@ -9090,9 +9147,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const bool must_wait = !pipeline && DrawMustNotSkip(regs);
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
     // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
+    // FIX-GT7-153: and a draw into a circuit's shadow map at its first drawing, or out of play.
+    const bool in_play = g_game_in_play.load(std::memory_order_relaxed);
+    const bool kept_shadow_wait =
+        must_wait && one_off_kept_shadow && (one_off_kept_shadow_first || !in_play);
     const bool harmful_wait =
-        must_wait && (OneOffKnownHarmful() ||
-                      (one_off_texture_level && !g_game_in_play.load(std::memory_order_relaxed)));
+        must_wait && (OneOffKnownHarmful() || kept_shadow_wait || (one_off_texture_level && !in_play));
     if (must_wait && (harmful_wait || OneOffBudgetLeft())) {
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};
@@ -9105,16 +9165,38 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                          .count()); // FIX-GT7-102
         if (pipeline) {
             ++stats.one_off_waits;
-            stats.one_off_harmful_waits += harmful_wait ? 1 : 0;
+            stats.one_off_harmful_waits += harmful_wait && !one_off_kept_shadow ? 1 : 0;
+            if (one_off_kept_shadow) {
+                // FIX-GT7-153: its own count; a line for the first waits of 1 ms or more.
+                const u64 waited_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - wait_start)
+                                              .count());
+                ++stats.kept_shadow_waits;
+                stats.kept_shadow_wait_ns += waited_ns;
+                stats.kept_shadow_wait_max_ns = std::max(stats.kept_shadow_wait_max_ns, waited_ns);
+                static std::atomic<u32> kept_logged{};
+                if (waited_ns >= 1000000) {
+                    if (const u32 n = kept_logged++; n < 64 || n % 500 == 0) {
+                        const auto& db = regs.depth_buffer;
+                        LOG_WARNING(Render_Vulkan,
+                                    "FIX-GT7-153: a draw into the shadow map at {:#x} ({}x{}, "
+                                    "16-bit) waited {:.1f} ms for its pipeline ({}, frame {})",
+                                    db.DepthAddress(), db.Pitch(), db.Height(), waited_ns / 1e6,
+                                    kept_shadow_wait ? "no deadline" : "the frame's budget", frame);
+                    }
+                }
+            }
             WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
         } else {
             ++stats.one_off_budget_skips; // FIX-GT7-109: not ready within the play budget
+            stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0; // FIX-GT7-153: a redraw in play
             WatchOneOffs(regs, true);
         }
     } else if (must_wait) {
         // FIX-GT7-102: this frame already waited its budget for one-off pipelines: skipped as
         // other draws are, and watched as a skip (it never makes its kind safe).
         ++stats.one_off_budget_skips;
+        stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0; // FIX-GT7-153: a redraw in play
         WatchOneOffs(regs, true);
     } else if (!pipeline && !one_off_hits.empty()) {
         // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
@@ -12769,7 +12851,94 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             return true;
         }
-        if (entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60 ||
+        // NEO-GT7-010: a volume (a 3D picture) the GPU baked stays whatever its time in use: GT7
+        // bakes its 64x64x64 colour-grading LUT once (cs 0x5da04de1, at 0x1009c00000) in the
+        // menus, samples it for under a second, then draws no 3D scene for two seconds; it was
+        // dropped, the tonemap read the guest memory's bytes instead and the PS4 Pro mode's scene
+        // stayed black for the rest of the session. Scratch-pool pictures are 2D. In the PS4 Pro
+        // mode only, so the base PS4 mode keeps its behaviour: RYGT_NATIVE_KEEP_VOLUMES=1 keeps
+        // them in every mode, =0 in none (as before).
+        static const bool keep_volumes = [] {
+            const char* env = std::getenv("RYGT_NATIVE_KEEP_VOLUMES");
+            if (env && env[0] == '0') {
+                return false;
+            }
+            return (env && env[0] == '1') || Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        }();
+        const bool volume = keep_volumes && entry.info.type == AmdGpu::ImageType::Color3D;
+        // FIX-GT7-153, second part: a circuit's shadow map stays whatever its time in use. On a cold
+        // first race at Le Mans GT7 drew it (frame 6071) while the load went on for a few hundred
+        // more frames of compiles; nothing sampled it for 120 frames, it was dropped, and the race
+        // uploaded its guest memory instead (the clear value: no shadow past the cascades) for the
+        // whole visit. FIX-157 could not keep it: no hash of its memory exists (the map is born from
+        // a fill, FIX-GT7-036, and its memory is GPU-only), so MemoryUnchanged never vouches for it.
+        // It is kept while no snapshot of its memory says otherwise. The NAT-114 region's own page
+        // watch turns a CPU write into a release; an unmap, a newer picture over it, or GPU work
+        // into part of its memory (ForeignWrite) let it go; a whole fill or copy at its address
+        // becomes a pending clear or upload, as for any target. A budget of its own, an eighth of
+        // the video memory setting between 256 and 512 MB, so FIX-157's pictures keep theirs; over
+        // it, the least recently used kept map goes first (only the current track's matters).
+        if (KeptShadowMapImage(entry.info)) {
+            static const u64 shadow_budget = [] {
+                const u64 vram = Instance::VideoMemorySettingBytes();
+                return vram != 0 ? std::clamp<u64>(vram / 8, u64{256} << 20, u64{512} << 20)
+                                 : u64{512} << 20;
+            }();
+            if (entry.content_hash != 0 && !registry->MemoryUnchanged(entry)) {
+                return false;
+            }
+            while (kept_shadow_bytes + size > shadow_budget) {
+                Native::ImageEntry* oldest = nullptr;
+                registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& other) {
+                    if (&other != &entry && other.kept.load(std::memory_order_relaxed) &&
+                        KeptShadowMapImage(other.info) &&
+                        (!oldest || other.last_use.load(std::memory_order_relaxed) <
+                                        oldest->last_use.load(std::memory_order_relaxed))) {
+                        oldest = &other;
+                    }
+                });
+                if (!oldest) {
+                    break;
+                }
+                oldest->kept.store(false, std::memory_order_relaxed);
+                kept_shadow_bytes -=
+                    std::min<u64>(kept_shadow_bytes, std::max<u64>(oldest->info.guest_size, 1));
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-153: the shadow map at {:#x} ({}x{}, last used at frame {}) is "
+                            "no longer kept, to keep the one at {:#x}",
+                            oldest->info.guest_address, oldest->info.size.width,
+                            oldest->info.size.height,
+                            oldest->last_use.load(std::memory_order_relaxed), address);
+            }
+            if (kept_shadow_bytes + size > shadow_budget) {
+                static std::atomic<u32> refused{};
+                if (const u32 n = refused++; n < 20 || n % 100 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-153: the shadow map at {:#x} ({}x{}, {:.1f} MB) can't be "
+                                "kept: {:.1f} MB kept of {:.1f} MB",
+                                address, entry.info.size.width, entry.info.size.height,
+                                size / 1048576.0, kept_shadow_bytes / 1048576.0,
+                                shadow_budget / 1048576.0);
+                }
+                return false;
+            }
+            entry.kept.store(true, std::memory_order_relaxed);
+            kept_shadow_bytes += size;
+            if (entry.content_hash != 0) {
+                WatchPages(address, size);
+            }
+            static std::atomic<u32> shadow_logged{};
+            if (const u32 n = shadow_logged++; n < 20 || n % 100 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-153: the shadow map at {:#x} ({}x{}) stays past its idle time "
+                            "(drawn at frame {}, last used at frame {}, frame {})",
+                            address, entry.info.size.width, entry.info.size.height,
+                            entry.made_frame, entry.last_use.load(std::memory_order_relaxed),
+                            frame);
+            }
+            return true;
+        }
+        if ((!volume && entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60) ||
             kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
             return false;
         }
@@ -12844,7 +13013,8 @@ void NativeRenderer::EvictImages() {
     }
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
         if (entry.kept.load(std::memory_order_relaxed)) {
-            kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
+            u64& bytes = KeptShadowMapImage(entry.info) ? kept_shadow_bytes : kept_bytes; // FIX-GT7-153
+            bytes -= std::min<u64>(bytes, std::max<u64>(entry.info.guest_size, 1));
         }
         if (Native::WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} evicted (last "
@@ -13330,9 +13500,41 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.size.height == info.size.height &&
                    candidate.info.num_bits == info.num_bits;
         });
+    // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
+    // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
+    // corner, copied below into an image of the display's size each frame. A lookup by the
+    // registered size found nothing and showed guest memory the GPU never wrote: a black screen.
+    // RYGT_NEO_DISPLAY_CROP=0: as before.
+    static const bool neo_display_crop = [] {
+        const char* env = std::getenv("RYGT_NEO_DISPLAY_CROP");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+    }();
+    Native::ImageEntry* corner_of = nullptr;
+    if (neo_display_crop) {
+        corner_of =
+            registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
+                return !candidate.from_cpu && !candidate.info.props.is_depth && candidate.image &&
+                       candidate.info.num_bits == info.num_bits &&
+                       candidate.info.num_samples == 1 &&
+                       candidate.info.size.width >= info.size.width &&
+                       candidate.info.size.height >= info.size.height &&
+                       (candidate.info.size.width > info.size.width ||
+                        candidate.info.size.height > info.size.height);
+            });
+        // NEO-GT7-009: an image of the display's size at the address (the copy's destination
+        // below, a render target since the first copy) is shown as it is only when it holds a
+        // newer picture than the larger one. Looked up only when none existed, the corner was
+        // copied until that destination was in use again; then the last copied frame stayed on
+        // screen: the race ran behind the frozen loading screen. Write versions share one clock.
+        if (corner_of && entry &&
+            entry->write_version.load(std::memory_order_relaxed) >=
+                corner_of->write_version.load(std::memory_order_relaxed)) {
+            corner_of = nullptr;
+        }
+    }
     if (!entry) {
         static std::atomic<u32> logged{};
-        if (Sample(logged)) {
+        if (!corner_of && Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
                         "NAT-103: nothing drew the display buffer {:#x} ({}x{}, {} bits) yet",
                         info.guest_address, info.size.width, info.size.height, info.num_bits);
@@ -13341,6 +13543,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     if (!entry || !entry->image) {
         return std::nullopt;
+    }
+    if (entry == corner_of) {
+        corner_of = nullptr;
     }
     VideoCore::ImageViewInfo view_info{};
     view_info.format = view_format;
@@ -13353,6 +13558,34 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (device->PendingImageInit()) {
         Begin();
         PrepareImages();
+    }
+    if (corner_of) { // NEO-GT7-006
+        Begin();
+        GlobalBarrier();
+        const vk::ImageSubresourceLayers layer{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        stream.cmd.copyImage(vk::Image{Handle<VkImage_T>(corner_of->image->NativeHandle())},
+                             vk::ImageLayout::eGeneral,
+                             vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                             vk::ImageLayout::eGeneral,
+                             vk::ImageCopy{.srcSubresource = layer,
+                                           .dstSubresource = layer,
+                                           .extent = {info.size.width, info.size.height, 1}});
+        GlobalBarrier();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-006: display {:#x} shows the {}x{} corner of the {}x{} picture "
+                        "drawn there ({} into {})",
+                        info.guest_address, info.size.width, info.size.height,
+                        corner_of->info.size.width, corner_of->info.size.height,
+                        vk::to_string(corner_of->info.pixel_format),
+                        vk::to_string(entry->info.pixel_format));
+        }
     }
     ProbeDisplay(*entry); // FIX-175 (diagnosis)
     if (capture_frame != ~u64{0} && capture_frame + 1 == frame) {
@@ -14628,6 +14861,15 @@ void NativeRenderer::Report() {
         LOG_INFO(Render_Vulkan, "FIX-GT7-121: {} draws into pictures of kinds seen sampled before "
                  "their redraw waited for their pipeline whatever the budget",
                  std::exchange(stats.one_off_harmful_waits, 0));
+    }
+    if (stats.kept_shadow_waits != 0 || stats.kept_shadow_skips != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-153: {} draws into whole-circuit shadow maps waited for "
+                 "their pipeline ({:.1f} ms in all, {:.1f} ms at most); {} redraws in play skipped at "
+                 "their frame's deadline",
+                 std::exchange(stats.kept_shadow_waits, 0),
+                 std::exchange(stats.kept_shadow_wait_ns, 0) / 1e6,
+                 std::exchange(stats.kept_shadow_wait_max_ns, 0) / 1e6,
+                 std::exchange(stats.kept_shadow_skips, 0));
     }
     SaveOneOffKinds(false); // PERF-GT7-023
     if (OneOffDiagOn()) {

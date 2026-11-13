@@ -33,6 +33,11 @@ target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
 gtest_discover_tests(shadps4_depth_attachment_test)
 
+add_executable(shadps4_kept_shadow_map_test test_kept_shadow_map.cpp)
+target_include_directories(shadps4_kept_shadow_map_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_kept_shadow_map_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_kept_shadow_map_test)
+
 add_executable(shadps4_color_clear_test test_color_clear.cpp test_color_blend.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
@@ -197,6 +202,18 @@ target_include_directories(shadps4_fps_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_compile_features(shadps4_fps_lock_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fps_lock_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fps_lock_test)
+
+add_executable(shadgt_gt7_preset_options_test test_gt7_preset_options.cpp)
+target_include_directories(shadgt_gt7_preset_options_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadgt_gt7_preset_options_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_gt7_preset_options_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_gt7_preset_options_test)
+
+add_executable(shadgt_coverage_reduction_test test_coverage_reduction.cpp)
+target_include_directories(shadgt_coverage_reduction_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_coverage_reduction_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_coverage_reduction_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_coverage_reduction_test)
 
 add_executable(shadgt_unique_function_test test_unique_function.cpp)
 target_include_directories(shadgt_unique_function_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
