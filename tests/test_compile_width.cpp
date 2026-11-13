@@ -10,158 +10,8 @@
 
 #include "video_core/renderer_vulkan/compile_width.h"
 
-using Vulkan::AdaptiveWidth;
 using Vulkan::CeilingRecord;
 namespace CompileCeiling = Vulkan::CompileCeiling;
-
-namespace {
-constexpr double Smooth = 34.0; // Below 36 ms: a 30 fps cap with room to spare.
-constexpr double Lag = 50.0;    // Above 40 ms.
-} // namespace
-
-TEST(CompileWidth, StartsAtStartClampedToCeiling) {
-    EXPECT_EQ(AdaptiveWidth(6, 2).Limit(), 2u);
-    EXPECT_EQ(AdaptiveWidth(6, 8).Limit(), 6u);
-}
-
-TEST(CompileWidth, LagStepsDown) {
-    AdaptiveWidth width(6, 8);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 3u);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 1u);
-}
-
-TEST(CompileWidth, LagHalvesFromTen) {
-    AdaptiveWidth width(10, 12);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 5u);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 2u);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 1u);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 1u);
-}
-
-TEST(CompileWidth, LagWhileIdleKeepsLimit) {
-    AdaptiveWidth width(6, 8);
-    for (int i = 0; i < 5; ++i) {
-        width.OnSecond(Lag, false);
-    }
-    EXPECT_EQ(width.Limit(), 6u);
-    // An unsaturated lagging second breaks the smooth streak.
-    width.OnSecond(Smooth, true);
-    width.OnSecond(Lag, false);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 6u);
-}
-
-TEST(CompileWidth, TwoSmoothSecondsStepUp) {
-    AdaptiveWidth width(6, 8);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 6u);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 7u);
-    // The streak restarts after a step, and a borderline second breaks it.
-    width.OnSecond(Smooth, true);
-    width.OnSecond(40.0, true);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 7u);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 8u);
-}
-
-TEST(CompileWidth, NotBusyNeverStepsUp) {
-    AdaptiveWidth width(6, 8);
-    for (int i = 0; i < 10; ++i) {
-        width.OnSecond(Smooth, false);
-    }
-    EXPECT_EQ(width.Limit(), 6u);
-    // An unsaturated second breaks the streak too.
-    width.OnSecond(Smooth, true);
-    width.OnSecond(Smooth, false);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 6u);
-}
-
-TEST(CompileWidth, ThresholdEdges) {
-    AdaptiveWidth width(6, 8);
-    width.OnSecond(39.9, true);
-    EXPECT_EQ(width.Limit(), 6u);
-    width.OnSecond(40.1, true);
-    EXPECT_EQ(width.Limit(), 3u);
-    for (int i = 0; i < 4; ++i) {
-        width.OnSecond(36.0, true);
-    }
-    EXPECT_EQ(width.Limit(), 3u);
-    width.OnSecond(35.9, true);
-    width.OnSecond(35.9, true);
-    EXPECT_EQ(width.Limit(), 4u);
-}
-
-TEST(CompileWidth, LoadSecondIgnoredAndResetsStreak) {
-    AdaptiveWidth width(6, 8);
-    width.OnSecond(80.0, true);
-    width.OnSecond(500.0, true);
-    EXPECT_EQ(width.Limit(), 6u);
-    width.OnSecond(Smooth, true);
-    width.OnSecond(80.0, true);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 6u);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 7u);
-}
-
-TEST(CompileWidth, StallHalvesAndBlocks10Seconds) {
-    AdaptiveWidth width(7, 8);
-    width.OnGpuStall();
-    EXPECT_EQ(width.Limit(), 3u);
-    for (int i = 0; i < 10; ++i) {
-        width.OnSecond(Smooth, true);
-    }
-    EXPECT_EQ(width.Limit(), 3u);
-    width.OnSecond(Smooth, true);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 4u);
-    // Lag still steps down during the block.
-    width.OnGpuStall();
-    ASSERT_EQ(width.Limit(), 2u);
-    width.OnSecond(Lag, true);
-    EXPECT_EQ(width.Limit(), 1u);
-}
-
-TEST(CompileWidth, BoundsOneAndCeiling) {
-    AdaptiveWidth width(2, 8);
-    for (int i = 0; i < 5; ++i) {
-        width.OnSecond(Lag, true);
-        width.OnGpuStall();
-    }
-    EXPECT_EQ(width.Limit(), 1u);
-    AdaptiveWidth wide(6, 8);
-    for (int i = 0; i < 20; ++i) {
-        wide.OnSecond(Smooth, true);
-    }
-    EXPECT_EQ(wide.Limit(), 8u);
-    wide.SetCeiling(3);
-    EXPECT_EQ(wide.Limit(), 3u);
-    wide.OnSecond(Smooth, true);
-    wide.OnSecond(Smooth, true);
-    EXPECT_EQ(wide.Limit(), 3u);
-}
-
-TEST(CompileWidth, RaisedCeilingLetsLimitClimb) {
-    AdaptiveWidth width(6, 8);
-    width.SetCeiling(3);
-    width.OnSecond(Smooth, true);
-    width.OnSecond(Smooth, true);
-    ASSERT_EQ(width.Limit(), 3u);
-    width.SetCeiling(8);
-    EXPECT_EQ(width.Limit(), 3u);
-    width.OnSecond(Smooth, true);
-    width.OnSecond(Smooth, true);
-    EXPECT_EQ(width.Limit(), 4u);
-}
 
 namespace {
 struct TempDir {
@@ -225,20 +75,32 @@ TEST(CompileCeiling, CorruptLineIgnored) {
     });
 }
 
-TEST(CompileCeiling, DeviceLostHalves) {
-    EXPECT_EQ(CompileCeiling::AfterDeviceLost(6), (CeilingRecord{3, 0}));
-    EXPECT_EQ(CompileCeiling::AfterDeviceLost(1), (CeilingRecord{1, 0}));
+TEST(CompileCeiling, FirstCeilingSixOnAmdProprietary) {
+    EXPECT_EQ(CompileCeiling::FirstCeiling(true, 12), 6u);
+    EXPECT_EQ(CompileCeiling::FirstCeiling(false, 12), 12u);
 }
-
-TEST(CompileCeiling, CleanRunsRaiseAfterThree) {
-    CeilingRecord r{3, 0};
-    r = CompileCeiling::AfterCleanRun(r, 200, 12);
-    r = CompileCeiling::AfterCleanRun(r, 200, 12);
-    EXPECT_EQ(r, (CeilingRecord{3, 2}));
-    r = CompileCeiling::AfterCleanRun(r, 199, 12);
-    EXPECT_EQ(r, (CeilingRecord{3, 2}));
-    r = CompileCeiling::AfterCleanRun(r, 200, 12);
-    EXPECT_EQ(r, (CeilingRecord{4, 0}));
-    CeilingRecord top{12, 2};
-    EXPECT_EQ(CompileCeiling::AfterCleanRun(top, 500, 12), (CeilingRecord{12, 0}));
+TEST(CompileCeiling, FirstCeilingClampedToWidest) {
+    EXPECT_EQ(CompileCeiling::FirstCeiling(true, 4), 4u);
+}
+TEST(CompileCeiling, StallHalvesPeakWithFloor) {
+    EXPECT_EQ(CompileCeiling::AfterStall({12, 2}, 12, 4), (CeilingRecord{6, 0}));
+    EXPECT_EQ(CompileCeiling::AfterStall({6, 1}, 6, 4), (CeilingRecord{4, 0}));
+}
+TEST(CompileCeiling, StallAtOrBelowFloorKeepsRecord) {
+    EXPECT_EQ(CompileCeiling::AfterStall({6, 2}, 4, 4), (CeilingRecord{6, 2}));
+    EXPECT_EQ(CompileCeiling::AfterStall({6, 2}, 2, 4), (CeilingRecord{6, 2}));
+}
+TEST(CompileCeiling, StallNeverRaisesAndIsIdempotent) {
+    const CeilingRecord once = CompileCeiling::AfterStall({5, 0}, 12, 4); // 12/2 = 6 > 5
+    EXPECT_EQ(once, (CeilingRecord{5, 0}));
+    EXPECT_EQ(CompileCeiling::AfterStall(CompileCeiling::AfterStall({12, 0}, 12, 4), 12, 4),
+              (CeilingRecord{6, 0}));
+}
+TEST(CompileCeiling, CleanRunNeedsTenBoundSeconds) {
+    EXPECT_EQ(CompileCeiling::AfterCleanRun({6, 0}, 9, 12), (CeilingRecord{6, 0}));
+    EXPECT_EQ(CompileCeiling::AfterCleanRun({6, 0}, 10, 12), (CeilingRecord{6, 1}));
+}
+TEST(CompileCeiling, ThirdCleanRunRaisesUpToWidest) {
+    EXPECT_EQ(CompileCeiling::AfterCleanRun({6, 2}, 10, 12), (CeilingRecord{7, 0}));
+    EXPECT_EQ(CompileCeiling::AfterCleanRun({12, 2}, 10, 12), (CeilingRecord{12, 0}));
 }

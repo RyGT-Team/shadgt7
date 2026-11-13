@@ -16,7 +16,7 @@ namespace Vulkan {
 /**
  * PERF-GT7-160: called by the perf monitor once per second of GPU stall (busy, no GPU tick
  * progress), set by the pipeline cache while its build workers exist. Runs on the perf monitor
- * thread, so the width backs off even while the command thread waits on the hung GPU.
+ * thread, so the ceiling is lowered even while the command thread waits on the hung GPU.
  */
 inline std::atomic<void (*)()> g_gpu_stall_hook{nullptr};
 
@@ -25,32 +25,6 @@ inline std::atomic<void (*)()> g_gpu_stall_hook{nullptr};
  * cache while its build workers learn the ceiling. Never throws.
  */
 inline std::atomic<void (*)()> g_device_lost_hook{nullptr};
-
-/**
- * PERF-GT7-160: how many pipeline builds the driver runs at once, tuned at run time from the
- * game's frame time. Each second reports the average frame time and whether it was saturated
- * (as many builds pending as the width): a lagging saturated second halves the limit, two
- * smooth saturated seconds in a row step it up, and a load second (80 ms or more) is ignored. A
- * GPU stall halves it and blocks step ups for 10 seconds. No locking: callers hold their mutex.
- */
-class AdaptiveWidth {
-public:
-    AdaptiveWidth(u32 start, u32 ceiling);
-
-    u32 Limit() const {
-        return limit;
-    }
-
-    void SetCeiling(u32 new_ceiling);
-    void OnSecond(double frame_ms, bool saturated);
-    void OnGpuStall();
-
-private:
-    u32 limit;
-    u32 ceiling;
-    u32 smooth_seconds{};  ///< Consecutive smooth, saturated seconds since the last change.
-    u32 blocked_seconds{}; ///< Seconds left without step ups after a GPU stall.
-};
 
 /// PERF-GT7-160: highest width known to be safe for one GPU + driver, kept across runs.
 struct CeilingRecord {
@@ -67,10 +41,14 @@ std::string Key(u32 vendor, u32 device, u32 driver);
 std::optional<CeilingRecord> Load(const std::filesystem::path& file, std::string_view key);
 /// Rewrites the line of `key` and keeps the others. Best effort: failures are swallowed.
 void Store(const std::filesystem::path& file, std::string_view key, CeilingRecord record);
-/// A device loss halves the peak width in use over the last seconds.
-CeilingRecord AfterDeviceLost(u32 peak_width);
-/// A run with enough builds counts; the third counted run raises the ceiling by one.
-CeilingRecord AfterCleanRun(CeilingRecord current, u32 builds, u32 widest);
+/// PERF-GT7-160: ceiling of a GPU + driver with no record: 6 on AMD proprietary, else `widest`.
+u32 FirstCeiling(bool amd_proprietary, u32 widest);
+/// PERF-GT7-160: a stall at `peak_width` builds lowers the ceiling to half of it, not below
+/// `floor`. A peak at or below `floor` keeps the record; the ceiling never rises here.
+CeilingRecord AfterStall(CeilingRecord current, u32 peak_width, u32 floor);
+/// PERF-GT7-160: a run with enough seconds bound by builds counts; the third counted run raises
+/// the ceiling by one, up to `widest`.
+CeilingRecord AfterCleanRun(CeilingRecord current, u32 bound_seconds, u32 widest);
 } // namespace CompileCeiling
 
 } // namespace Vulkan

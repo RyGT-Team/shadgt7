@@ -12,62 +12,9 @@
 namespace Vulkan {
 
 namespace {
-constexpr double LoadMs = 80.0;     // PERF-GT7-160: a second this slow is a load or a wait.
-constexpr double LagMs = 40.0;      // PERF-GT7-160: slower is lag (30 fps cap: 34-39 ms).
-constexpr double SmoothMs = 36.0;   // PERF-GT7-160: faster is smooth (30 fps cap: 34-39 ms).
-constexpr u32 SmoothToRaise = 2;    // PERF-GT7-160: smooth saturated seconds before one more build.
-constexpr u32 StallSeconds = 10;    // PERF-GT7-160: seconds without step ups after a GPU stall.
-constexpr u32 MinCleanBuilds = 200; // PERF-GT7-160: builds that make a run count as clean.
+constexpr u32 MinBoundSeconds = 10; // PERF-GT7-160: seconds bound by builds that make a run count.
 constexpr u32 CleanRunsToRaise = 3; // PERF-GT7-160: counted runs before the ceiling grows.
 } // namespace
-
-AdaptiveWidth::AdaptiveWidth(u32 start, u32 ceiling_) : limit{1}, ceiling{std::max(1u, ceiling_)} {
-    limit = std::clamp(start, 1u, ceiling);
-}
-
-void AdaptiveWidth::SetCeiling(u32 new_ceiling) {
-    ceiling = std::max(1u, new_ceiling);
-    limit = std::min(limit, ceiling);
-}
-
-void AdaptiveWidth::OnSecond(double frame_ms, bool saturated) {
-    const bool blocked = blocked_seconds > 0;
-    if (blocked) {
-        --blocked_seconds;
-    }
-    // PERF-GT7-160: a load second says nothing about the builds; it only breaks the streak.
-    if (frame_ms >= LoadMs) {
-        smooth_seconds = 0;
-        return;
-    }
-    // PERF-GT7-160: only a saturated second (as many builds pending as the width) moves the
-    // limit: otherwise the width is not in use and changing it has no effect. Load frames of
-    // 55-62 ms with nothing pending stepped it down in the first in-game run.
-    // PERF-GT7-160: lag halves the limit: back from a pause screen (cheap frames, up to 10 at
-    // a time) one step a second left a race at 20-25 fps for seconds.
-    if (frame_ms > LagMs) {
-        if (saturated) {
-            limit = std::max(1u, limit / 2);
-        }
-        smooth_seconds = 0;
-        return;
-    }
-    // PERF-GT7-160: borderline, unsaturated or blocked seconds do not count toward a step up.
-    if (!(frame_ms < SmoothMs) || !saturated || blocked) {
-        smooth_seconds = 0;
-        return;
-    }
-    if (++smooth_seconds >= SmoothToRaise) {
-        limit = std::min(limit + 1, ceiling);
-        smooth_seconds = 0;
-    }
-}
-
-void AdaptiveWidth::OnGpuStall() {
-    limit = std::max(1u, limit / 2);
-    smooth_seconds = 0;
-    blocked_seconds = StallSeconds;
-}
 
 namespace CompileCeiling {
 
@@ -163,12 +110,19 @@ void Store(const std::filesystem::path& file, std::string_view key, CeilingRecor
     }
 }
 
-CeilingRecord AfterDeviceLost(u32 peak_width) {
-    return {std::max(1u, peak_width / 2), 0};
+u32 FirstCeiling(bool amd_proprietary, u32 widest) {
+    return std::max(1u, amd_proprietary ? std::min(6u, widest) : widest);
 }
 
-CeilingRecord AfterCleanRun(CeilingRecord current, u32 builds, u32 widest) {
-    if (builds < MinCleanBuilds) {
+CeilingRecord AfterStall(CeilingRecord current, u32 peak_width, u32 floor) {
+    if (peak_width <= floor) {
+        return current;
+    }
+    return {std::min(current.ceiling, std::max(floor, peak_width / 2)), 0};
+}
+
+CeilingRecord AfterCleanRun(CeilingRecord current, u32 bound_seconds, u32 widest) {
+    if (bound_seconds < MinBoundSeconds) {
         return current;
     }
     if (++current.clean_runs < CleanRunsToRaise) {
