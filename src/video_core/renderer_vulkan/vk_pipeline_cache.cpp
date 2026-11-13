@@ -957,14 +957,14 @@ private:
         const char* const max_env = std::getenv("RYGT_COMPILE_MAX");
         const bool max_set = max_env && *max_env;
         if (!Adaptive()) {
-            LOG_INFO(Render_Vulkan,
+            LOG_WARNING(Render_Vulkan,
                      "PERF-GT7-160: adaptive compile width off (RYGT_COMPILE_ADAPTIVE=0){}",
                      max_set ? ", RYGT_COMPILE_MAX ignored" : "");
         } else if (MaxOverride() != 0) {
-            LOG_INFO(Render_Vulkan, "PERF-GT7-160: fixed compile ceiling {} (RYGT_COMPILE_MAX)",
+            LOG_WARNING(Render_Vulkan, "PERF-GT7-160: fixed compile ceiling {} (RYGT_COMPILE_MAX)",
                      MaxOverride());
         } else if (max_set) {
-            LOG_INFO(Render_Vulkan,
+            LOG_WARNING(Render_Vulkan,
                      "PERF-GT7-160: RYGT_COMPILE_MAX={} ignored (not a number of 1 or more)",
                      max_env);
         }
@@ -991,7 +991,7 @@ private:
             std::scoped_lock lk{extra_mutex};
             ceiling = std::clamp(ceiling_record.ceiling, CompileConcurrency(), Widest());
         }
-        LOG_INFO(Render_Vulkan, "PERF-GT7-160: ceiling {} for {} (floor {})",
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: ceiling {} for {} (floor {})",
                     ceiling_record.ceiling, ceiling_key, CompileConcurrency());
         {
             std::scoped_lock lk{learn_mutex};
