@@ -1001,16 +1001,26 @@ private:
     /// keeps this run from counting as clean, whatever the peak was.
     /// Lock order: stall_mutex (the stall hook), learn_mutex, extra_mutex.
     static void LowerCeiling(const char* cause) {
+        // PERF-GT7-160: a hang that starts less than 1 s before the peak window closes is not
+        // seen: the first stall hook fires after 1 s, and the window then holds the lowered width.
         dirty.store(true);
         std::scoped_lock lk{learn_mutex};
         PipelineBuildWorkers* const workers = learning;
         if (!workers) {
             return;
         }
+        const auto now = std::chrono::steady_clock::now();
+        // PERF-GT7-160: the hook fires every second of a stall; calls within 1.5 s of the last
+        // one are the same episode and reuse its peak, or one hang would lower the ceiling twice.
+        const bool same_episode = now - workers->last_lower < std::chrono::milliseconds{1500};
+        workers->last_lower = now;
         u32 peak;
-        {
+        if (same_episode) {
+            peak = workers->episode_peak;
+        } else {
             std::scoped_lock extra_lk{workers->extra_mutex};
-            peak = workers->PeakWidth(std::chrono::steady_clock::now());
+            peak = workers->PeakWidth(now);
+            workers->episode_peak = peak;
         }
         const CeilingRecord next =
             CompileCeiling::AfterStall(workers->ceiling_record, peak, CompileConcurrency());
@@ -1117,6 +1127,8 @@ private:
     std::filesystem::path ceiling_file;
     CeilingRecord ceiling_record{};
     bool clean_run_stored = false; ///< under learn_mutex
+    std::chrono::steady_clock::time_point last_lower{}; ///< under learn_mutex
+    u32 episode_peak = 0; ///< under learn_mutex: the peak width of the current stall episode
     static inline std::mutex learn_mutex;
     static inline PipelineBuildWorkers* learning = nullptr; ///< under learn_mutex
     static inline std::atomic<bool> dirty{}; ///< a stall or a device loss: not a clean run
