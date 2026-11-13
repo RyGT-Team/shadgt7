@@ -103,7 +103,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_LEGACY_FALLBACK|flag|Shader compiling|on|0 = off; the read is in code disabled with '&& false', so it has no effect|Old-renderer shader fallback while new translations build (D10). Its code path is disabled, so setting it does nothing.",
     "RYGTSW1|SHADGT_NO_LIBRARIES|flag|Shader compiling|off|exactly 1 = on|Builds whole pipelines instead of shared pipeline libraries (fast link).",
     // Native recorder & sync
-    "RYGTSW1|RYGT_CORE_OWNERS|int|Native recorder & sync|2 (recorder)|bitmask: 1 command processor, 2 recorder, 4 Vulkan commands, 0 none|Which renderer threads get a physical CPU core of their own (PERF-GT7-048). Default 2 gives one to the recorder.",
+    "RYGTSW1|RYGT_CORE_OWNERS|int|Native recorder & sync|0 (none)|bitmask: 1 command processor, 2 recorder, 4 Vulkan commands, 0 none|Gives renderer threads a CPU core each; the game keeps only the cores left. Try 2 on 8+ cores with SMT; much slower on 6; ignored on hybrid CPUs.",
     "RYGTSW1|RYGT_DIRECT_FIND_RECENT|flag|Native recorder & sync|on|0 = off|Each thread remembers recently found direct-memory views to skip the locked map lookup (PERF-GT7-127); 0 turns it off.",
     "RYGTSW1|RYGT_FLAT_PREFETCH|flag|Native recorder & sync|on|0 = off|Prefetches each stage's shader user data into cache before binding buffers (PERF-GT7-122); 0 turns it off.",
     "RYGTSW1|RYGT_GFX_YIELD_PACKETS|int|Native recorder & sync|32|graphics packets between yields; 0 = never yield|Lets compute submissions decode after every N graphics packets (PERF-GT7-052); 0 never yields.",
