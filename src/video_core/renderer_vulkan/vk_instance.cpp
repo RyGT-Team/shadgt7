@@ -1425,10 +1425,6 @@ void Instance::ReportDeviceLost() const {
             std::fclose(file);
         }
     }
-    // PERF-GT7-160: builds running at the loss lower the next run's compile ceiling.
-    if (const auto hook = g_device_lost_hook.load()) {
-        hook();
-    }
     if (device_fault && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
         const VkDevice dev = static_cast<VkDevice>(*device);
         VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
@@ -1462,6 +1458,11 @@ void Instance::ReportDeviceLost() const {
             LOG_CRITICAL(Render_Vulkan, "DIAG-243:   vendor: {} (code {:#x}, data {:#x})",
                          v.description, v.vendorFaultCode, v.vendorFaultData);
         }
+    }
+    // PERF-GT7-160: builds running at the loss lower the next run's compile ceiling. After the
+    // fault dump, which must not wait for the hook's file write.
+    if (const auto hook = g_device_lost_hook.load()) {
+        hook();
     }
     // The draws recorded last, newest first (the GPU was somewhere among them or before).
     const u64 newest = g_fault_serial.load(std::memory_order_acquire);

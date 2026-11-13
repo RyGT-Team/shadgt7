@@ -765,23 +765,16 @@ static void SlowMotionThread(std::stop_token stop) {
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
 class PipelineCache::PipelineBuildWorkers {
 public:
-    explicit PipelineBuildWorkers(const Instance& instance)
-        : queue{Adaptive() ? std::min(CompileConcurrency(), StartCeiling())
-                           : CompileConcurrency()} {
+    explicit PipelineBuildWorkers(const Instance& instance) : queue{CompileConcurrency()} {
         // Concurrent driver pipeline compilations stay bounded (the queue's limit): large bursts
         // can overwhelm the driver while the game and its pipeline linker use the GPU.
         for (u32 i = 0; i < AllCores(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
-        if (Adaptive()) {
-            // PERF-GT7-160: the perf monitor halves the width on a GPU stall.
-            std::scoped_lock lk{stall_mutex};
-            stalling = this;
-            g_gpu_stall_hook.store(&OnGpuStallHook);
-        }
         LearnCeiling(instance);
         if (Adaptive()) {
-            // PERF-GT7-160: the start width takes effect now, not at the first state change.
+            // PERF-GT7-160: a fixed ceiling (RYGT_COMPILE_MAX) takes effect now, not at the
+            // first state change.
             std::scoped_lock lk{extra_mutex};
             ApplyExtra();
         }
@@ -914,79 +907,41 @@ public:
         return on;
     }
     /// PERF-GT7-160: the ceiling learned for this GPU and driver; ignored under RYGT_COMPILE_MAX.
+    /// Takes extra_mutex: never call it with that held.
     void SetCeiling(u32 new_ceiling) {
         if (MaxOverride() != 0) {
             return;
         }
         std::scoped_lock lk{extra_mutex};
-        ceiling = std::clamp(new_ceiling, 1u, Widest());
-        adaptive.SetCeiling(ceiling);
-        ApplyLimit("ceiling");
+        ceiling = std::clamp(new_ceiling, CompileConcurrency(), Widest());
+        ApplyExtra();
     }
     /// PERF-GT7-160: builds at once as last applied.
     u32 WidthInUse() const {
         return width_in_use.load(std::memory_order_relaxed);
     }
-    /// PERF-GT7-160: on every draw; once a second, the controller gets the game's average frame
-    /// time over that second, measured as PERF-GT7-034 does (Common::GetGameFrameTotals) but in
-    /// its own window, so it runs under RYGT_COMPILE_CATCH_UP=0 and RYGT_CATCH_UP_PACE=0 too.
-    void FrameTick(std::chrono::steady_clock::time_point now) {
-        if (!Adaptive()) {
-            return;
-        }
-        std::unique_lock lk{frame_mutex, std::try_to_lock};
-        if (!lk.owns_lock()) {
-            return;
-        }
-        const auto totals = Common::GetGameFrameTotals();
-        if (frame_start == std::chrono::steady_clock::time_point{}) {
-            frame_start = now;
-            frame_count = totals.frames;
-            frame_us = totals.us;
-            return;
-        }
-        if (now - frame_start < std::chrono::seconds{1}) {
-            return;
-        }
-        const u64 frames = totals.frames - frame_count;
-        const double frame_ms =
-            frames != 0 ? double(totals.us - frame_us) / 1000.0 / double(frames)
-                        : std::chrono::duration<double, std::milli>(now - frame_start).count();
-        frame_start = now;
-        frame_count = totals.frames;
-        frame_us = totals.us;
-        OnSecond(frame_ms);
-    }
-    /// PERF-GT7-160: lag narrows the limit, smooth seconds widen it, only while as many builds
-    /// are pending as the width in use (the width then holds them back).
-    void OnSecond(double frame_ms) {
-        std::scoped_lock lk{extra_mutex};
-        const u32 before = adaptive.Limit();
-        last_frame_ms = frame_ms;
-        adaptive.OnSecond(frame_ms, Pending() >= WidthInUse());
-        ApplyLimit(adaptive.Limit() < before ? "lag" : "smooth");
-    }
-    void OnGpuStall() {
-        std::scoped_lock lk{extra_mutex};
-        adaptive.OnGpuStall();
-        ApplyLimit("stall");
-    }
-    /// PERF-GT7-160: at a clean exit, a run with enough builds counts toward a wider ceiling.
-    /// Once per run, and never after a device loss.
+    /// PERF-GT7-160: at a clean exit, a run with enough seconds bound by the ceiling counts toward
+    /// a wider one. Once per run, and never after a stall or a device loss.
     static void StoreCleanRun() {
         std::scoped_lock lk{learn_mutex};
         PipelineBuildWorkers* const workers = learning;
-        if (!workers || device_lost.load() || workers->clean_run_stored) {
+        if (!workers || dirty.load() || workers->clean_run_stored) {
             return;
         }
         workers->clean_run_stored = true;
-        const u32 builds = workers->completed.load(std::memory_order_relaxed);
+        std::chrono::steady_clock::duration bound;
+        {
+            std::scoped_lock extra_lk{workers->extra_mutex};
+            workers->CloseBound(std::chrono::steady_clock::now());
+            bound = workers->bound_total;
+        }
+        const u32 seconds = u32(std::chrono::duration_cast<std::chrono::seconds>(bound).count());
         const CeilingRecord next =
-            CompileCeiling::AfterCleanRun(workers->ceiling_record, builds, Widest());
+            CompileCeiling::AfterCleanRun(workers->ceiling_record, seconds, Widest());
         LOG_WARNING(Render_Vulkan,
-                    "PERF-GT7-160: ceiling record {} {}/{} -> {}/{} (clean run, {} builds)",
+                    "PERF-GT7-160: ceiling record {} {}/{} -> {}/{} (clean run, {} s bound)",
                     workers->ceiling_key, workers->ceiling_record.ceiling,
-                    workers->ceiling_record.clean_runs, next.ceiling, next.clean_runs, builds);
+                    workers->ceiling_record.clean_runs, next.ceiling, next.clean_runs, seconds);
         CompileCeiling::Store(workers->ceiling_file, workers->ceiling_key, next);
     }
 
@@ -1000,49 +955,74 @@ private:
         ceiling_key = CompileCeiling::Key(instance.GetVendorID(), instance.GetDeviceID(),
                                           instance.GetDriverVersion());
         ceiling_file =
-            Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "compile_width.txt";
+            Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "compile_ceiling.txt";
         ceiling_record =
-            CompileCeiling::Load(ceiling_file, ceiling_key).value_or(CeilingRecord{Widest(), 0});
+            CompileCeiling::Load(ceiling_file, ceiling_key)
+                .value_or(CeilingRecord{
+                    CompileCeiling::FirstCeiling(
+                        instance.GetDriverID() == vk::DriverId::eAmdProprietary, Widest()),
+                    0});
         SetCeiling(ceiling_record.ceiling);
-        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: ceiling {} for {}, compiles start {} at a time",
-                    ceiling_record.ceiling, ceiling_key,
-                    std::min(StartLimit(), ceiling_record.ceiling));
-        std::scoped_lock lk{learn_mutex};
-        learning = this;
-        g_device_lost_hook.store(&OnDeviceLost);
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: ceiling {} for {} (floor {})",
+                    ceiling_record.ceiling, ceiling_key, CompileConcurrency());
+        {
+            std::scoped_lock lk{learn_mutex};
+            learning = this;
+            g_device_lost_hook.store(&OnDeviceLost);
+        }
+        // PERF-GT7-160: the perf monitor lowers the ceiling on a GPU stall.
+        std::scoped_lock lk{stall_mutex};
+        stalling = this;
+        g_gpu_stall_hook.store(&OnGpuStallHook);
     }
     /// PERF-GT7-160: runs on the perf monitor thread (g_gpu_stall_hook).
     static void OnGpuStallHook() {
         std::scoped_lock lk{stall_mutex};
         if (stalling) {
-            stalling->OnGpuStall();
+            stalling->LowerCeiling("GPU stall");
         }
     }
-    /// PERF-GT7-160: runs on the thread that saw the loss. Builds queued or running then halve
-    /// the peak width in use over the last ~10 s for the next run: the width right now may
-    /// already be narrowed (in a race, or by a stall before the loss).
+    /// PERF-GT7-160: runs on the thread that saw the loss, after the fault dump.
     static void OnDeviceLost() {
         try {
-            device_lost.store(true);
-            std::scoped_lock lk{learn_mutex};
-            PipelineBuildWorkers* const workers = learning;
-            if (!workers || !workers->Busy()) {
-                return;
-            }
-            u32 peak;
+            dirty.store(true);
             {
-                std::scoped_lock extra_lk{workers->extra_mutex};
-                peak = workers->PeakWidth(std::chrono::steady_clock::now());
+                std::scoped_lock lk{learn_mutex};
+                if (!learning || !learning->Busy()) {
+                    return;
+                }
             }
-            const CeilingRecord next = CompileCeiling::AfterDeviceLost(peak);
-            LOG_WARNING(
-                Render_Vulkan,
-                "PERF-GT7-160: ceiling record {} {}/{} -> {}/{} (device lost, peak width {})",
-                workers->ceiling_key, workers->ceiling_record.ceiling,
-                workers->ceiling_record.clean_runs, next.ceiling, next.clean_runs, peak);
-            CompileCeiling::Store(workers->ceiling_file, workers->ceiling_key, next);
+            LowerCeiling("device lost");
         } catch (...) {
         }
+    }
+    /// PERF-GT7-160: a stall or a loss halves the peak width in use over the last ~10 s, for this
+    /// run and the next: the width right now may already be narrowed (in a race). Either one also
+    /// keeps this run from counting as clean, whatever the peak was.
+    /// Lock order: stall_mutex (the stall hook), learn_mutex, extra_mutex.
+    static void LowerCeiling(const char* cause) {
+        dirty.store(true);
+        std::scoped_lock lk{learn_mutex};
+        PipelineBuildWorkers* const workers = learning;
+        if (!workers) {
+            return;
+        }
+        u32 peak;
+        {
+            std::scoped_lock extra_lk{workers->extra_mutex};
+            peak = workers->PeakWidth(std::chrono::steady_clock::now());
+        }
+        const CeilingRecord next =
+            CompileCeiling::AfterStall(workers->ceiling_record, peak, CompileConcurrency());
+        if (next == workers->ceiling_record) {
+            return;
+        }
+        CompileCeiling::Store(workers->ceiling_file, workers->ceiling_key, next);
+        const CeilingRecord old = workers->ceiling_record;
+        workers->ceiling_record = next;
+        workers->SetCeiling(next.ceiling);
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: ceiling record {} {} -> {} ({}, peak width {})",
+                    workers->ceiling_key, old.ceiling, next.ceiling, cause, peak);
     }
     /// PERF-GT7-160: RYGT_COMPILE_MAX=n (n >= 1) fixes the ceiling; 0 when unset.
     static u32 MaxOverride() {
@@ -1058,31 +1038,6 @@ private:
     static u32 StartCeiling() {
         return MaxOverride() != 0 ? MaxOverride() : Widest();
     }
-    /// PERF-GT7-160: the controller's first limit, 6 by default (RYGT_COMPILE_START=n): 4 never
-    /// lost the device on an RX 9070 but filled new tracks slowly, 8 sometimes lost it. The
-    /// ceiling still bounds it.
-    static u32 StartLimit() {
-        static const u32 start = [] {
-            u32 n = 6;
-            if (const char* env = std::getenv("RYGT_COMPILE_START"); env && *env) {
-                n = u32(std::strtoul(env, nullptr, 10));
-            }
-            return std::max(n, 1u);
-        }();
-        return start;
-    }
-    /// PERF-GT7-160: after the controller ran (extra_mutex held), its limit takes effect.
-    void ApplyLimit(const char* reason) {
-        if (!Adaptive() || adaptive.Limit() == logged_limit) {
-            return;
-        }
-        logged_limit = adaptive.Limit();
-        LOG_WARNING(Render_Vulkan,
-                    "PERF-GT7-160: compiles {} at a time ({}: {:.1f} ms a frame, {} pending, "
-                    "ceiling {})",
-                    logged_limit, reason, last_frame_ms, Pending(), ceiling);
-        ApplyExtra();
-    }
     /// PERF-GT7-160: the widest width in use over the last 5 to 10 s, in two 5 s buckets
     /// (extra_mutex held).
     u32 PeakWidth(std::chrono::steady_clock::time_point now) {
@@ -1095,17 +1050,29 @@ private:
         return std::max(peak_now, peak_before);
     }
     void ApplyExtra() {
-        const u32 widest = Widest();
-        // PERF-GT7-160: the adaptive limit is the width in every state (in a race, waiting,
-        // backlog, catch-up), bounded by the ceiling; the frame time moves it, not the state.
-        const u32 width = Adaptive()       ? std::max(std::min(adaptive.Limit(), ceiling), 1u)
-                          : in_play        ? PlayWidth() // FIX-GT7-109
-                          : waiting > 0    ? widest
-                          : backlog        ? std::clamp(8u, CompileConcurrency(), widest)
-                          : foreground > 0 ? CompileConcurrency()
-                          : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
-                                           : CompileConcurrency();
-        PeakWidth(std::chrono::steady_clock::now()); // PERF-GT7-160: closes the old width's bucket
+        const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
+                                      CompileConcurrency(), 12u);
+        u32 width = in_play          ? PlayWidth() // FIX-GT7-109
+                    : waiting > 0    ? widest
+                    : backlog        ? std::clamp(8u, CompileConcurrency(), widest)
+                    : foreground > 0 ? CompileConcurrency()
+                    : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
+                                     : CompileConcurrency();
+        const auto now = std::chrono::steady_clock::now();
+        if (Adaptive()) {
+            // PERF-GT7-160: the ceiling bounds main's width; the time it does so counts a clean
+            // run toward a wider ceiling.
+            if (width > ceiling) {
+                if (!bound_open) {
+                    bound_open = true;
+                    bound_since = now;
+                }
+            } else {
+                CloseBound(now);
+            }
+            width = std::min(width, ceiling);
+        }
+        PeakWidth(now); // PERF-GT7-160: closes the old width's bucket
         width_in_use.store(width, std::memory_order_relaxed);
         peak_now = std::max(peak_now, width);
         // FIX-GT7-022: the pace (PERF-GT7-034) holds back the read-ahead builds only, and they
@@ -1114,17 +1081,20 @@ private:
         // while the game ran at 35-38 ms a frame either way: buildings were missing or black for
         // a while. In the race, a new building's build waited for a worker behind read-ahead
         // ones of up to 1.7 s each.
-        // PERF-GT7-160: with the adaptive limit the pace no longer narrows them; one worker
-        // still stays free for the draws on screen.
         u32 background = width;
         if (waiting == 0) {
-            background = Adaptive()
-                             ? std::max(width - 1, 1u)
-                             : std::min(std::clamp(pace, 1u, width), std::max(width - 1, 1u));
+            background = std::min(std::clamp(pace, 1u, width), std::max(width - 1, 1u));
         }
         queue.SetMaxRunning(std::min(width, CompileConcurrency()));
         queue.SetExtraRunning(width > CompileConcurrency() ? width - CompileConcurrency() : 0);
         queue.SetBackgroundLimit(background);
+    }
+    /// PERF-GT7-160: adds the open stretch of bound time to the total (extra_mutex held).
+    void CloseBound(std::chrono::steady_clock::time_point now) {
+        if (bound_open) {
+            bound_open = false;
+            bound_total += now - bound_since;
+        }
     }
     std::mutex extra_mutex;
     int waiting = 0;
@@ -1133,21 +1103,15 @@ private:
     bool backlog = false; ///< FIX-GT7-106
     bool in_play = false; ///< FIX-GT7-109
     u32 pace = 64; ///< PERF-GT7-034: no limit
-    // PERF-GT7-160: the adaptive width, under extra_mutex.
+    // PERF-GT7-160: the ceiling over main's widths and the time it bound them, under extra_mutex.
     u32 ceiling = StartCeiling();
-    AdaptiveWidth adaptive{StartLimit(), ceiling};
-    u32 logged_limit = adaptive.Limit();
-    double last_frame_ms = 0.0; ///< the game's ms a frame in the last second
+    bool bound_open = false;
+    std::chrono::steady_clock::time_point bound_since{};
+    std::chrono::steady_clock::duration bound_total{};
     std::chrono::steady_clock::time_point peak_since{};
     u32 peak_now = 0;
     u32 peak_before = 0;
-    std::atomic<u32> width_in_use{Adaptive() ? adaptive.Limit() : CompileConcurrency()};
-    std::atomic<u32> completed{}; ///< PERF-GT7-160: builds finished
-    // PERF-GT7-160: the controller's 1 s frame-time window, under frame_mutex.
-    std::mutex frame_mutex;
-    std::chrono::steady_clock::time_point frame_start{};
-    u64 frame_count = 0;
-    u64 frame_us = 0;
+    std::atomic<u32> width_in_use{CompileConcurrency()};
     // PERF-GT7-160: the ceiling file's record for this run, set before `learning` points here.
     std::string ceiling_key;
     std::filesystem::path ceiling_file;
@@ -1155,7 +1119,7 @@ private:
     bool clean_run_stored = false; ///< under learn_mutex
     static inline std::mutex learn_mutex;
     static inline PipelineBuildWorkers* learning = nullptr; ///< under learn_mutex
-    static inline std::atomic<bool> device_lost{};
+    static inline std::atomic<bool> dirty{}; ///< a stall or a device loss: not a clean run
     static inline std::mutex stall_mutex;
     static inline PipelineBuildWorkers* stalling = nullptr; ///< under stall_mutex
 
@@ -1225,7 +1189,6 @@ private:
                                                               : Common::ThreadPriority::Normal);
             }
             job();
-            completed.fetch_add(1, std::memory_order_relaxed); // PERF-GT7-160
             queue.Finished();
         }
     }
@@ -4892,9 +4855,6 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         const char* env = std::getenv("RYGT_COMPILE_CATCH_UP");
         return !(env && env[0] == '0');
     }();
-    if (build_workers) {
-        build_workers->FrameTick(now); // PERF-GT7-160
-    }
     if (!enabled || !build_workers) {
         return;
     }
@@ -5072,9 +5032,6 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     c.pace_frames = totals.frames;
     c.pace_us = totals.us;
     const u32 usual = PipelineBuildWorkers::UsualWidth();
-    // PERF-GT7-160: the adaptive width (PipelineBuildWorkers::FrameTick) replaces the pace
-    // below; the catch-up's core and priority switches stay.
-    const bool adaptive = PipelineBuildWorkers::Adaptive();
     // FIX-GT7-012: not gated on FIX-110's race flag, which GT7 never sets (its project scripts
     // aren't seen): PERF-GT7-034 never acted. A second over 80 ms a frame (loading, a draw
     // waiting for its pipeline, a stall) is neither late nor on time: compiles are not what
@@ -5096,9 +5053,8 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             c.stepped_since = now;
             ++c.step_backs;
             build_workers->SetCatchUp(false);
-            note(adaptive ? "the catch-up's compiles back to their cores"
-                          : "the catch-up's compiles back to 4 at a time on their cores");
-        } else if (!adaptive && c.pace_limit > 1 && build_workers->Busy()) {
+            note("the catch-up's compiles back to 4 at a time on their cores");
+        } else if (c.pace_limit > 1 && build_workers->Busy()) {
             --c.pace_limit;
             build_workers->SetPace(c.pace_limit);
             note(c.pace_limit == 1
@@ -5112,7 +5068,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         return;
     }
     c.fast = 0;
-    if (!adaptive && c.pace_limit < usual) {
+    if (c.pace_limit < usual) {
         ++c.pace_limit;
         build_workers->SetPace(c.pace_limit == usual ? 64 : c.pace_limit);
         note(fmt::format("read-ahead compiles {} at a time", c.pace_limit).c_str());
