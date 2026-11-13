@@ -33,6 +33,11 @@ target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
 gtest_discover_tests(shadps4_depth_attachment_test)
 
+add_executable(shadps4_kept_shadow_map_test test_kept_shadow_map.cpp)
+target_include_directories(shadps4_kept_shadow_map_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_kept_shadow_map_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_kept_shadow_map_test)
+
 add_executable(shadps4_color_clear_test test_color_clear.cpp test_color_blend.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
