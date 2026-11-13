@@ -15,7 +15,8 @@ namespace Vulkan {
 
 /**
  * PERF-GT7-160: called by the perf monitor once per second of GPU stall (busy, no GPU tick
- * progress), set by the pipeline cache while its build workers exist. Runs on the perf monitor
+ * progress), set by the pipeline cache only while it learns the ceiling (not under
+ * RYGT_COMPILE_ADAPTIVE=0 or RYGT_COMPILE_MAX). Runs on the perf monitor
  * thread, so the ceiling is lowered even while the command thread waits on the hung GPU.
  */
 inline std::atomic<void (*)()> g_gpu_stall_hook{nullptr};

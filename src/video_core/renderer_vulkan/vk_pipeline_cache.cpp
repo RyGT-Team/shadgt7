@@ -772,9 +772,11 @@ public:
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
         LearnCeiling(instance);
-        if (Adaptive()) {
-            // PERF-GT7-160: a fixed ceiling (RYGT_COMPILE_MAX) takes effect now, not at the
-            // first state change.
+        LogCeilingMode();
+        if (Adaptive() && MaxOverride() != 0) {
+            // PERF-GT7-160: a fixed ceiling (RYGT_COMPILE_MAX) can be below the start width, so
+            // it takes effect now. Otherwise the queue keeps main's start limit until the first
+            // state change, as on main.
             std::scoped_lock lk{extra_mutex};
             ApplyExtra();
         }
@@ -938,6 +940,9 @@ public:
         const u32 seconds = u32(std::chrono::duration_cast<std::chrono::seconds>(bound).count());
         const CeilingRecord next =
             CompileCeiling::AfterCleanRun(workers->ceiling_record, seconds, Widest());
+        if (next == workers->ceiling_record) {
+            return;
+        }
         LOG_WARNING(Render_Vulkan,
                     "PERF-GT7-160: ceiling record {} {}/{} -> {}/{} (clean run, {} s bound)",
                     workers->ceiling_key, workers->ceiling_record.ceiling,
@@ -946,6 +951,24 @@ public:
     }
 
 private:
+    /// PERF-GT7-160: one line at construction naming the active mode, for the cases where an
+    /// environment override is in effect or was ignored. The learning case logs in LearnCeiling.
+    static void LogCeilingMode() {
+        const char* const max_env = std::getenv("RYGT_COMPILE_MAX");
+        const bool max_set = max_env && *max_env;
+        if (!Adaptive()) {
+            LOG_INFO(Render_Vulkan,
+                     "PERF-GT7-160: adaptive compile width off (RYGT_COMPILE_ADAPTIVE=0){}",
+                     max_set ? ", RYGT_COMPILE_MAX ignored" : "");
+        } else if (MaxOverride() != 0) {
+            LOG_INFO(Render_Vulkan, "PERF-GT7-160: fixed compile ceiling {} (RYGT_COMPILE_MAX)",
+                     MaxOverride());
+        } else if (max_set) {
+            LOG_INFO(Render_Vulkan,
+                     "PERF-GT7-160: RYGT_COMPILE_MAX={} ignored (not a number of 1 or more)",
+                     max_env);
+        }
+    }
     /// PERF-GT7-160: the ceiling learned in earlier runs for this GPU and driver, unless
     /// RYGT_COMPILE_ADAPTIVE=0 or RYGT_COMPILE_MAX fixes the behaviour.
     void LearnCeiling(const Instance& instance) {
@@ -962,8 +985,13 @@ private:
                     CompileCeiling::FirstCeiling(
                         instance.GetDriverID() == vk::DriverId::eAmdProprietary, Widest()),
                     0});
-        SetCeiling(ceiling_record.ceiling);
-        LOG_WARNING(Render_Vulkan, "PERF-GT7-160: ceiling {} for {} (floor {})",
+        {
+            // PERF-GT7-160: no ApplyExtra here: the learned ceiling is at least the start width,
+            // so the first state change applies it, and until then the queue behaves as on main.
+            std::scoped_lock lk{extra_mutex};
+            ceiling = std::clamp(ceiling_record.ceiling, CompileConcurrency(), Widest());
+        }
+        LOG_INFO(Render_Vulkan, "PERF-GT7-160: ceiling {} for {} (floor {})",
                     ceiling_record.ceiling, ceiling_key, CompileConcurrency());
         {
             std::scoped_lock lk{learn_mutex};
