@@ -13,6 +13,7 @@
 
 #include "common/logging/log.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -22,6 +23,10 @@
 // times the mode's scale (Native 1x, Quality 1.5x, Balanced 1.72x, Performance 2x, Ultra
 // Performance 3x), and the post-process pass then fits that output to the window. "auto" (the
 // default) scales to the window size, as before.
+namespace Vulkan::RytyDlssG {
+bool UpscaleRequested(); // ryty_dlssg.h: GPU.dlss_enabled and Streamline's DLSS plugin
+} // namespace Vulkan::RytyDlssG
+
 namespace Vulkan::RytyUpscale {
 
 enum class Quality { Auto, Native, Quality, Balanced, Performance, UltraPerformance };
@@ -105,7 +110,9 @@ inline bool NativeAA() {
 // Nothing is changed in the game's pictures unless Streamline's DLSS scales them and takes the
 // inputs (TemporalUsable): with FSR, the plain scaling, the NGX plugin or a refusal the game
 // draws as without the prototype. Off in the PS4 Pro mode on a 4K TV (TemporalRequested).
-//   RYGT_DLSS_TEMPORAL_KEY=0     no keys (Page Up switches the prototype off and on while
+//   RYGT_DLSS_TEMPORAL_KEY=1     the test keys and their line in the FPS counter; none by
+//                                default since DLSS-GT7-004, a player must not switch the
+//                                picture's parts by accident (Page Up switches it off and on while
 //                                playing; Page Down steps through the ways the HUD is drawn,
 //                                Home shifts the menus' interface by the jitter or not, End
 //                                switches the menus' interface motion mask). Only read while
@@ -141,7 +148,34 @@ struct TemporalInputs {
     vk::ImageView ui_scene_view;
 };
 
-/// RYGT_DLSS_TEMPORAL=1 was set for this run, and the game does not run in the PS4 Pro mode on a
+/// DLSS-GT7-004: temporal DLSS is what NVIDIA DLSS means by default. It is asked for when
+/// Streamline's DLSS is the upscaler the settings choose (GPU.dlss_enabled with sl.dlss.dll there)
+/// and no frame generation is on: with FSR, with no upscaler, on another vendor's GPU, nothing
+/// of the prototype runs, the HUD split it needs included. Frame generation, DLSS's or FSR's, was
+/// never tried with it, so it keeps DLSS on single frames. RYGT_DLSS_TEMPORAL=0 turns it off, =1
+/// asks for it whatever the settings (the test launchers). Seen on an RTX 4070 only.
+inline bool TemporalWanted() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
+        if (env && (env[0] == '0' || env[0] == '1')) {
+            return env[0] == '1';
+        }
+        return RytyDlssG::UpscaleRequested() && !EmulatorSettings.IsDlssgEnabled() &&
+               !EmulatorSettings.IsFrameGenEnabled();
+    }();
+    return on;
+}
+
+/// The test keys listed above and their line in the FPS counter: RYGT_DLSS_TEMPORAL_KEY=1.
+inline bool TemporalKeys() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_KEY");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+/// Temporal DLSS is wanted (TemporalWanted), and the game does not run in the PS4 Pro mode on a
 /// 4K TV. There GT7 draws 3200x1800 in a checkerboard and rebuilds the full picture with its own
 /// temporal compute pass (cs 0x7aa5f0ad): no 0xcfa125dd pass to replace, and DLSS's history on
 /// top of the game's would accumulate twice (trails doubled where nothing moves, as rain). DLSS
@@ -151,8 +185,7 @@ struct TemporalInputs {
 /// first answer).
 inline bool TemporalRequested() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
-        if (!(env && env[0] == '1')) {
+        if (!TemporalWanted()) {
             return false;
         }
         const char* tv = std::getenv("RYGT_NEO_TV");

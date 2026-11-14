@@ -290,8 +290,10 @@ void DrawFpsCounter() {
     } else {
         written = std::snprintf(text, sizeof(text), "%.0f FPS", fps);
     }
-    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): what the DLSS pass runs with, and its key.
-    if (Vulkan::RytyUpscale::TemporalRequested() && written > 0 &&
+    // DLSS-GT7-001: what the DLSS pass runs with, and its test keys, with RYGT_DLSS_TEMPORAL_KEY=1
+    // only (DLSS-GT7-004): players see the plain counter.
+    if (Vulkan::RytyUpscale::TemporalRequested() && Vulkan::RytyUpscale::TemporalKeys() &&
+        written > 0 &&
         written < static_cast<int>(sizeof(text))) {
         const bool wanted = Vulkan::RytyUpscale::TemporalActive();
         const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;

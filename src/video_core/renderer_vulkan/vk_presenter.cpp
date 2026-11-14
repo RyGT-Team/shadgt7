@@ -1449,12 +1449,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool scaled = false;
     const vk::Extent2D upscale_target =
         RytyUpscale::Target(image_size, {frame->width, frame->height});
-    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): Page Up switches it off and on while playing.
-    if (RytyUpscale::TemporalRequested()) {
-        static const bool key = [] {
-            const char* env = std::getenv("RYGT_DLSS_TEMPORAL_KEY");
-            return !(env && env[0] == '0');
-        }();
+    // DLSS-GT7-001: the test keys, with RYGT_DLSS_TEMPORAL_KEY=1 only (DLSS-GT7-004). Page Up
+    // switches temporal DLSS off and on while playing.
+    if (RytyUpscale::TemporalRequested() && RytyUpscale::TemporalKeys()) {
+        static const bool key = true;
 #ifdef _WIN32
         // The key's state now, and a press when it goes down (the "pressed since the last
         // call" bit is shared with every other program that asks). Only while the game's window

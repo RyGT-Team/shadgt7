@@ -286,6 +286,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // NVIDIA
     "RYGTSW1|RYGT_DLSSG_FRAMES|int|NVIDIA|1|1..5 generated frames (2x to 6x); multi-frame needs an RTX 50; falls back to 1 if refused|NVIDIA DLSS frame generation: how many frames are generated between game frames (GT-MFG).",
     "RYGTSW1|RYGT_DLSS_STREAMLINE|flag|NVIDIA|on (when sl.dlss.dll is present)|0 = off|DLSS upscaling goes through Streamline's sl.dlss.dll. 0 keeps it on the self-built ryGT_dlss.dll plugin.",
+    "RYGTSW1|RYGT_DLSS_TEMPORAL|flag|NVIDIA|on with NVIDIA DLSS through Streamline and no frame generation|0 = off, 1 = on whatever the settings|Temporal DLSS for GT7: DLSS gets the game's depth, motion vectors and jitter in place of the game's own anti-aliasing (DLSS-GT7-001/004). Off in the PS4 Pro mode on a 4K TV. Seen on an RTX 4070 only.",
     "RYGTSW1|RYGT_NEO_COVERAGE_TRUNCATE|flag|NVIDIA|on in the PS4 Pro mode on NVIDIA|0 = MERGE, as before|In the PS4 Pro mode on NVIDIA, mixed-sample pipelines use TRUNCATE coverage like the console, which removes a light wireframe on car windows (NEO-GT7-016).",
     "RYGTSW1|RYGT_NEO_PIXEL_RATE|flag|NVIDIA|on in the PS4 Pro mode|0 = off, as before|In the PS4 Pro mode, a draw with more depth samples than colour samples runs its pixel shader per pixel on NVIDIA, which avoids a GPU loss (NEO-GT7-005).",
     // Runtime
@@ -345,7 +346,9 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_DIAG_VOLUME|hex|Diagnostics & tracing|off|hex image address. Diagnostics builds only (Common::DiagEnv).|Diagnosis: reads back and logs a 3D texture at that address.",
     "RYGTSW1|RYGT_DIAG_WRITEBACK_RACE|flag|Diagnostics & tracing|off|1 = on. Diagnostics builds only (Common::DiagEnv).|Diagnosis: counts CPU writes into memory a pending GPU write-back will still overwrite, and logs them (DIAG-176).",
     "RYGTSW1|RYGT_DLSS_BIAS_EXPLICIT_LOD|flag|Diagnostics & tracing|off|1 = on|With the temporal DLSS prototype's texture bias: 1 also biases the samplers read at an explicit level (reflections then look wet); FIX-GT7-182.",
-    "RYGTSW1|RYGT_DLSS_TEMPORAL_MIP_BIAS|flag|Diagnostics & tracing|on with RYGT_DLSS_TEMPORAL=1|0 = off|Texture LOD bias that follows the DLSS scale once the temporal prototype has scaled a frame (DLSS-GT7-002).",
+    "RYGTSW1|RYGT_DLSS_TEMPORAL_BLOOM|int|Diagnostics & tracing|unset|0 or 1|Temporal DLSS: 1 replaces the anti-aliased picture before the first draw into it (until DLSS-GT7-003, lights shimmered in pre-races), 0 replaces it at once.",
+    "RYGTSW1|RYGT_DLSS_TEMPORAL_KEY|flag|Diagnostics & tracing|off|1 = on|Temporal DLSS test keys (Page Up, Page Down, Home, End) and their line in the FPS counter.",
+    "RYGTSW1|RYGT_DLSS_TEMPORAL_MIP_BIAS|flag|Diagnostics & tracing|on with temporal DLSS|0 = off|Texture LOD bias that follows the DLSS scale once the temporal prototype has scaled a frame (DLSS-GT7-002).",
     "RYGTSW1|RYGT_DLSS_TEMPORAL_MIP_EXTRA|float|Diagnostics & tracing|-1|-2 to 0|Term added to log2(render / display) for the temporal DLSS prototype's texture bias (DLSS-GT7-002); restart to compare.",
     "RYGTSW1|RYGT_DIAG_WRITES_AT|hex|Diagnostics & tracing|off|hex guest address. Diagnostics builds only (Common::DiagEnv).|Diagnosis: logs one frame's work touching that address, up to 300 lines (DIAG-178).",
     "RYGTSW1|RYGT_DIAG_WRITES_FRAME|int|Diagnostics & tracing|2500|frame number; with RYGT_DIAG_WRITES_AT. Diagnostics builds only (Common::DiagEnv).|Diagnosis: from which frame RYGT_DIAG_WRITES_AT logs.",
