@@ -26,6 +26,11 @@ Fields, separated by `|` (only the description may contain `|`):
 | values | What the accepted values mean; say "Diagnostics builds only", "Debug builds only" or "any value turns it on" when true. |
 | description | One plain sentence, about 150 characters at most, for a user deciding whether to set it. Say if it slows the game or writes large logs. |
 
+**Switches the ryGT7 runtime reads** (`core/` in rygt7: libkernel, libc, libScePad, libSceNet,
+libSceUserService, ...) are described in this table too: the launcher reads every `libs\*.prx`, the
+runtime modules included, and takes a description from whichever file has it. Add their lines under
+`Runtime` (or the group that fits) and say which module reads them.
+
 **When you change or remove a switch**, update or delete its line.
 
 - A switch without a line still shows in the launcher, under "Not described in this renderer build".
