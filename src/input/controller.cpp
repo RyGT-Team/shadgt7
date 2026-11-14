@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
@@ -325,8 +325,10 @@ void GameControllers::ResetLightbarColors() {
 
 bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
     if (m_sdl_gamepad != nullptr) {
-        return SDL_RumbleGamepad(m_sdl_gamepad, (smallMotor / 255.0f) * 0xFFFF,
-                                 (largeMotor / 255.0f) * 0xFFFF, -1);
+        // FEAT-GT7-179: SDL's first level is the low-frequency (left, heavy) motor, the second
+        // the high-frequency (right, light) one; they were passed the other way round.
+        return SDL_RumbleGamepad(m_sdl_gamepad, (largeMotor / 255.0f) * 0xFFFF,
+                                 (smallMotor / 255.0f) * 0xFFFF, -1);
     }
     return true;
 }
