@@ -172,27 +172,30 @@ void StartFirstDrawWatcher() {
 // PERF-098: the precompile of stored shaders and pipelines, as a translucent blue bar with
 // shadowed white text near the bottom of the splash screen (and of the game, if it is still
 // going when the game starts drawing).
-void DrawPrecompileProgress() {
+struct ProgressBarState {
+    std::chrono::steady_clock::time_point finished{};
+    bool shown = false;
+};
+
+void DrawProgressBar(const Vulkan::PrecompileProgress& progress, ProgressBarState& state,
+                     const char* doing, const char* done_text, float height_fraction) {
     using Clock = std::chrono::steady_clock;
-    const auto progress = Vulkan::GetPrecompileProgress();
-    static Clock::time_point finished{};
-    static bool shown = false;
     if (progress.total == 0) {
         return;
     }
     float alpha = 1.0f;
     if (progress.active) {
-        shown = true;
-        finished = {};
+        state.shown = true;
+        state.finished = {};
     } else {
-        if (!shown) {
-            return; // nothing was left to build: no bar at all
+        if (!state.shown) {
+            return; // nothing was left to do: no bar at all
         }
-        if (finished == Clock::time_point{}) {
-            finished = Clock::now();
+        if (state.finished == Clock::time_point{}) {
+            state.finished = Clock::now();
         }
         // "Done" stays a moment, then fades out.
-        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
+        const float since = std::chrono::duration<float>(Clock::now() - state.finished).count();
         alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
         if (alpha <= 0.0f) {
             return;
@@ -201,20 +204,20 @@ void DrawPrecompileProgress() {
     const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
     const float fraction =
         progress.total ? float(progress.done) / float(progress.total) : 0.0f;
-    char text[96];
+    char text[128];
     if (progress.active) {
-        std::snprintf(text, sizeof(text), "Precompiling shaders   %llu / %llu   %.0f%%",
+        std::snprintf(text, sizeof(text), "%s   %llu / %llu   %.0f%%", doing,
                       static_cast<unsigned long long>(progress.done),
                       static_cast<unsigned long long>(progress.total), fraction * 100.0f);
     } else {
-        std::snprintf(text, sizeof(text), "Shaders ready");
+        std::snprintf(text, sizeof(text), "%s", done_text);
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
     const float bar_height = 6.0f;
     const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
-                         viewport->Pos.y + viewport->Size.y * 0.90f};
+                         viewport->Pos.y + viewport->Size.y * height_fraction};
     const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
     draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
     if (fraction > 0.0f) {
@@ -228,6 +231,19 @@ void DrawPrecompileProgress() {
         draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
     }
     draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
+}
+
+void DrawPrecompileProgress() {
+    // FEAT-GT7-187 (from shadGT FEAT-GTS-469): one bar for both: the manifest pre-translation
+    // (PERF-GT7-117), which ran with no sign that it ran, then the stored pipelines the precompile
+    // builds (it waits for the translations).
+    const auto compile = Vulkan::GetPrecompileProgress();
+    const auto translate = Vulkan::GetPretranslateProgress();
+    const Vulkan::PrecompileProgress both{compile.total + translate.total,
+                                          compile.done + translate.done,
+                                          compile.active || translate.active};
+    static ProgressBarState state;
+    DrawProgressBar(both, state, "Compiling shaders", "Shaders ready", 0.90f);
 }
 
 // PERF-100: while a new shader compiles and the game is held, the same translucent style: a
