@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "common/nvtx.h"
 #include "video_core/amdgpu/draw_pipe.h"
+#include "video_core/renderer_vulkan/compile_width.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "ryty_gpu/ryty_diag.h"
 
@@ -614,13 +615,29 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     u64 samples = 0;
     u64 busy_samples = 0;
     u64 window_tick = CurrentTick();
+    u64 stall_gpu_tick = 0;
+    auto stall_since = window_start;
     while (!stoken.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
         work_semaphore.Refresh();
         const u64 submitted = work_semaphore.CurrentTick() - 1;
         ++samples;
-        busy_samples += work_semaphore.KnownGpuTick() < submitted ? 1 : 0;
+        const u64 gpu_tick = work_semaphore.KnownGpuTick();
+        const bool busy = gpu_tick < submitted;
+        busy_samples += busy ? 1 : 0;
         const auto now = std::chrono::steady_clock::now();
+        // PERF-GT7-160: a GPU stall: busy throughout with no GPU tick progress for 1 s, counted
+        // once per second it lasts; the compile width backs off on it, from this thread (the
+        // command thread may be the one stuck on the GPU).
+        if (!busy || gpu_tick != stall_gpu_tick) {
+            stall_gpu_tick = gpu_tick;
+            stall_since = now;
+        } else if (now - stall_since >= std::chrono::seconds{1}) {
+            if (const auto hook = g_gpu_stall_hook.load()) {
+                hook();
+            }
+            stall_since = now;
+        }
         if (now - window_start < std::chrono::seconds{2}) {
             continue;
         }

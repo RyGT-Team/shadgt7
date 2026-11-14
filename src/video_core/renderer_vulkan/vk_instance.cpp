@@ -17,6 +17,7 @@
 #include "core/libraries/kernel/process.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/compile_width.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
@@ -1457,6 +1458,11 @@ void Instance::ReportDeviceLost() const {
             LOG_CRITICAL(Render_Vulkan, "DIAG-243:   vendor: {} (code {:#x}, data {:#x})",
                          v.description, v.vendorFaultCode, v.vendorFaultData);
         }
+    }
+    // PERF-GT7-160: builds running at the loss lower the next run's compile ceiling. After the
+    // fault dump, which must not wait for the hook's file write.
+    if (const auto hook = g_device_lost_hook.load()) {
+        hook();
     }
     // The draws recorded last, newest first (the GPU was somewhere among them or before).
     const u64 newest = g_fault_serial.load(std::memory_order_acquire);
