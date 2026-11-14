@@ -152,6 +152,9 @@ static std::filesystem::path g_capture_dir;
 // <vendor>-<device>). A record names the GPU that recorded it (format 3); records of the older
 // per-GPU folders take it from the folder's name when they are merged in (MergeManifestFolders).
 static u32 g_manifest_vendor{}, g_manifest_device{}; // this GPU
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): <serial>-programs, programs a launcher copied out of this
+// PC's game files (<hash>.bin, from the first instruction through the 32-byte footer).
+static std::filesystem::path g_programs_dir;
 // FEAT-GT7-188 (from shadGT FEAT-GTS-470): on by default (RYGT_MANIFEST_RECORD=0 turns it off):
 // every translation and every stored one a draw first uses gets a record, so the manifest covers
 // what was played and a pre-translation after a renderer or driver update, here or on another
@@ -286,6 +289,26 @@ static bool WriteManifestRecordFile(const ManifestRecord& r) {
         }
     }
     return written;
+}
+
+// A record's code: from the local capture (`dir`) or, when it doesn't have it (a manifest from
+// elsewhere: records carry no code), from the program copied out of this PC's game files, cut to
+// the record's length and taken only when its hash is the record's (FEAT-GT7-188).
+static std::vector<u32> ReadRecordCode(const std::filesystem::path& dir, u64 hash, u64 code_xxh,
+                                       u32 code_words) {
+    auto code = ReadWords(dir / fmt::format("{:016x}-{:016x}.code", hash, code_xxh));
+    if (code.size() == code_words || g_programs_dir.empty()) {
+        return code;
+    }
+    auto program = ReadWords(g_programs_dir / fmt::format("{:016x}.bin", hash));
+    if (program.size() < code_words) {
+        return code;
+    }
+    program.resize(code_words);
+    if (XXH3_64bits(program.data(), program.size() * sizeof(u32)) != code_xxh) {
+        return code;
+    }
+    return program;
 }
 
 static void WriteManifestRecord(const ManifestRecord& record, std::span<const u32> code,
@@ -1571,7 +1594,7 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
         }
         ++records;
         spv_hashes.insert(r.spv_xxh);
-        auto code = ReadWords(code_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+        auto code = ReadRecordCode(code_dir, r.hash, r.code_xxh, r.code_words); // FEAT-GT7-188
         std::vector<u32> fetch;
         Shader::Gcn::FetchOverride fetch_override;
         if (r.has_fetch_data) {
@@ -1805,7 +1828,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                     continue;
                 }
             }
-            auto code = ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+            auto code = ReadRecordCode(g_capture_dir, r.hash, r.code_xxh, r.code_words); // FEAT-GT7-188
             if (code.size() != r.code_words) {
                 ++no_code;
                 continue;
@@ -2507,6 +2530,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         g_manifest_device = instance.GetDeviceID();
         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        g_programs_dir = cache_dir / fmt::format("{}-programs", serial); // FEAT-GT7-188
         const char* verify_on = std::getenv("RYGT_MANIFEST_VERIFY");
         const char* pretranslate_on = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
         if (ManifestRecordOn() || (verify_on && verify_on[0] == '1') ||
