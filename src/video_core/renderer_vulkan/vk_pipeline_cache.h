@@ -289,6 +289,10 @@ private:
     struct PrewarmRecord;
     bool InstallPrewarmRecord(PrewarmRecord& record);
     void PrewarmRead(std::stop_token stop);
+    /// FEAT-GT7-189 (from shadGT FEAT-GTS-471): this GPU's stored pipelines as the manifest's
+    /// recipe file, and other GPUs' recipe files made this GPU's stored pipelines (see the .cpp).
+    void ExportPipelineRecipes(std::stop_token stop);
+    void ImportPipelineRecipes(std::stop_token stop);
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which

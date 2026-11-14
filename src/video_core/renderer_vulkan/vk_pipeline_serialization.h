@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include "common/serdes.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -32,6 +33,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 /// FEAT-GT7-185 (PERF-038): the program hash and permutation index of stored shader metadata, without decoding
 /// the rest (decoding registers SRT walker code, which only the GPU thread may do).
 bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx);
+/// FEAT-GT7-189 (from shadGT FEAT-GTS-471): writes a stored graphics pipeline file at once (see
+/// RegisterPipelineData), not through the store's queue, so a listing right after it sees it.
+bool WriteStoredGraphicsPipeline(const std::filesystem::path& file, const GraphicsPipelineKey& key,
+                                 GraphicsPipeline::SerializationSupport& sdata);
+/// The current pipeline record version and the key's size, for pipeline recipe files.
+u32 StoredPipelineKeyVersion();
 /// FEAT-GT7-185 (PERF-038): a stored graphics pipeline of the current key version (others are skipped).
 bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
                                 GraphicsPipeline::SerializationSupport& sdata);

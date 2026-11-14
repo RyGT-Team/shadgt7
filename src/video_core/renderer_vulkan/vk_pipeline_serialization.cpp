@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 
@@ -145,6 +146,33 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 
     Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
+}
+
+bool WriteStoredGraphicsPipeline(const std::filesystem::path& file, const GraphicsPipelineKey& key,
+                                 GraphicsPipeline::SerializationSupport& sdata) {
+    Serialization::Archive ar{};
+    Serialization::Writer pldata{ar};
+    pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(u32{0}); // graphics
+    key.Serialize(ar);
+    sdata.Serialize(ar);
+    const auto bytes = ar.TakeOff();
+    auto temp = file;
+    temp += ".tmp";
+    {
+        std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) {
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, file, ec);
+    return !ec;
+}
+
+u32 StoredPipelineKeyVersion() {
+    return Serialization::PipelineKeyVersion;
 }
 
 bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
