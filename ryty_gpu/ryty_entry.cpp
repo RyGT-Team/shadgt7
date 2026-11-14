@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <SDL3/SDL_events.h> // FIX-GT7-190: SDL_PumpEvents
 #include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
@@ -102,10 +103,18 @@ void RunWindowThread() {
         g_window_ready = true;
     }
     g_window_cv.notify_all();
-    // Events reach ImGui, which the presenter initializes, so pump only once it exists.
+    // Events reach ImGui, which the presenter initializes, so they are handled only once it
+    // exists. FIX-GT7-190 (from shadGT FIX-GTS-474): meanwhile the window's messages are still
+    // taken from Windows (SDL queues them for the loop below), or after 5 s Windows calls it "Not
+    // Responding" while the renderer starts (the manifest merge, a large driver cache).
     {
         std::unique_lock lock{g_window_mutex};
-        g_window_cv.wait(lock, [] { return g_renderer_ready; });
+        while (!g_window_cv.wait_for(lock, std::chrono::milliseconds{50},
+                                     [] { return g_renderer_ready; })) {
+            lock.unlock();
+            SDL_PumpEvents();
+            lock.lock();
+        }
     }
     window.InitTimers();
     while (window.IsOpen()) {
