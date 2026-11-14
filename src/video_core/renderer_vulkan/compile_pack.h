@@ -6,12 +6,12 @@
 // PERF-GT7-108: the graphics compile pack. Every shader object set the driver compiles from SPIR-V
 // is also kept as a recipe (its stages' SPIR-V, flags and descriptor set layouts), in a folder per
 // GPU (not per driver): <cache>/<serial>.compile_pack/<vendor>-<device>/<key>.pack. With
-// RYGT_COMPILE_PACK=1 the recipes the SO-009 cache lacks for this driver are compiled in the
+// SHADGT_COMPILE_PACK=1 the recipes the SO-009 cache lacks for this driver are compiled in the
 // background at start, on every core below normal priority, so a track already in the pack starts
 // with its shader objects ready: after a driver update (the driver's caches start empty), or with a
-// pack made on another PC with the same GPU. RYGT_PACK_RECORD=0: no recipes are kept.
+// pack made on another PC with the same GPU. SHADGT_PACK_RECORD=0: no recipes are kept.
 // FIX-GT7-136: recording and the start-up compile need shader objects (off by default since
-// FIX-GT7-147, RYGT_SHADER_OBJECT=1 turns them on): without them no SPIR-V is kept, so there is
+// FIX-GT7-147, SHADGT_SHADER_OBJECT=1 turns them on): without them no SPIR-V is kept, so there is
 // no recipe to keep or compile.
 
 #include <atomic>
@@ -38,7 +38,7 @@ inline std::atomic<bool> g_running{false};      ///< the start-up compile is run
 
 inline bool RecordingOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_PACK_RECORD");
+        const char* env = std::getenv("SHADGT_PACK_RECORD");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -46,7 +46,7 @@ inline bool RecordingOn() {
 
 inline bool CompileOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_COMPILE_PACK");
+        const char* env = std::getenv("SHADGT_COMPILE_PACK");
         return env && env[0] == '1';
     }();
     return on;

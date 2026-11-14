@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// NAT-003: shadow mode for the native renderer (RYGT_NATIVE_SHADOW=1, implies the NAT-002 hooks).
+// NAT-003: shadow mode for the native renderer (SHADGT_NATIVE_SHADOW=1, implies the NAT-002 hooks).
 // When a GT Sport render job ends, the thread that recorded it reads the job's own commands and
 // works out the GPU state at each of its draws, as the native renderer will. The command processor
 // still renders everything as before; at each draw it compares its own state with what the job
@@ -20,11 +20,11 @@ union Regs;
 namespace Native {
 
 /// Whether render jobs are walked on their threads (shadow mode, or OPT-010 native prepare mode:
-/// RYGT_NATIVE_PREPARE=1).
+/// SHADGT_NATIVE_PREPARE=1).
 bool ShadowEnabled();
 /// GT7-PREP: where a PGL context keeps its Gnm DrawCommandBuffer (GT Sport 0x780, GT7 0x778).
 void SetPglContextDcb(u32 offset);
-/// Whether the command processor compares its state with the jobs' (RYGT_NATIVE_SHADOW=1).
+/// Whether the command processor compares its state with the jobs' (SHADGT_NATIVE_SHADOW=1).
 bool ShadowComparing();
 
 /// A render job began on this thread; `dcb` is its Gnm DrawCommandBuffer (fresh command chunk).

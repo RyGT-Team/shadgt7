@@ -54,7 +54,7 @@ struct Profile {
     /// AMD-313: FIX-215/216's NaN rules for MED3/MIN3/MAX3 on AMD's trinary path (default on).
     bool amd_nan_rules{true};
     /// FIX-GT7-138: FIX-215's NaN rule for MED3 on GPUs without the trinary extension too (NVIDIA,
-    /// Intel; default on, RYGT_MED3_NAN=0 turns it off).
+    /// Intel; default on, SHADGT_MED3_NAN=0 turns it off).
     bool med3_nan_rule{true};
     /// AMD-306: pixel shaders keep whole quads and reconverge at the end of branches
     /// (VK_KHR_shader_quad_control, VK_KHR_shader_maximal_reconvergence), so texture samples in

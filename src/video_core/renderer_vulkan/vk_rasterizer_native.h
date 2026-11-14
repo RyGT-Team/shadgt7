@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// NAT-100: native mode (RYGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
+// NAT-100: native mode (SHADGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
 
 #pragma once
 
@@ -74,7 +74,7 @@ class Rasterizer;
 class GraphicsPipeline;
 class ComputePipeline;
 
-/// NAT-100: whether native mode was asked for (RYGT_NATIVE=1).
+/// NAT-100: whether native mode was asked for (SHADGT_NATIVE=1).
 bool NativeModeRequested();
 
 class NativeRenderer {
@@ -135,13 +135,13 @@ public:
     /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
     void DumpFrame(const std::filesystem::path& dir);
 
-    /// OPT-010 (RYGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
+    /// OPT-010 (SHADGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
     static bool PrepareEnabled();
     /// Whether the prepared draws are used (the recorder takes them, the command thread trusts them).
     static bool PreparedOn();
     /// PERF-GT7-010: whether the recorder and the command processor run above normal priority.
     static bool BoostOn();
-    /// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
+    /// PERF-GT7-013..016 (SHADGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
     static bool NextOn();
     /// PERF-GT7-018: whether new lists are recorded by the scheduler's command thread.
     static bool RingOn();
@@ -207,7 +207,7 @@ private:
         void Clear();
     };
 
-    /// DIAG-GT7-001 (RYGT_DIAG_GPU_TIME=1): what the GPU ran between two timestamps of a list.
+    /// DIAG-GT7-001 (SHADGT_DIAG_GPU_TIME=1): what the GPU ran between two timestamps of a list.
     struct GpuSegment {
         u32 draws = 0, dispatches = 0, uploads = 0;
         u64 upload_bytes = 0;
@@ -433,13 +433,13 @@ private:
     /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
     /// into a picture no recent frame drew into.
     bool DrawMustNotSkip(const AmdGpu::Regs& regs);
-    /// DIAG-GT7-008 (RYGT_DIAG=1; RYGT_DIAG_ONE_OFF_REDRAW=0 off): what became of the pictures
+    /// DIAG-GT7-008 (SHARED_DIAG=1; SHADGT_DIAG_ONE_OFF_REDRAW=0 off): what became of the pictures
     /// FIX-198 made draws wait for: drawn again in a later frame (how soon), sampled in a later
     /// frame before that, or neither in 300 frames; by why they waited (never drawn, or not for
     /// 64 frames), with the draws that waited for each. Whether a new scene's first frame may skip
     /// them as later frames do.
     static bool OneOffDiagOn();
-    static bool OneOffDiagAll(); ///< RYGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
+    static bool OneOffDiagAll(); ///< SHADGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
     /// After a FIX-198 wait (or a draw PERF-GT7-023 skipped instead): from one_off_hits.
     void WatchOneOffs(const AmdGpu::Regs& regs, bool skipped);
     void CheckOneOffs();     ///< each frame
@@ -473,7 +473,7 @@ private:
     /// FIX-GT7-135: the texture (address, level >= 1) whose level `target` is; {0, -1}: none.
     std::pair<VAddr, s32> TextureLevelOf(const VideoCore::ImageInfo& target);
     /// FIX-GT7-102: time the current frame's draws waited for one-off pipelines; past the
-    /// budget (RYGT_ONE_OFF_BUDGET_MS, 250 by default, 0 no limit) the frame's other one-off
+    /// budget (SHADGT_ONE_OFF_BUDGET_MS, 250 by default, 0 no limit) the frame's other one-off
     /// draws are skipped as other draws are, and still watched.
     bool OneOffBudgetLeft();
     /// FIX-GT7-109: the deadline of a one-off draw's wait (max: no bound).
@@ -498,7 +498,7 @@ private:
     /// being sampled before, at least 8 times, no longer waits: its draws are skipped while their
     /// pipeline builds, as other draws are. One picture of the kind sampled before its redraw makes
     /// it wait again. Kept from run to run (<cache folder>/<serial>.one_off_kinds.txt).
-    /// RYGT_ONE_OFF_LEARN=0: every one-off picture waits, as before.
+    /// SHADGT_ONE_OFF_LEARN=0: every one-off picture waits, as before.
     struct OneOffKind {
         bool depth = false;
         u32 pitch = 0, height = 0, slices = 0, samples = 0;
@@ -533,7 +533,7 @@ private:
     void SaveOneOffKinds(bool wait); ///< when changed; wait: on this thread
     std::unordered_map<OneOffKind, OneOffKindStats, OneOffKindHash> one_off_kinds;
     std::unordered_map<OneOffPlace, OneOffKindStats, OneOffPlaceHash> one_off_places;
-    /// DIAG-GT7-010 (with RYGT_DIAG): the pages CPU write faults hit, by frame, to find the ones
+    /// DIAG-GT7-010 (with SHARED_DIAG): the pages CPU write faults hit, by frame, to find the ones
     /// the game writes every frame (watched again and faulted again each frame: 4-7 ms a frame of
     /// faults on the game's threads in a heavy scene) and what they hold.
     struct FaultPage {
@@ -566,7 +566,7 @@ private:
     u64 draws_at_frame = 0; ///< DIAG-GT7-011: stats.draws at the last frame's end
     std::string FaultPagesText(); ///< the window's pages, then cleared
     bool one_off_kinds_changed = false;
-    /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
+    /// DIAG-176 (diagnosis, SHADGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
     /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
     struct PendingWriteback {
         VAddr begin;
@@ -587,7 +587,7 @@ private:
     /// bound in a second frame is copied at the start of the next list; CPU writes to its pages
     /// are copied in before its next use; 64 KiB granules the CPU writes in two frames (rings of
     /// per-frame data) are read in place again for a while. Mirrors never overlap regions or
-    /// each other. RYGT_NATIVE_MIRRORS=0 turns them off; RYGT_NATIVE_MIRROR_MB is the budget.
+    /// each other. SHADGT_NATIVE_MIRRORS=0 turns them off; SHADGT_NATIVE_MIRROR_MB is the budget.
     struct Mirror {
         VAddr begin = 0;
         VAddr end = 0;
@@ -682,7 +682,7 @@ private:
     Mirror* memo_mirror = nullptr;
     /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
     Mirror* last_mirror = nullptr;
-    /// FIX-170 (diagnosis): RYGT_NATIVE_SNAPSHOT_BELOW, 0 when off.
+    /// FIX-170 (diagnosis): SHADGT_NATIVE_SNAPSHOT_BELOW, 0 when off.
     static u64 SnapshotBelow();
     /// A copy of the range as it is now (NAT-106 zeros where the CPU can't read).
     std::optional<std::pair<vk::Buffer, u64>> SnapshotRange(VAddr address, u64 size);
@@ -743,10 +743,10 @@ private:
         u64 lists = 0, slow = 0;
         double busy_ms = 0.0, max_list_ms = 0.0, max_gap_ms = 0.0;
     } gpu_time_stats;
-    /// OPT-013..015 (RYGT_NATIVE_REUSE=0 turns them off): work the previous draws of the list
+    /// OPT-013..015 (SHADGT_NATIVE_REUSE=0 turns them off): work the previous draws of the list
     /// already did is not done again.
     static bool ReuseOn();
-    /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the change under test alternates with the defaults
+    /// DIAG-GT7-003 (SHADGT_NATIVE_AB=1): the change under test alternates with the defaults
     /// every 10 s report window (A the defaults without PERF-GT7-018, B with it), each window's
     /// cost logged.
     static bool AbOn();
@@ -832,7 +832,7 @@ private:
         u32 count = 0, instances = 0, vertex_offset = 0, first_instance = 0;
         u64 ps = 0, prims = 0; ///< DIAG-GT7-001: its pixel shader and size, for the segment
     };
-    /// PERF-GT7-060 (on; RYGT_NATIVE_LDS_BATCH=0 off): the FIX-227 draws of a
+    /// PERF-GT7-060 (on; SHADGT_NATIVE_LDS_BATCH=0 off): the FIX-227 draws of a
     /// run share one barrier.
     static bool LdsBatchOn();
     /// PERF-GT7-060: copies what the reader pass binds; false when a descriptor write points
@@ -878,7 +878,7 @@ private:
     /// NAT-112: small render targets drawn into are written back to guest memory (GT Sport's
     /// CPU reads its brightness chain there for auto exposure).
     void FlushWritebacks();
-    /// FIX-156 (diagnosis): reads back the pictures at RYGT_NATIVE_WATCH_TEXTURE now and then.
+    /// FIX-156 (diagnosis): reads back the pictures at SHADGT_NATIVE_WATCH_TEXTURE now and then.
     void ProbeWatchedPictures();
     /// FIX-157 (diagnosis): a T# at a watched address and the picture it resolved to.
     void WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp, bool storage,
@@ -930,7 +930,7 @@ private:
         u32 sampled_width, sampled_height;
         VAddr target;
         u32 width, height, bits;
-        std::array<u32, 2> y; ///< the rows probed (at x RYGT_PROBE_AT's)
+        std::array<u32, 2> y; ///< the rows probed (at x SHADGT_PROBE_AT's)
         std::string bound;    ///< the draw's images (views, empty ones)
         std::string recorded; ///< hashes of its buffers' bytes when it was recorded
         u32 extra = 0;        ///< bytes after the blocks: its buffers, then the texture's
@@ -992,7 +992,7 @@ private:
     std::vector<DispatchProbe> dispatch_probes;
     void ProbeDispatch(const Shader::Info& stage, const DrawBindings& b, bool after);
     /// DIAG-179 (diagnosis): a traced R32F texture read back right after its sources were
-    /// copied in (RYGT_DIAG_REFRESH_READ=<width>x<height>).
+    /// copied in (SHADGT_DIAG_REFRESH_READ=<width>x<height>).
     struct RefreshProbe {
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         u64 tick;
@@ -1037,16 +1037,16 @@ private:
     void CaptureImage(const Native::ImageEntry& entry, u64 at_frame, const std::string& what);
     void WriteCaptures();
     void ReadRegionCompares();
-    /// DIAG-180 (diagnosis, RYGT_DIAG_VOLUME=<hex address>): an RGBA16F volume read back every
+    /// DIAG-180 (diagnosis, SHADGT_DIAG_VOLUME=<hex address>): an RGBA16F volume read back every
     /// 300 frames, summarized per slice.
     std::unique_ptr<Native::Rhi::Buffer> volume_probe;
     u64 volume_tick = 0;
     u32 volume_width = 0, volume_height = 0, volume_depth = 0;
     void ProbeVolume();
-    /// DIAG-182 (diagnosis, RYGT_DIAG_STALE_SMALL=1): small textures in use whose guest bytes
+    /// DIAG-182 (diagnosis, SHADGT_DIAG_STALE_SMALL=1): small textures in use whose guest bytes
     /// differ from what was last uploaded while nothing asks for an upload.
     void CheckSmallTextures();
-    /// DIAG-184 (diagnosis, RYGT_DIAG_PROGRAM_TEXTURES=<hex hash>): the small textures that
+    /// DIAG-184 (diagnosis, SHADGT_DIAG_PROGRAM_TEXTURES=<hex hash>): the small textures that
     /// program samples, and every 120 frames what memory holds there against what was uploaded.
     std::vector<Native::ImageEntry*> diag_program_textures;
     void NoteProgramTextures(u64 program, const DrawBindings& b);
@@ -1055,7 +1055,7 @@ private:
     void NoteProgramTextureWrites(const Targets* targets, const DrawBindings& b);
     void NoteProgramTextureWrite(VAddr address, u64 size, const char* kind);
     u32 diag185_lines = 0;
-    /// DIAG-187 (diagnosis, RYGT_DIAG_WRITE_HISTORY=1): GPU writes, region events and CPU write
+    /// DIAG-187 (diagnosis, SHADGT_DIAG_WRITE_HISTORY=1): GPU writes, region events and CPU write
     /// faults in a ring; DIAG-184 prints those over each of its textures when it first sees it.
     struct WriteNote {
         VAddr begin = 0;
@@ -1065,7 +1065,7 @@ private:
         u32 kind = 0;
     };
     std::vector<WriteNote> write_history;
-    std::vector<WriteNote> kept_history; ///< over RYGT_DIAG_HISTORY_RANGES, from the start
+    std::vector<WriteNote> kept_history; ///< over SHADGT_DIAG_HISTORY_RANGES, from the start
     u64 write_history_count = 0;
     std::mutex write_history_mutex;
     u64 history_program = 0;
@@ -1132,14 +1132,14 @@ private:
     void RefreshSources(Native::ImageEntry& texture);
     /// FIX-212: a depth target and a colour target of its layout at its address (D16/R16,
     /// D32/R32) are one picture: the other's newer one is copied in before either is used
-    /// (RYGT_NATIVE_DEPTH_TWINS=0 off).
+    /// (SHADGT_NATIVE_DEPTH_TWINS=0 off).
     void SyncDepthTwin(Native::ImageEntry& entry);
     /// FIX-210: before a draw into a target that is mips or layers of a larger one (FIX-197),
     /// the subresources of the drawn view that the larger one holds newer pictures for are
-    /// copied in (RYGT_NATIVE_PART_SYNC=0 off).
+    /// copied in (SHADGT_NATIVE_PART_SYNC=0 off).
     void SyncPartFromWholes(Native::ImageEntry& part, const DrawnRange& range);
     static bool PartSyncOn();
-    /// FIX-207: textures made of targets made of targets (RYGT_NATIVE_WHOLE_SOURCES=0 off), and
+    /// FIX-207: textures made of targets made of targets (SHADGT_NATIVE_WHOLE_SOURCES=0 off), and
     /// the version of such a whole: that of its newest part.
     static bool WholeSourcesOn();
     static u64 WholeVersion(Native::ImageEntry& source);
@@ -1316,12 +1316,12 @@ private:
         }
     } in_place;
     bool InPlaceSampled() const {
-        // PERF-GT7-001: diagnosis only (RYGT_NATIVE_INPLACE_STATS=1). Sampled frames put every
+        // PERF-GT7-001: diagnosis only (SHADGT_NATIVE_INPLACE_STATS=1). Sampled frames put every
         // 64 KB page of every binding in a set and looked each vertex attribute up in full
         // (no OPT-004 shortcut): in GT7's busy scenes (~3,000 draws) those frames missed the
         // 30 fps deadline.
         static const bool on = [] {
-            const char* env = Common::DiagEnv("RYGT_NATIVE_INPLACE_STATS");
+            const char* env = Common::DiagEnv("SHADGT_NATIVE_INPLACE_STATS");
             return env && env[0] == '1';
         }();
         return on && (frame & 7) == 0;
@@ -1377,7 +1377,7 @@ private:
     /// FIX-GT7-133: the stand-in's view (made, and the image cleared, on the recorder only when
     /// `may_create`); none when off or not made yet.
     vk::ImageView DepthStandIn(bool array, bool may_create);
-    /// FIX-GT7-133: RYGT_NATIVE_DEPTH_STAND_IN is not 0. A prepared draw that needs the stand-in
+    /// FIX-GT7-133: SHADGT_NATIVE_DEPTH_STAND_IN is not 0. A prepared draw that needs the stand-in
     /// before the recorder made it goes to the recorder.
     static bool DepthStandInOn();
     /// Color targets by their CMASK address, depth targets by their HTILE address (so a clear

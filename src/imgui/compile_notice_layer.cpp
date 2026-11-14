@@ -31,7 +31,7 @@ constexpr auto ShowAfter = std::chrono::milliseconds{500};
 
 bool Enabled() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_COMPILE_NOTICE");
+        const char* env = std::getenv("SHADGT_COMPILE_NOTICE");
         return !(env && env[0] == '0');
     }();
     return on;

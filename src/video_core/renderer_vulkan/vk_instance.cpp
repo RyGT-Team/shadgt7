@@ -403,8 +403,8 @@ bool Instance::CreateDevice() {
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-    // PERF-210 (RYGT_ANTI_LAG=1): AMD Anti-Lag, see AntiLagUpdate.
-    if (const char* env = std::getenv("RYGT_ANTI_LAG"); env && env[0] == '1') {
+    // PERF-210 (SHADGT_ANTI_LAG=1): AMD Anti-Lag, see AntiLagUpdate.
+    if (const char* env = std::getenv("SHADGT_ANTI_LAG"); env && env[0] == '1') {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                                         vk::PhysicalDeviceAntiLagFeaturesAMD>();
         anti_lag = chain.get<vk::PhysicalDeviceAntiLagFeaturesAMD>().antiLag &&
@@ -446,12 +446,12 @@ bool Instance::CreateDevice() {
     // FIX-GT7-136 turned them off by default on AMD GPUs (crashes reported there).
     // FIX-GT7-147: off by default on every GPU. On an RTX 4070 the small icons of GT7's car
     // interiors (garage) lost pieces with shader objects and were whole with pipelines, on three
-    // renderers (f26615ed, a283e27e, 422deef9). RYGT_SHADER_OBJECT=1 turns them on, on any GPU;
+    // renderers (f26615ed, a283e27e, 422deef9). SHADGT_SHADER_OBJECT=1 turns them on, on any GPU;
     // =0 and any other value leave them off.
     // SO-012: a start that wants shader objects after a lost device with shader objects on uses
     // pipelines once (the marker is removed, so the next start that wants them tries them again).
     // A start that doesn't want them leaves the marker for that next one.
-    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
+    const char* shader_object_env = std::getenv("SHADGT_SHADER_OBJECT");
     const char shader_object_forced = shader_object_env ? shader_object_env[0] : '\0';
     const bool shader_object_asked = shader_object_forced == '1';
     bool after_loss = false;
@@ -466,10 +466,10 @@ bool Instance::CreateDevice() {
                                        "objects: this run builds pipelines");
         }
     } else if (shader_object_forced == '0') {
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (RYGT_SHADER_OBJECT=0)");
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (SHADGT_SHADER_OBJECT=0)");
     } else {
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (FIX-GT7-147: off by default, "
-                                   "RYGT_SHADER_OBJECT=1 turns them on)");
+                                   "SHADGT_SHADER_OBJECT=1 turns them on)");
     }
     if (shader_object_asked && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
@@ -492,9 +492,9 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: whenever shader objects are on (only with RYGT_SHADER_OBJECT=1 since
+        // SO-011: whenever shader objects are on (only with SHADGT_SHADER_OBJECT=1 since
         // FIX-GT7-147), tessellated pipelines are shader objects too, now that shader objects are
-        // linked, cached on disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them
+        // linked, cached on disk and set only changed state. SHADGT_SHADER_OBJECT_TESS=0 keeps them
         // pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
@@ -511,12 +511,12 @@ bool Instance::CreateDevice() {
             }
             shader_object = shader_independent_sets;
         }
-        const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
+        const char* tess = std::getenv("SHADGT_SHADER_OBJECT_TESS");
         shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
         LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
                     shader_independent_sets ? "yes" : "no (using pipelines)");
         LOG_WARNING(Render_Vulkan,
-                    "SO-001: shader objects {} (RYGT_SHADER_OBJECT=1); tessellated pipelines {}",
+                    "SO-001: shader objects {} (SHADGT_SHADER_OBJECT=1); tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
     }
@@ -594,10 +594,10 @@ bool Instance::CreateDevice() {
     // pipelines keep the implicit MERGE (not checked by the validation layers without the
     // structure). Only in the PS4 Pro mode: sceKernelIsNeoMode is answered (and kept) before the
     // device is made, and the base mode has no mixed-sample draws.
-    // RYGT_NEO_COVERAGE_TRUNCATE=0: MERGE, as before.
+    // SHADGT_NEO_COVERAGE_TRUNCATE=0: MERGE, as before.
     if (nv_framebuffer_mixed_samples && !amd_mixed_attachment_samples &&
         Libraries::Kernel::sceKernelIsNeoMode() != 0) {
-        const char* env = std::getenv("RYGT_NEO_COVERAGE_TRUNCATE");
+        const char* env = std::getenv("SHADGT_NEO_COVERAGE_TRUNCATE");
         const bool wanted = !(env && env[0] == '0');
         const bool available = std::ranges::any_of(available_extensions, [](const auto& name) {
             return name == VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME;
@@ -612,7 +612,7 @@ bool Instance::CreateDevice() {
                 add_extension(VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME);
         }
         LOG_WARNING(Render_Vulkan, "NEO-GT7-016: colour coverage of mixed-sample draws: {}",
-                    !wanted                 ? "MERGE (RYGT_NEO_COVERAGE_TRUNCATE=0)"
+                    !wanted                 ? "MERGE (SHADGT_NEO_COVERAGE_TRUNCATE=0)"
                     : nv_coverage_reduction ? "TRUNCATE where the driver lists it"
                                             : "MERGE (no VK_NV_coverage_reduction_mode)");
     }
@@ -664,10 +664,10 @@ bool Instance::CreateDevice() {
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
-    // DIAG-243: RYGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
+    // DIAG-243: SHADGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
     // faulting address and the driver's description, and the renderer notes its last draws.
     {
-        const char* env = std::getenv("RYGT_DEVICE_FAULT");
+        const char* env = std::getenv("SHADGT_DEVICE_FAULT");
         note_fault_draws = env && env[0] == '1';
     }
     if (note_fault_draws) {
@@ -1216,12 +1216,12 @@ void Instance::CollectPhysicalMemoryInfo() {
 }
 
 // NAT-VRAM-001: the launcher's video memory setting (GPU.vram_budget_mb, 0 = Auto) or
-// RYGT_VRAM_BUDGET_MB caps the budget the texture cache's garbage collector plans with, so it
+// SHADGT_VRAM_BUDGET_MB caps the budget the texture cache's garbage collector plans with, so it
 // frees cached images the game hasn't used lately once the process uses more than the setting.
 // Auto keeps the driver-reported budget (VK_EXT_memory_budget) unchanged.
 u64 Instance::VideoMemorySettingBytes() {
     static const u64 bytes = [] {
-        if (const char* env = std::getenv("RYGT_VRAM_BUDGET_MB"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_VRAM_BUDGET_MB"); env && *env) {
             return u64{std::strtoull(env, nullptr, 10)} << 20;
         }
         if (const auto value = Common::RytyGameConfigValue("vram_budget_mb")) {

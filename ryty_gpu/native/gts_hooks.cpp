@@ -8,7 +8,7 @@
 // - no game code writes GPU commands itself, apart from PGL's links between command chunks;
 // - compute dispatches go through four Gnm wrappers, and every graphics frame is submitted by one
 //   PGL function.
-// With RYGT_NATIVE_HOOKS=1 these functions are hooked and counted. Every 10 seconds the counts are
+// With SHADGT_NATIVE_HOOKS=1 these functions are hooked and counted. Every 10 seconds the counts are
 // logged next to the draws and dispatches the renderer received (NAT-002 lines), to check that the
 // hooks see everything before a native renderer relies on them. Nothing else changes.
 
@@ -381,7 +381,7 @@ void StartReporter() {
 } // namespace
 
 void InstallGtsHooks(u8* exe_base) {
-    const char* env = std::getenv("RYGT_NATIVE_HOOKS");
+    const char* env = std::getenv("SHADGT_NATIVE_HOOKS");
     if ((!env || env[0] != '1') && !ShadowEnabled()) {
         return;
     }

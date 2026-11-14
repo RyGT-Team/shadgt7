@@ -938,10 +938,10 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
 
-    // FIX-GT7-145: 10 bits for a frame shown on an HDR10 output. RYGT_HDR_FRAME_8BIT=1: the
+    // FIX-GT7-145: 10 bits for a frame shown on an HDR10 output. SHADGT_HDR_FRAME_8BIT=1: the
     // surface's format as before.
     static const bool hdr_frame_8bit = [] {
-        const char* env = std::getenv("RYGT_HDR_FRAME_8BIT");
+        const char* env = std::getenv("SHADGT_HDR_FRAME_8BIT");
         return env != nullptr && env[0] == '1';
     }();
     const bool hdr_frame = swapchain.GetHDR() && !hdr_frame_8bit;
@@ -1457,9 +1457,9 @@ void Presenter::WaitFrameDrawn(const Frame* frame) {
     // the GPU drew that frame let GT7 refill the frame's UI vertex data while the GPU had yet
     // to read it: on the title screen, the background picture or its blurred copy drawn back
     // over it went missing on about one frame in four (the World Map scene behind it or black
-    // showing). RYGT_NATIVE_FLIP_WAIT=0 reports flips at once as before (diagnosis).
+    // showing). SHADGT_NATIVE_FLIP_WAIT=0 reports flips at once as before (diagnosis).
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_FLIP_WAIT");
+        const char* env = std::getenv("SHADGT_NATIVE_FLIP_WAIT");
         return !(env && env[0] == '0');
     }();
     if (!enabled || !frame || !frame->ready_scheduler || !rasterizer->Native()) {

@@ -40,3 +40,14 @@ const std::string GetRemoteNameFromLink() {
 
 } // namespace
 
+// FEAT-GT7-177: the build's git describe and commit, for the RyGT launcher's Advanced page. The launcher
+// reads libSceVideoOut.prx as a file (it never loads it) and looks for "RYGTREV1|describe|commit".
+// Exported so the linker keeps it; nothing in the renderer reads it.
+extern "C" {
+#if defined(_WIN32)
+__declspec(dllexport)
+#else
+__attribute__((visibility("default"), used))
+#endif
+extern const char RyGT_BuildDescription[] = "RYGTREV1|@GIT_DESC@|@GIT_REV@";
+}

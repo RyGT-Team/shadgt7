@@ -3,7 +3,7 @@
 
 // GTS-009: GT Sport's own log. The game's native code logs through loggers whose output object is
 // a null sink in the release build: its write method (GTSport.exe vtable 0x2971f18, slot 0x20) is
-// a bare "ret" (RVA 0x1c62fc0). With RYGT_GAME_LOG=1 that slot points here instead, and every
+// a bare "ret" (RVA 0x1c62fc0). With SHARED_GAME_LOG=1 that slot points here instead, and every
 // message goes to gtsport_game.log next to GTSport.exe. The slot is only changed when it still
 // holds the original function (another game version or converter build is left alone).
 
@@ -193,7 +193,7 @@ void PS4_SYSV_ABI WriteMessage(void* sink, const void* tags, const char* file, s
 namespace Ryty {
 
 void InstallGameLog() {
-    const char* enabled = std::getenv("RYGT_GAME_LOG");
+    const char* enabled = std::getenv("SHARED_GAME_LOG");
     if (enabled == nullptr || *enabled == '\0' || *enabled == '0') {
         return;
     }

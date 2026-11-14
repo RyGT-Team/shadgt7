@@ -5,7 +5,7 @@
 // game's code runs. Each patch checks the original bytes first and is skipped when they differ
 // (another game version, another converter build). The game's files are not changed.
 //
-// RYGT_PATCH=<rva>:<original hex>:<new hex>[,...] applies arbitrary patches the same way, for
+// SHADGT_PATCH=<rva>:<original hex>:<new hex>[,...] applies arbitrary patches the same way, for
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
 #include <cstdio>
@@ -91,8 +91,8 @@ bool Apply(u8* base, const Patch& patch) {
 // DIAG-097 (temporary): GT Sport's per-course view distances, GTRender::EnvironmentSetting::Misc
 // (reflection field list at eboot 0x2be6ac0; defaults set by its constructor at 0x6c7370). The
 // three calls of that constructor are redirected through a stub so every Misc instance is known;
-// a thread logs their values when the game changes them (RYGT_ENV_DIAG=1) and can scale chosen
-// fields (RYGT_ENV_SCALE=far=0.5,farPassFar=0.5,...) to test how draw counts react.
+// a thread logs their values when the game changes them (SHADGT_ENV_DIAG=1) and can scale chosen
+// fields (SHADGT_ENV_SCALE=far=0.5,farPassFar=0.5,...) to test how draw counts react.
 struct MiscField {
     const char* name;
     u32 offset;
@@ -172,10 +172,10 @@ bool LooksLikeEnvironmentSetting(const u8* base, std::string* reject_log = nullp
 }
 
 void MiscMonitor() {
-    // RYGT_ENV_AB=<seconds>: the scale is on and off for alternating periods of the same run,
+    // SHADGT_ENV_AB=<seconds>: the scale is on and off for alternating periods of the same run,
     // with draws per frame and frame rate logged for each state (run-to-run differences of the
     // test race are larger than the effects measured).
-    const char* ab_env = Common::DiagEnv("RYGT_ENV_AB");
+    const char* ab_env = Common::DiagEnv("SHADGT_ENV_AB");
     const u32 ab_ticks = ab_env ? static_cast<u32>(std::atof(ab_env) * 10.0) : 0;
     struct AbTotals {
         u64 draws, frames, ticks;
@@ -221,7 +221,7 @@ void MiscMonitor() {
                 }
                 continue;
             }
-            // RYGT_ENV_SET=<hex offset>:<i|f|b><value>,...: fields of every EnvironmentSetting
+            // SHADGT_ENV_SET=<hex offset>:<i|f|b><value>,...: fields of every EnvironmentSetting
             // set to a value (graphics-option experiments: shadow splitCount at 0x3d8/0x42c...).
             static const auto env_sets = [] {
                 struct Set {
@@ -230,7 +230,7 @@ void MiscMonitor() {
                     double value;
                 };
                 std::vector<Set> sets;
-                if (const char* env = std::getenv("RYGT_ENV_SET")) {
+                if (const char* env = std::getenv("SHADGT_ENV_SET")) {
                     std::string text = env;
                     size_t at = 0;
                     while (at < text.size()) {
@@ -256,7 +256,7 @@ void MiscMonitor() {
                     std::memcpy(&old, field, 4);
                     const s32 value = static_cast<s32>(set.value);
                     if (old != value) {
-                        std::fprintf(stderr, "[env] RYGT_ENV_SET %p+%#x: %d -> %d\n", instance.base, set.offset, old, value);
+                        std::fprintf(stderr, "[env] SHADGT_ENV_SET %p+%#x: %d -> %d\n", instance.base, set.offset, old, value);
                         std::memcpy(field, &value, 4);
                     }
                 } else if (set.type == 'f') {
@@ -264,13 +264,13 @@ void MiscMonitor() {
                     std::memcpy(&old, field, 4);
                     const float value = static_cast<float>(set.value);
                     if (old != value) {
-                        std::fprintf(stderr, "[env] RYGT_ENV_SET %p+%#x: %g -> %g\n", instance.base, set.offset, old, value);
+                        std::fprintf(stderr, "[env] SHADGT_ENV_SET %p+%#x: %g -> %g\n", instance.base, set.offset, old, value);
                         std::memcpy(field, &value, 4);
                     }
                 } else if (set.type == 'b') {
                     const u8 value = static_cast<u8>(set.value);
                     if (*field != value) {
-                        std::fprintf(stderr, "[env] RYGT_ENV_SET %p+%#x: %u -> %u\n", instance.base, set.offset, *field, value);
+                        std::fprintf(stderr, "[env] SHADGT_ENV_SET %p+%#x: %u -> %u\n", instance.base, set.offset, *field, value);
                         *field = value;
                     }
                 }
@@ -307,9 +307,9 @@ void MiscMonitor() {
                              instance.site, changes.c_str());
                 std::fflush(stderr);
             }
-            // RYGT_ENV_WATCH=<hex offset>: which code reads that field of the first instance that
+            // SHADGT_ENV_WATCH=<hex offset>: which code reads that field of the first instance that
             // gets a course's values (a hardware read/write watch, at once and again 40 s later).
-            static const char* watch_env = Common::DiagEnv("RYGT_ENV_WATCH");
+            static const char* watch_env = Common::DiagEnv("SHADGT_ENV_WATCH");
             static const u32 watch_offset =
                 watch_env ? static_cast<u32>(std::strtoul(watch_env, nullptr, 16)) : 0;
             static u8* watched = nullptr;
@@ -346,11 +346,11 @@ void RecordMisc(void* self, int site) {
     std::fill(std::begin(instance.seen), std::end(instance.seen), -1.0f);
     std::fill(std::begin(instance.written), std::end(instance.written), -1.0f);
     g_misc.push_back(instance);
-    // RYGT_ENV_WATCH_NEW=<hex offset>: reads and writes of that field of each new
+    // SHADGT_ENV_WATCH_NEW=<hex offset>: reads and writes of that field of each new
     // EnvironmentSetting for its first 1.5 s (skipped while another watch runs).
     // (Not during boot: the watch logs through the renderer's log, which starts later.)
     static const auto first_record = std::chrono::steady_clock::now();
-    if (const char* env = Common::DiagEnv("RYGT_ENV_WATCH_NEW");
+    if (const char* env = Common::DiagEnv("SHADGT_ENV_WATCH_NEW");
         env && site == 0 && std::chrono::steady_clock::now() - first_record > std::chrono::seconds{30}) {
         const u32 offset = static_cast<u32>(std::strtoul(env, nullptr, 16));
         Vulkan::RytyWatchWrites(reinterpret_cast<u64>(self) + offset, 1500,
@@ -387,7 +387,7 @@ u8* AllocNear(u8* base) {
 // add-on was downloaded, i.e. when the KeyValue ints unlock_dlc_gm_LewisHamilton and
 // dlc_gm_validLewisHamilton are 1. The servers that set them are gone, but all ten events, Lewis's
 // ghosts and voice-overs are in the game's files. The KeyValue lookup that MKeyValue::getInt calls
-// answers 1 for those two keys; every other key is untouched. RYGT_LEWIS=0 turns this off.
+// answers 1 for those two keys; every other key is untouched. SHADGT_LEWIS=0 turns this off.
 constexpr u64 kKeyValueGetIntCall = 0x212204; // call of the lookup inside MKeyValue::getInt
 constexpr u64 kKeyValueLookup = 0xbae080;     // bool lookup(store, const char* key, s64* value)
 
@@ -397,7 +397,7 @@ KeyValueLookupFn g_key_value_lookup = nullptr;
 // GTS-004: every special paint (matte, chrome, colour-shift and maker colours, bought with mileage
 // points from the shut-down servers). The inventory (inventory.ad) asks KeyValue for
 // unlock_sp_paint_<id>; those answer 1. Off by default (Lance: the paints don't show on the car);
-// RYGT_PAINTS=1 turns it on.
+// SHADGT_PAINTS=1 turns it on.
 bool g_unlock_lewis = false;
 bool g_unlock_paints = false;
 
@@ -451,8 +451,8 @@ bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, 
 #include "ryty_gpu/ryty_gt7_hdr_status.inl"
 
 void InstallLewisChallenge(u8* base) {
-    const char* env = std::getenv("RYGT_LEWIS");
-    const char* paints = std::getenv("RYGT_PAINTS");
+    const char* env = std::getenv("SHADGT_LEWIS");
+    const char* paints = std::getenv("SHADGT_PAINTS");
     g_unlock_lewis = !(env && env[0] == '0');
     g_unlock_paints = paints && paints[0] == '1'; // off: they unlock but don't show on the car
     if (!g_unlock_lewis && !g_unlock_paints) {
@@ -474,7 +474,7 @@ void InstallLewisChallenge(u8* base) {
 // script is patched while the game reads it: that one condition uses completed_playgo (true once the
 // game is installed) instead of enable_menu, like the Garage button. The bytes are only changed
 // where the whole original sequence (78 bytes of v1.69's GTMODE.ADC) is found in one 4 KB read.
-// RYGT_LIVERY=0 turns this off.
+// SHADGT_LIVERY=0 turns this off.
 struct ScriptPatch {
     const char* name;
     std::vector<u8> original;
@@ -606,7 +606,7 @@ void NoteProjectScript(const u8* data, s64 read) {
         return;
     }
     std::string_view name = head.substr(at + 15);
-    if (std::getenv("RYGT_LOG_PROJECTS")) {
+    if (std::getenv("SHADGT_LOG_PROJECTS")) {
         // DIAG-135: every project script the game loads, with the time.
         SYSTEMTIME now;
         GetLocalTime(&now);
@@ -634,9 +634,9 @@ void NoteProjectScript(const u8* data, s64 read) {
 }
 
 // DIAG-163: the first 60 scripts the game loads, with their source path and the time since the
-// first one, so a boot that ends early shows how far its scripts got. RYGT_LOG_BOOT=0 turns it off.
+// first one, so a boot that ends early shows how far its scripts got. SHADGT_LOG_BOOT=0 turns it off.
 void NoteBootScript(const u8* data, s64 read) {
-    static const bool off = std::getenv("RYGT_LOG_BOOT") && std::getenv("RYGT_LOG_BOOT")[0] == '0';
+    static const bool off = std::getenv("SHADGT_LOG_BOOT") && std::getenv("SHADGT_LOG_BOOT")[0] == '0';
     static std::atomic<int> count{0};
     static const auto first = std::chrono::steady_clock::now();
     if (off || read < 16 || std::memcmp(data, "ADCH012", 8) != 0) {
@@ -684,7 +684,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     }
     NoteBootScript(begin, read); // DIAG-163
     NoteProjectScript(begin, read); // FIX-110
-    static const bool log_scripts = std::getenv("RYGT_LOG_SCRIPTS") != nullptr;
+    static const bool log_scripts = std::getenv("SHADGT_LOG_SCRIPTS") != nullptr;
     if (log_scripts) {
         // DIAG-107: the start of each script chunk read (first 48 printable bytes).
         std::string text;
@@ -704,7 +704,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
 }
 
 void InstallScriptPatches(u8* base) {
-    const char* livery = std::getenv("RYGT_LIVERY");
+    const char* livery = std::getenv("SHADGT_LIVERY");
     if (!(livery && livery[0] == '0')) {
         // STRING_CONST 'disable', ARRAY_CONST 1, VARIABLE_EVAL enable_menu [7], UNARY_OPERATOR
         // __not__, LOGICAL_OR, VARIABLE_EVAL VariableManager.get, STRING_CONST
@@ -715,7 +715,7 @@ void InstallScriptPatches(u8* base) {
                       "0000407001000094020000260300000076777800000000940200001d8142940200000601000000"),
              25, ParseHex("811302000000")});
     }
-    if (!(std::getenv("RYGT_SCRIPTS") && std::getenv("RYGT_SCRIPTS")[0] == '0')) {
+    if (!(std::getenv("SHADGT_SCRIPTS") && std::getenv("SHADGT_SCRIPTS")[0] == '0')) {
         LoadScriptReplacements();
     }
     // The hook stays in without patches too: FIX-110 reads which project the game loads.
@@ -731,7 +731,7 @@ void InstallScriptPatches(u8* base) {
     }
 }
 
-// DIAG-GT7-043: RYGT_DUMP_SCRIPTS=<folder> saves every Adhoc script GT7 loads, one file each, with
+// DIAG-GT7-043: SHADGT_DUMP_SCRIPTS=<folder> saves every Adhoc script GT7 loads, one file each, with
 // the time it was loaded in stderr. Since version 15 a script's body is encrypted: the loader reads
 // the "ADCH015" header and 16 bytes, makes a decrypting stream from them and reads through it. What
 // that stream's read returns is saved, so this sees what the game itself gets.
@@ -753,7 +753,7 @@ int g_script_dump_count = 0;
 // its context for one session only. As the game reads Arcade's scripts, this adds to their bytecode:
 // the top screen writes the choices to a file, and the context's first read of the course and of the
 // car takes them from it. Nothing changes on disk but that file. Every function touched is checked
-// by name and sizes first; if one differs, the script stays as it is. RYGT_ARCADE_MEMORY=0 turns it off.
+// by name and sizes first; if one differs, the script stays as it is. SHADGT_ARCADE_MEMORY=0 turns it off.
 constexpr const char* kArcadeMemoryFile = "/APP_DATA/arcade_last.txt";
 
 // Operands of each Adhoc instruction: s symbol, S count and symbols, i 32 bits, b 8 bits, h 16 bits,
@@ -1401,9 +1401,9 @@ u64 PS4_SYSV_ABI ScriptStreamReadHook(void* stream, u8* to, u64 size) {
 }
 
 void InstallGt7ScriptDump(u8* base) {
-    const char* folder = std::getenv("RYGT_DUMP_SCRIPTS");
+    const char* folder = std::getenv("SHADGT_DUMP_SCRIPTS");
     const bool dump = folder && folder[0];
-    const char* memory = std::getenv("RYGT_ARCADE_MEMORY");
+    const char* memory = std::getenv("SHADGT_ARCADE_MEMORY");
     u8* const read = base + kGt7ScriptStreamRead + kTextRvaShift;
     constexpr size_t kMoved = sizeof(kGt7ScriptStreamReadStart);
     // Only GT7 has these bytes here: FIX-GT7-060 stays silent elsewhere.
@@ -1457,9 +1457,9 @@ void InstallGt7ScriptDump(u8* base) {
 }
 
 void InstallMiscHooks(u8* base) {
-    const char* diag = Common::DiagEnv("RYGT_ENV_DIAG");
-    const char* scale = std::getenv("RYGT_ENV_SCALE");
-    if (!(diag && diag[0] == '1') && !scale && !std::getenv("RYGT_ENV_SET")) {
+    const char* diag = Common::DiagEnv("SHADGT_ENV_DIAG");
+    const char* scale = std::getenv("SHADGT_ENV_SCALE");
+    if (!(diag && diag[0] == '1') && !scale && !std::getenv("SHADGT_ENV_SET")) {
         return;
     }
     std::fill(std::begin(g_misc_scale), std::end(g_misc_scale), 1.0f);
@@ -1611,9 +1611,9 @@ void SyncDecals() {
 // 1024x512 reflection of the wet track (ReflectSetting.enableIfWet of the course settings, checked
 // at eboot 0xab27d2): ~24% of a Tokyo rain frame's draws. Ignoring "wet" leaves the pass out
 // (Tokyo rain, 3 races each: 40.6 fps vs 31.1). Off when GPU.wet_reflections is false in
-// user\custom_configs\CUSA03220.json (the launcher's option) or RYGT_WET_REFLECTIONS=0.
+// user\custom_configs\CUSA03220.json (the launcher's option) or SHADGT_WET_REFLECTIONS=0.
 bool WetReflectionsWanted() {
-    if (const char* env = std::getenv("RYGT_WET_REFLECTIONS")) {
+    if (const char* env = std::getenv("SHADGT_WET_REFLECTIONS")) {
         return env[0] != '0';
     }
     // FIX-230: Unicode and long-path safe.
@@ -1633,7 +1633,7 @@ bool WetReflectionsWanted() {
 // mirror in a block it skips when the mirror object is null or the scene's mirror-off flag
 // ([r13+0x5a8]) is set: "cmp byte ptr [r13+0x5a8], 0; jne skip" at eboot 0x110011a. The cmp becomes
 // a call to a stub that also skips every other time, so the mirror is redrawn every second frame
-// (its picture is kept in between). GPU.mirror_half_rate=true (launcher) or RYGT_MIRROR_HALF=1.
+// (its picture is kept in between). GPU.mirror_half_rate=true (launcher) or SHADGT_MIRROR_HALF=1.
 bool ConfigFlag(const char* key, bool fallback) {
     // FIX-230: Unicode and long-path safe.
     const std::string text = Common::RytyReadGameConfig();
@@ -1679,12 +1679,12 @@ static std::string ConfigValue(const char* key) {
 // GTS-009: the camera's aspect ratio for a screen wider (or narrower) than 16:9, from
 // GPU.aspect_ratio: "auto" (the shape of the game's window or screen, from the display settings),
 // "21:9", "32:9", another width:height or a number. 0 when the game's own 16:9 applies.
-// RYGT_ASPECT overrides it.
+// SHARED_ASPECT overrides it.
 namespace Vulkan {
 float RytyDisplayAspect() {
     static const float aspect = [] {
         std::string value = ConfigValue("aspect_ratio");
-        if (const char* env = std::getenv("RYGT_ASPECT")) {
+        if (const char* env = std::getenv("SHARED_ASPECT")) {
             value = env;
         }
         double ratio = 0.0;
@@ -1731,7 +1731,7 @@ static void InstallWideCamera(u8* base) {
 
 void InstallMirrorHalfRate(u8* base) {
     bool wanted = ConfigFlag("mirror_half_rate", false);
-    if (const char* env = std::getenv("RYGT_MIRROR_HALF")) {
+    if (const char* env = std::getenv("SHADGT_MIRROR_HALF")) {
         wanted = env[0] == '1';
     }
     if (!wanted) {
@@ -1778,7 +1778,7 @@ void InstallTriggerTelemetry(u8* base) {
     auto original = reinterpret_cast<TelemetryUpdateFn>(base + 0x68cf20);
     const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
     if (*slot != original || std::memcmp(base + 0x68cf53, magic, sizeof(magic)) != 0) return;
-    const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+    const char* enabled = std::getenv("SHADGT_ADAPTIVE_TRIGGERS");
     if (enabled && enabled[0] == '0') return;
     DWORD protection;
     if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
@@ -1797,7 +1797,7 @@ void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
     const auto* packet = static_cast<const u8*>(service) + 0x1dc;
     Input::TriggerFeedback::Publish(packet);
     static const bool log = [] {
-        const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
+        const char* env = std::getenv("SHADGT_ADAPTIVE_TRIGGERS_LOG");
         return env && env[0] == '1';
     }();
     static u64 calls = 0;
@@ -1848,9 +1848,9 @@ void InstallTriggerTelemetryGt7(u8* base) {
         return;
     }
     // On whenever the launcher's trigger strength slider is above 0% (the bridge scales the effects
-    // by it and releases the triggers at 0%, also while the game runs); RYGT_ADAPTIVE_TRIGGERS=0
+    // by it and releases the triggers at 0%, also while the game runs); SHADGT_ADAPTIVE_TRIGGERS=0
     // forces it off, =1 on even at 0%.
-    const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+    const char* enabled = std::getenv("SHADGT_ADAPTIVE_TRIGGERS");
     if (enabled && enabled[0] == '0') return;
     DWORD protection;
     if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
@@ -1955,9 +1955,9 @@ void InstallFatalErrorDiag(u8* base) {
 // same output and the same counter left in the object. Hooked where the default and the custom
 // seek paths join (the three instructions moved to the stub are position independent), so a
 // cipher object with its own block-step method still runs the game's code. Applied only when the
-// function's bytes are the expected ones and the self-test passes. RYGT_FAST_CIPHER=0: off.
-// RYGT_FAST_CIPHER_VERIFY=<n>: the first n calls also run the game's own code on a copy of the
-// data and compare. RYGT_DIAG_CIPHER=1: calls, MB and time a second on stderr.
+// function's bytes are the expected ones and the self-test passes. SHADGT_FAST_CIPHER=0: off.
+// SHADGT_FAST_CIPHER_VERIFY=<n>: the first n calls also run the game's own code on a copy of the
+// data and compare. SHADGT_DIAG_CIPHER=1: calls, MB and time a second on stderr.
 namespace Gt7Cipher {
 
 constexpr u64 kXor = 0x3326e10;         // void xor(Cipher* self, u8* data, s64 size, u64 offset)
@@ -2301,7 +2301,7 @@ bool SelfTest() {
 }
 
 void Install(u8* base) {
-    const char* env = std::getenv("RYGT_FAST_CIPHER");
+    const char* env = std::getenv("SHADGT_FAST_CIPHER");
     const bool asked = env && env[0];
     if (asked && env[0] == '0') {
         return;
@@ -2320,7 +2320,7 @@ void Install(u8* base) {
     int regs[4] = {};
     __cpuidex(regs, 7, 0);
     g_avx2 = (regs[1] & (1 << 5)) != 0;
-    if (const char* wide = std::getenv("RYGT_FAST_CIPHER_SSE"); wide && wide[0] == '1') {
+    if (const char* wide = std::getenv("SHADGT_FAST_CIPHER_SSE"); wide && wide[0] == '1') {
         g_avx2 = false;
     }
     if (!SelfTest()) {
@@ -2385,10 +2385,10 @@ void Install(u8* base) {
     DWORD ignored = 0;
     VirtualProtect(join, sizeof(jump), old_protect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), join, sizeof(jump));
-    if (const char* verify = std::getenv("RYGT_FAST_CIPHER_VERIFY"); verify && verify[0]) {
+    if (const char* verify = std::getenv("SHADGT_FAST_CIPHER_VERIFY"); verify && verify[0]) {
         g_verify_left = std::strtoll(verify, nullptr, 0);
     }
-    if (const char* stats = std::getenv("RYGT_DIAG_CIPHER"); stats && stats[0] == '1') {
+    if (const char* stats = std::getenv("SHADGT_DIAG_CIPHER"); stats && stats[0] == '1') {
         g_stats = true;
     }
     std::fprintf(stderr, "[patch] PERF-GT7-113 fast file cipher applied (%s)\n",
@@ -2404,7 +2404,7 @@ void RytySetGt7HdrStatusCompatibility(bool available) {
 // NEO-GT7-014: GT7's graphics presets, option by option. GT7 fills its preset in one function
 // (GT7.exe+0x1bcc7c0: GT7_PS4, GT7_PS4Pro_4K for a Pro on a TV above 1080p, GT7_PS4Pro_2K for a
 // Pro on a 1080p TV) and copies it into GTRender::GraphicsConfig (+0x1bccba0, called from
-// +0x1bcc4bd and +0x173149c). That copy is hooked: with RYGT_NEO_EXTRAS set, five values the Pro
+// +0x1bcc4bd and +0x173149c). That copy is hooked: with SHADGT_NEO_EXTRAS set, five values the Pro
 // presets differ on are forced in whichever preset the game picked, each on or off on its own:
 //   blur        motion blur in races (race effect flags 0x08, motion blur off, and 0x10, a
 //               second blur off, cleared; off: both set, as in the PS4 and Pro 4K presets)
@@ -2413,7 +2413,7 @@ void RytySetGt7HdrStatusCompatibility(bool available) {
 //               and 6; off: set)
 //   garage60    the high-quality garage scenes (mode 5) at 60 fps (divisor 1; off: 2)
 //   lod         level of detail kept 1.3 times farther (the preset's detail scale 1.3; off: 1.0)
-// RYGT_NEO_EXTRAS=blur,lod turns those two on and the three others off; "all" and "none" too
+// SHADGT_NEO_EXTRAS=blur,lod turns those two on and the three others off; "all" and "none" too
 // (gt7_preset_options.h). Unset: the game's presets as they are (the Pro 1080p one has all five,
 // the others none). Preset layout (0x350 bytes, read from +0x1bcc7c0 and +0x1bccba0): +0x18
 // detail scale (float), mode m at 0x48 + 0x60 m with its frame divisor at +0 (u32) and effect
@@ -2525,19 +2525,19 @@ u8* FindPresetCopy(u8* base) {
 }
 
 void Install(u8* base) {
-    const char* env = std::getenv("RYGT_NEO_EXTRAS");
+    const char* env = std::getenv("SHADGT_NEO_EXTRAS");
     if (!env || !*env) {
         return;
     }
     const u32 on = Parse(env, [](std::string_view item) {
-        std::fprintf(stderr, "[patch] NEO-GT7-014: unknown option '%.*s' in RYGT_NEO_EXTRAS, "
+        std::fprintf(stderr, "[patch] NEO-GT7-014: unknown option '%.*s' in SHADGT_NEO_EXTRAS, "
                              "ignored\n",
                      static_cast<int>(item.size()), item.data());
     });
     u8* const copy = FindPresetCopy(base);
     if (!copy) {
         std::fprintf(stderr, "[patch] NEO-GT7-014: preset copy not found (another GT7 version), "
-                             "RYGT_NEO_EXTRAS not applied\n");
+                             "SHADGT_NEO_EXTRAS not applied\n");
         return;
     }
     if (copy != base + kPresetCopy) {
@@ -2570,7 +2570,7 @@ void Install(u8* base) {
     DWORD ignored = 0;
     VirtualProtect(copy, sizeof(kPresetCopyStart), old_protect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), copy, sizeof(kPresetCopyStart));
-    std::fprintf(stderr, "[patch] NEO-GT7-014 preset options applied (RYGT_NEO_EXTRAS=%s)\n", env);
+    std::fprintf(stderr, "[patch] NEO-GT7-014 preset options applied (SHADGT_NEO_EXTRAS=%s)\n", env);
 }
 
 } // namespace Gt7Presets
@@ -2594,12 +2594,12 @@ void RytyApplyGamePatches() {
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
-    if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
+    if (!(std::getenv("SHADGT_DECALS") && std::getenv("SHADGT_DECALS")[0] == '0')) {
         SyncDecals();
     }
     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
     char buffer[4096];
-    const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
+    const DWORD length = GetEnvironmentVariableA("SHADGT_PATCH", buffer, sizeof(buffer));
     if (length == 0 || length >= sizeof(buffer)) {
         return;
     }
@@ -2613,7 +2613,7 @@ void RytyApplyGamePatches() {
         if (a != std::string::npos && b != std::string::npos) {
             Patch patch{std::strtoull(item.substr(0, a).c_str(), nullptr, 16),
                         ParseHex(item.substr(a + 1, b - a - 1)), ParseHex(item.substr(b + 1)),
-                        "RYGT_PATCH " + item.substr(0, a)};
+                        "SHADGT_PATCH " + item.substr(0, a)};
             Apply(base, patch);
         }
         start = end + 1;

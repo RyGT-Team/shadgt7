@@ -52,7 +52,7 @@ bool HybridCpu();
 
 /// PERF-GT7-024: on a CPU with one kind of core, the threads of the driver's shader compiler are
 /// kept on the compile cores too: unnamed threads busy since the last call are sampled, and one
-/// found running in nvgpucomp64.dll is moved. Called every 2 s. RYGT_COMPILE_CORES=0 turns the
+/// found running in nvgpucomp64.dll is moved. Called every 2 s. SHADGT_COMPILE_CORES=0 turns the
 /// compile cores off.
 void ConfineDriverCompileThreads();
 /// PERF-GT7-054: calls `fn(handle, thread id)` for each of this process's threads, the handle

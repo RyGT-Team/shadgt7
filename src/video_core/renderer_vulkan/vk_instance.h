@@ -22,7 +22,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
 
-/// DIAG-243 (RYGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
+/// DIAG-243 (SHADGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
 void NoteDrawForFault(u64 pipeline_hash, u32 info);
 
 class Instance {
@@ -33,7 +33,7 @@ public:
     ~Instance();
 
     /// DIAG-243: once, after a lost device: VK_EXT_device_fault's report (with
-    /// RYGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
+    /// SHADGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
     void ReportDeviceLost() const;
 
     /// Returns a formatted string for the driver version
@@ -175,7 +175,7 @@ public:
         return depth_range_unrestricted;
     }
 
-    /// SO-001: plain pipelines are drawn with shader objects (RYGT_SHADER_OBJECT=1).
+    /// SO-001: plain pipelines are drawn with shader objects (SHADGT_SHADER_OBJECT=1).
     bool IsShaderObjectEnabled() const {
         return shader_object;
     }
@@ -366,7 +366,7 @@ public:
     /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
     bool IsAmdGcn() const;
 
-    /// DIAG-243: RYGT_DEVICE_FAULT=1: the device
+    /// DIAG-243: SHADGT_DEVICE_FAULT=1: the device
     /// fault extension is enabled and the renderer notes its last draws.
     bool NotesDrawsForFault() const {
         return note_fault_draws;
@@ -700,7 +700,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool device_fault{}; // DIAG-243
-    bool note_fault_draws{}; ///< DIAG-243: RYGT_DEVICE_FAULT=1
+    bool note_fault_draws{}; ///< DIAG-243: SHADGT_DEVICE_FAULT=1
     bool quad_control{};       ///< AMD-306
     bool vertex_order_check{}; ///< AMD-307
     bool supports_memory_budget{};

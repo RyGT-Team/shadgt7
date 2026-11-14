@@ -98,7 +98,7 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
     }
     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
     const Id med{ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx)};
-    // FIX-GT7-138 (Profile::med3_nan_rule, RYGT_MED3_NAN=0 turns it off): the same NaN case on
+    // FIX-GT7-138 (Profile::med3_nan_rule, SHADGT_MED3_NAN=0 turns it off): the same NaN case on
     // GPUs without the trinary extension (NVIDIA, Intel). NMin/NMax drop a NaN operand, so the
     // formula above gives GT7's (65000, NaN, 0) HDR clamp 65000 where GCN gives 0: pure white
     // lines along building and sign edges, white flashes on car bodies, and their glow.

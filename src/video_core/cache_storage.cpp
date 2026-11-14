@@ -45,7 +45,7 @@ namespace {
 // unchecked. Each store is stamped with the build that filled it (its commit: a release is one
 // commit), and a store of another build (or of none, from before the stamp) is cleared once
 // when a different build opens it. Only this store: the GPU driver's own caches are left alone.
-// RYGT_KEEP_SHADER_CACHE=1 keeps it (tests across builds).
+// SHADGT_KEEP_SHADER_CACHE=1 keeps it (tests across builds).
 constexpr const char* StampName = "renderer_build.txt";
 
 // FIX-GT7-053: CMake can't read the commit in a git worktree, so such a build has only its
@@ -55,21 +55,21 @@ std::string RendererBuild() {
 }
 
 bool KeepShaderCache() {
-    const char* env = std::getenv("RYGT_KEEP_SHADER_CACHE");
+    const char* env = std::getenv("SHADGT_KEEP_SHADER_CACHE");
     return env && env[0] == '1';
 }
 
 // Tests: a store of its own for this tag. The stamp knows neither the environment's switches nor
 // changes made since the build was configured, so a test keeps one store per renderer and switches.
-// NEO-GT7-007: RYGT_NEO_SDWA_CMP=0 translates SDWA compares the old way (to VCC), which breaks the
+// NEO-GT7-007: SHADGT_NEO_SDWA_CMP=0 translates SDWA compares the old way (to VCC), which breaks the
 // PS4 Pro checkerboard resolve; those translations get a store of their own, so a session run once
 // with the switch leaves nothing wrong in the usual store. Only with the Pro mode's switch
-// (RYGT_NEO=1, read as libkernel reads it): the base mode has no SDWA, so its store stays.
+// (SHARED_NEO=1, read as libkernel reads it): the base mode has no SDWA, so its store stays.
 std::string StoreTag() {
-    const char* env = std::getenv("RYGT_SHADER_STORE_TAG");
+    const char* env = std::getenv("SHADGT_SHADER_STORE_TAG");
     std::string tag = env && *env ? std::string{"-"} + env : std::string{};
-    const char* sdwa = std::getenv("RYGT_NEO_SDWA_CMP");
-    const char* neo = std::getenv("RYGT_NEO");
+    const char* sdwa = std::getenv("SHADGT_NEO_SDWA_CMP");
+    const char* neo = std::getenv("SHARED_NEO");
     if (sdwa && sdwa[0] == '0' && neo && neo[0] == '1' && neo[1] == '\0') {
         tag += "-sdwa-vcc";
     }
@@ -120,10 +120,10 @@ bool SetAside(const std::filesystem::path& store) {
 /// FIX-GT7-056: this stamp sends the store to SHD-010's clear at the next start.
 constexpr const char* OverLimitStamp = "over-size-limit";
 
-/// RYGT_SHADER_STORE_MAX_MB=0: no limit.
+/// SHADGT_SHADER_STORE_MAX_MB=0: no limit.
 u64 StoreMaxBytes() {
     static const u64 max = [] {
-        const char* env = std::getenv("RYGT_SHADER_STORE_MAX_MB");
+        const char* env = std::getenv("SHADGT_SHADER_STORE_MAX_MB");
         return u64{env && *env ? std::strtoull(env, nullptr, 0) : 4096} * 1048576;
     }();
     return max;
@@ -231,7 +231,7 @@ bool ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
     }
     if (has_files && KeepShaderCache()) {
         LOG_WARNING(Render, "SHD-010: shader store {} is {} (this is {}); kept "
-                            "(RYGT_KEEP_SHADER_CACHE=1)",
+                            "(SHADGT_KEEP_SHADER_CACHE=1)",
                     store.string(), from, build);
         return true;
     }

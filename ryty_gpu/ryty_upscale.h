@@ -10,7 +10,7 @@
 #include "core/libraries/kernel/process.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
-// ryGT: the size DLSS and FSR 3.1 scale the game picture to (RYGT_UPSCALE_QUALITY, set by the
+// ryGT: the size DLSS and FSR 3.1 scale the game picture to (SHARED_UPSCALE_QUALITY, set by the
 // launcher's Upscaling quality list). The game always draws at its own size (1920x1080 for GT7),
 // so a quality mode cannot lower the render resolution: it picks the output instead, the picture
 // times the mode's scale (Native 1x, Quality 1.5x, Balanced 1.72x, Performance 2x, Ultra
@@ -22,7 +22,7 @@ enum class Quality { Auto, Native, Quality, Balanced, Performance, UltraPerforma
 
 inline Quality GetQuality() {
     static const Quality quality = [] {
-        const char* env = std::getenv("RYGT_UPSCALE_QUALITY");
+        const char* env = std::getenv("SHARED_UPSCALE_QUALITY");
         if (!env) {
             return Quality::Auto;
         }

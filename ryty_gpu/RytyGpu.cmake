@@ -112,7 +112,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_input_bridge.cpp
         ryty_gpu/ryty_controller_overlay.cpp
         ryty_gpu/ryty_write_watch.cpp
-        # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
+        # Stutter diagnostics (SHARED_DIAG=1), ryty_diag.h.
         ryty_gpu/ryty_diag.cpp
         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
         ryty_gpu/ryty_dlss.cpp
@@ -136,7 +136,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # NAT-020/021: the native image registry and its self test.
         ryty_gpu/native/image_registry.cpp
         ryty_gpu/native/native_selftest.cpp
-        # NAT-100: native mode (RYGT_NATIVE=1): draws recorded with native images.
+        # NAT-100: native mode (SHADGT_NATIVE=1): draws recorded with native images.
         src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp

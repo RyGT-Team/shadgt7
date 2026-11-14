@@ -54,10 +54,10 @@ struct VertexAttribute {
 
     /// FIX-GT7-054: the V# code is made from. Code made from a garbage V# followed its swizzle
     /// under the key of plain floats, and a real attribute of four floats then matched it: GT7's
-    /// map markers read R, G, B, R or nothing at all. RYGT_GARBAGE_VSHARP_PLAIN=0: as before.
+    /// map markers read R, G, B, R or nothing at all. SHADGT_GARBAGE_VSHARP_PLAIN=0: as before.
     AmdGpu::Buffer GetSharpForCode(const Shader::Info& info) const noexcept {
         static const bool plain = [] {
-            const char* env = std::getenv("RYGT_GARBAGE_VSHARP_PLAIN");
+            const char* env = std::getenv("SHADGT_GARBAGE_VSHARP_PLAIN");
             return !(env && env[0] == '0');
         }();
         auto buffer = GetSharp(info);

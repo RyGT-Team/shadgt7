@@ -120,10 +120,10 @@ void EndCapture() {
 }
 
 void TriggerCapture() {
-    // DIAG-224 (diagnosis, RYGT_RDOC_PRESENT_FRAME=1): RenderDoc's own capture of the next frame
+    // DIAG-224 (diagnosis, SHADGT_RDOC_PRESENT_FRAME=1): RenderDoc's own capture of the next frame
     // from present to present. The submit-delimited capture ended before the native renderer's
     // command buffers were submitted, so it held only the presentation.
-    static const bool present_frame = std::getenv("RYGT_RDOC_PRESENT_FRAME") != nullptr;
+    static const bool present_frame = std::getenv("SHADGT_RDOC_PRESENT_FRAME") != nullptr;
     if (present_frame && rdoc_api) {
         rdoc_api->TriggerMultiFrameCapture(3); // presents run at 60 Hz, game frames at 30
         return;

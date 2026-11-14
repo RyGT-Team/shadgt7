@@ -417,13 +417,13 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
 
                 const u32 num_dwords = u32(opcode) - u32(IR::Opcode::StoreBufferU32) + 1;
 
-                // TESS-001: the launcher's Tessellation option off (RYGT_TESSELLATION=0) draws
+                // TESS-001: the launcher's Tessellation option off (SHADGT_TESSELLATION=0) draws
                 // tessellated surfaces flat: every factor is limited to 1, so each patch is drawn
                 // as its own triangles with no added detail. A factor of 0 or less still culls the
                 // patch, as the game asks. (Skipping these draws instead would lose the cars: GT7
                 // draws their bodies tessellated in the colour pass.)
                 static const bool flat = [] {
-                    const char* env = std::getenv("RYGT_TESSELLATION");
+                    const char* env = std::getenv("SHADGT_TESSELLATION");
                     return env && env[0] == '0';
                 }();
                 const auto GetValue = [&](IR::Value data) -> IR::F32 {

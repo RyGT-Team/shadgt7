@@ -159,10 +159,10 @@ struct BufferResource {
 };
 using BufferResourceList = boost::container::static_vector<BufferResource, NUM_BUFFERS>;
 
-/// FIX-GT7-043: whether the key tells an FMask from anything else. RYGT_FMASK_KEY=0: as before.
+/// FIX-GT7-043: whether the key tells an FMask from anything else. SHADGT_FMASK_KEY=0: as before.
 inline bool FMaskKeyEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_FMASK_KEY");
+        const char* env = std::getenv("SHADGT_FMASK_KEY");
         return !(env && env[0] == '0');
     }();
     return enabled;
@@ -172,10 +172,10 @@ inline bool FMaskKeyEnabled() {
 /// samples and loads read it as a multisampled array, its size is queried without a level. The
 /// translation stopped at the image type before (no SPIR-V type, no sample coordinates for it),
 /// and GT7's draws with such a T# were queued again and again and never drawn (one failed
-/// translation every 2 s in quiet race stretches of 11-08). RYGT_MSAA_ARRAY_SAMPLE=0: as before.
+/// translation every 2 s in quiet race stretches of 11-08). SHADGT_MSAA_ARRAY_SAMPLE=0: as before.
 inline bool MsaaArrayEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_MSAA_ARRAY_SAMPLE");
+        const char* env = std::getenv("SHADGT_MSAA_ARRAY_SAMPLE");
         return !(env && env[0] == '0');
     }();
     return enabled;
@@ -264,10 +264,10 @@ struct ImageResource {
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
 
-/// FIX-215: whether samplers of cube maps clamp at the faces' edges (RYGT_CUBE_SAMPLER_CLAMP=0 off).
+/// FIX-215: whether samplers of cube maps clamp at the faces' edges (SHADGT_CUBE_SAMPLER_CLAMP=0 off).
 inline bool CubeSamplerClampEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_CUBE_SAMPLER_CLAMP");
+        const char* env = std::getenv("SHADGT_CUBE_SAMPLER_CLAMP");
         return !(env && env[0] == '0');
     }();
     return enabled;

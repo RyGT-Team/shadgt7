@@ -216,9 +216,9 @@ void DrawCompileNotice() {
 // What the watermark says: this renderer's revision, after the prerelease's name when this is
 // that prerelease's renderer (manifest.json beside the exe has its commit; a test renderer copied
 // into a release leaves the release's manifest there). Empty in a tagged release, or with
-// RYGT_WATERMARK=0.
+// SHADGT_WATERMARK=0.
 std::string BuildWatermark() {
-    const char* env = std::getenv("RYGT_WATERMARK");
+    const char* env = std::getenv("SHADGT_WATERMARK");
     if (Common::g_is_release || (env && env[0] == '0')) {
         return {};
     }
@@ -660,7 +660,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         if (HostIsConvertedGame()) {
             RytyProtectGuestRedZones();
             RytyApplyGamePatches();
-            // NAT-002: hook points for the native renderer (RYGT_NATIVE_HOOKS=1).
+            // NAT-002: hook points for the native renderer (SHADGT_NATIVE_HOOKS=1).
             Native::InstallGtsHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
         }
     }
@@ -728,7 +728,7 @@ extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
 }
 
 // NEO-GT7-015: this renderer draws the PS4 Pro mode (NEO-GT7-001 to 014). Ryty's libkernel asks
-// for it before RYGT_NEO=1 answers sceKernelIsNeoMode with 1: a renderer without the Pro mode
+// for it before SHARED_NEO=1 answers sceKernelIsNeoMode with 1: a renderer without the Pro mode
 // (an older package) keeps the base PS4 mode instead of a black screen and a lost GPU.
 extern "C" __declspec(dllexport) int RytyGpuNeoSupported() {
     return 1;

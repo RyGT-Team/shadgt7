@@ -34,7 +34,7 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
              vk::Extent2D size);
 
 /// ryGT: DLSS upscaling (GPU.dlss_enabled) through Streamline's sl.dlss.dll, when it is in the dlss
-/// folder (RYGT_DLSS_STREAMLINE=0 keeps the self-built ryGT_dlss.dll plugin instead). It runs on
+/// folder (SHADGT_DLSS_STREAMLINE=0 keeps the self-built ryGT_dlss.dll plugin instead). It runs on
 /// its own viewport with zero motion vectors and a flat depth image, starting DLSS's history over
 /// every frame like the plugin.
 bool UpscaleRequested();

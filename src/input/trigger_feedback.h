@@ -46,11 +46,11 @@ struct Feedback {
     std::uint8_t left{}, right{};
 };
 // Telemetry from the car being driven: on track (flags bit 0), not paused or loading (bits 1, 2).
-// (diagnosis) RYGT_ADAPTIVE_TRIGGERS_REPLAY=1 also takes replays and demos (bit 0 clear), to check
+// (diagnosis) SHADGT_ADAPTIVE_TRIGGERS_REPLAY=1 also takes replays and demos (bit 0 clear), to check
 // the effects without driving.
 inline bool Driving(std::uint16_t flags) {
     static const bool replays = [] {
-        const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_REPLAY");
+        const char* env = std::getenv("SHADGT_ADAPTIVE_TRIGGERS_REPLAY");
         return env && env[0] == '1';
     }();
     return ((flags & 1) || replays) && !(flags & 6);

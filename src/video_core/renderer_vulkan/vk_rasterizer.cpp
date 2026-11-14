@@ -1072,12 +1072,12 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
             // the shadow's old buffer (its capacity).
             std::swap(info.flattened_ud_buf, selected.flattened);
-            // PERF-GT7-122 (RYGT_FLAT_PREFETCH=0 off): the command thread wrote these dwords on
+            // PERF-GT7-122 (SHADGT_FLAT_PREFETCH=0 off): the command thread wrote these dwords on
             // another core a moment ago, and the first read of each stage's buffer descriptors
             // was 40% of BindBuffers' own time in a 20-car race (profile by line, 2026-11-10):
             // Asked for now, their cache lines arrive while the targets are resolved.
             static const bool prefetch = [] {
-                const char* env = std::getenv("RYGT_FLAT_PREFETCH");
+                const char* env = std::getenv("SHADGT_FLAT_PREFETCH");
                 return !(env && env[0] == '0');
             }();
 #if defined(_M_X64) || defined(__x86_64__)
@@ -1244,19 +1244,19 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
     // pipeline without it (built here when no worker took it yet), so the command thread goes
     // on selecting the next draws' pipelines and their builds start meanwhile. With the lock
     // held, a new track's first race built its one-off targets' pipelines one after the other
-    // (171 draws, ~390 ms each with a cold driver cache): a 68 s stop. RYGT_ONE_OFF_UNLOCKED=0
+    // (171 draws, ~390 ms each with a cold driver cache): a 68 s stop. SHADGT_ONE_OFF_UNLOCKED=0
     // waits as before.
     static const bool unlocked = [] {
-        const char* env = std::getenv("RYGT_ONE_OFF_UNLOCKED");
+        const char* env = std::getenv("SHADGT_ONE_OFF_UNLOCKED");
         return !(env && env[0] == '0');
     }();
     // PERF-GT7-036: its shaders too: waited for under the lock, the command thread could not
     // select the next draws (nor queue their shaders and builds) meanwhile, so a new track's
     // first corner waited for each draw's translations one after the other (45 draws, ~11 ms
     // each: frames of 400-900 ms). A draw takes a round per stage it lacks, and one for its
-    // pipeline. RYGT_ONE_OFF_SHADERS_UNLOCKED=0: under the lock, as before.
+    // pipeline. SHADGT_ONE_OFF_SHADERS_UNLOCKED=0: under the lock, as before.
     static const bool shaders_unlocked = [] {
-        const char* env = std::getenv("RYGT_ONE_OFF_SHADERS_UNLOCKED");
+        const char* env = std::getenv("SHADGT_ONE_OFF_SHADERS_UNLOCKED");
         return !(env && env[0] == '0');
     }();
     bool found = false;
@@ -1297,7 +1297,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
         }
     }
     if (!found && bounded && unlocked) {
-        // FIX-GT7-109: never a wait without a deadline in play. (RYGT_ONE_OFF_UNLOCKED=0 waits
+        // FIX-GT7-109: never a wait without a deadline in play. (SHADGT_ONE_OFF_UNLOCKED=0 waits
         // under the lock as before, deadline or not: it never skipped a one-off draw.)
         return nullptr;
     }
@@ -2901,7 +2901,7 @@ static bool SpunLabel(VAddr address) {
 
 static s64 FenceBatchNs() {
     static const s64 ns = [] {
-        const char* env = std::getenv("RYGT_NATIVE_FENCE_BATCH_MS");
+        const char* env = std::getenv("SHADGT_NATIVE_FENCE_BATCH_MS");
         return env && *env ? s64(std::strtod(env, nullptr) * 1e6) : s64{2'000'000};
     }();
     return ns;
@@ -3014,7 +3014,7 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // Publish its fences only after GPU completion, so the guest cannot recycle those inputs
     // or consume stale particle counters. Early compute fences caused stretched spark geometry.
     static const bool native_hold_compute = [] {
-        const char* env = std::getenv("RYGT_NATIVE_HOLD_COMPUTE");
+        const char* env = std::getenv("SHADGT_NATIVE_HOLD_COMPUTE");
         return !(env && env[0] == '0');
     }();
     direct_hold = direct_hold || (native && (!compute_queue || native_hold_compute));
@@ -3132,7 +3132,7 @@ void Rasterizer::FrameDumpNoteOld() {
 
 bool Rasterizer::ExposureLogOn() {
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_EXPOSURE_LOG");
+        const char* env = Common::DiagEnv("SHADGT_EXPOSURE_LOG");
         return env && env[0] == '1';
     }();
     return on;
@@ -3151,7 +3151,7 @@ void Rasterizer::ExposureLogShader(const Shader::Info& stage, const char* render
     }
     exposure_last = now;
     static const float dump_exposure = [] {
-        const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_EXPOSURE");
+        const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_EXPOSURE");
         return env && *env ? float(std::atof(env)) : -1.0f;
     }();
     const float key = std::bit_cast<float>(now[1]);
@@ -3175,12 +3175,12 @@ void Rasterizer::StartFrameDumpNow() {
 }
 
 void Rasterizer::FrameDumpFlip() {
-    // FIX-158 (diagnosis, RYGT_PEEK=<hex address>[,...], RYGT_PEEK_AT=<seconds>): the first
+    // FIX-158 (diagnosis, SHADGT_PEEK=<hex address>[,...], SHADGT_PEEK_AT=<seconds>): the first
     // eight floats guest memory holds at each address, at 240 flips from that time on (what the
     // CPU reads back of GPU results, per frame).
     static const std::vector<VAddr> peek = [] {
         std::vector<VAddr> list;
-        const char* env = Common::DiagEnv("RYGT_PEEK");
+        const char* env = Common::DiagEnv("SHADGT_PEEK");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -3194,7 +3194,7 @@ void Rasterizer::FrameDumpFlip() {
     }();
     if (!peek.empty()) {
         static const double peek_at = [] {
-            const char* env = Common::DiagEnv("RYGT_PEEK_AT");
+            const char* env = Common::DiagEnv("SHADGT_PEEK_AT");
             return env ? std::atof(env) : 200.0;
         }();
         static const auto peek_start = std::chrono::steady_clock::now();
@@ -3249,11 +3249,11 @@ void Rasterizer::FrameDumpFlip() {
             it = exposure_targets.erase(it);
         }
     }
-    // RYGT_FRAME_DUMP_AT=<seconds>[,<seconds>...]: one dump at each time (FIX-156 diagnosis:
+    // SHADGT_FRAME_DUMP_AT=<seconds>[,<seconds>...]: one dump at each time (FIX-156 diagnosis:
     // several frames of one run, e.g. a lit and a dark cockpit).
     static const std::vector<double> dump_times = [] {
         std::vector<double> times;
-        if (const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_AT"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_AT"); env && *env) {
             std::string list{env};
             for (size_t pos = 0; pos < list.size();) {
                 const size_t end = std::min(list.find(',', pos), list.size());
@@ -3314,10 +3314,10 @@ void Rasterizer::FrameDumpFlip() {
         return;
     }
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    // NAT-128 (RYGT_FRAME_DUMP_FRAMES=n): n frames are collected (events of each, the targets and
+    // NAT-128 (SHADGT_FRAME_DUMP_FRAMES=n): n frames are collected (events of each, the targets and
     // textures as the last one left them), for work the game does every few frames only.
     static const u32 dump_frames = [] {
-        const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_FRAMES");
+        const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_FRAMES");
         return env && *env ? std::max(std::atoi(env), 1) : 1;
     }();
     static u32 frames_seen = 0;
@@ -3408,9 +3408,9 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
         trace_last_pass = text;
         TraceText(text); // NAT-130
     }
-    // DIAG-168 (diagnosis, RYGT_TRACE_DRAWS=1): every draw into a traced pass, as below.
+    // DIAG-168 (diagnosis, SHADGT_TRACE_DRAWS=1): every draw into a traced pass, as below.
     static const bool trace_draws = [] {
-        const char* env = Common::DiagEnv("RYGT_TRACE_DRAWS");
+        const char* env = Common::DiagEnv("SHADGT_TRACE_DRAWS");
         return env && env[0] == '1';
     }();
     bool traced_draw = false;
@@ -3507,7 +3507,7 @@ void Rasterizer::FrameDumpEvent(std::string text) {
 
 std::pair<VAddr, VAddr> Rasterizer::TraceRange() {
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = Common::DiagEnv("RYGT_TRACE_RANGE");
+        const char* env = Common::DiagEnv("SHADGT_TRACE_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -3522,7 +3522,7 @@ std::pair<VAddr, VAddr> Rasterizer::TraceRange() {
 bool Rasterizer::TracedElsewhere(VAddr address, u64 size) {
     static const std::vector<std::pair<VAddr, VAddr>> ranges = [] {
         std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = Common::DiagEnv("RYGT_TRACE_RANGE");
+        const char* env = Common::DiagEnv("SHADGT_TRACE_RANGE");
         const char* at = env ? std::strchr(env, ',') : nullptr;
         while (at && *at == ',') {
             char* end = nullptr;
@@ -5388,9 +5388,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             auto& image = texture_cache.GetImage(image_id);
-            // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
+            // FIX-152 (diagnosis): SHADGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
             static const bool dump_all = [] {
-                const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
             if (frame_dump_collecting && !is_storage &&
@@ -6139,10 +6139,10 @@ void Rasterizer::OnNewMapping(VAddr addr, u64 size) {
     // a lap later. Views still there at a map are stale: the range is treated as unmapped first.
     // Without them, textures there are still uploaded again: uploaded while nothing was mapped,
     // they hold zeros, and memory mapped with its data already in it writes nothing they would
-    // see. RYGT_MAP_DROPS_COPIES=0: as before (stale views are still counted in the log; imports
+    // see. SHADGT_MAP_DROPS_COPIES=0: as before (stale views are still counted in the log; imports
     // that failed in the range are retried).
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_MAP_DROPS_COPIES");
+        const char* env = std::getenv("SHADGT_MAP_DROPS_COPIES");
         return !(env && env[0] == '0');
     }();
     if (size == 0) {
@@ -6154,7 +6154,7 @@ void Rasterizer::OnNewMapping(VAddr addr, u64 size) {
             LOG_WARNING(Render_Vulkan,
                         "FIX-GT7-077: views of what was mapped before at {:#x}+{:#x} {} at its new "
                         "mapping ({} so far)",
-                        addr, size, enabled ? "dropped" : "kept (RYGT_MAP_DROPS_COPIES=0)", n);
+                        addr, size, enabled ? "dropped" : "kept (SHADGT_MAP_DROPS_COPIES=0)", n);
         }
         if (enabled) {
             UnmapMemory(addr, size);
@@ -6383,11 +6383,11 @@ void Rasterizer::UpdateDepthStencilState() const {
     if (depth_test_enabled) {
         dynamic_state.SetDepthWriteEnabled(regs.depth_control.depth_write_enable &&
                                            !regs.depth_render_control.depth_clear_enable);
-        // DIAG-227 (diagnosis, RYGT_DIAG_GEQUAL_ALWAYS=1): GREATER_EQUAL depth tests always pass
+        // DIAG-227 (diagnosis, SHADGT_DIAG_GEQUAL_ALWAYS=1): GREATER_EQUAL depth tests always pass
         // (whether the colour pass after a depth pre-pass fails its depth test).
-        static const bool gequal_always = Common::DiagEnv("RYGT_DIAG_GEQUAL_ALWAYS") != nullptr;
+        static const bool gequal_always = Common::DiagEnv("SHADGT_DIAG_GEQUAL_ALWAYS") != nullptr;
         auto op = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
-        static const bool tess_always = Common::DiagEnv("RYGT_DIAG_TESS_ALWAYS") != nullptr;
+        static const bool tess_always = Common::DiagEnv("SHADGT_DIAG_TESS_ALWAYS") != nullptr;
         if (tess_always && regs.stage_enable.hs_en) {
             op = vk::CompareOp::eAlways; // DIAG-227: tessellated draws only
         }
@@ -6403,16 +6403,16 @@ void Rasterizer::UpdateDepthStencilState() const {
         dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
     }
 
-    // DIAG-228 (diagnosis, RYGT_DIAG_NO_DEPTH_BIAS=1): no depth bias at all.
-    static const bool no_bias = Common::DiagEnv("RYGT_DIAG_NO_DEPTH_BIAS") != nullptr;
+    // DIAG-228 (diagnosis, SHADGT_DIAG_NO_DEPTH_BIAS=1): no depth bias at all.
+    static const bool no_bias = Common::DiagEnv("SHADGT_DIAG_NO_DEPTH_BIAS") != nullptr;
     // FIX-224: a tessellated draw tested GREATER(_EQUAL) or LESS(_EQUAL) against depth a depth
     // pre-pass wrote for the same surface from its plain triangles gets a small bias toward the
     // camera. GT7 draws the car's body once untessellated into depth and then tessellated in colour
     // with GREATER_EQUAL: close up, many of the tessellated sub-triangles came out a rounding error
     // behind the pre-pass and failed, leaving black patches with zero motion on the car in the race
-    // start's close-ups. RYGT_TESS_DEPTH_BIAS=<units of minimum resolvable depth>, 0 turns it off.
+    // start's close-ups. SHADGT_TESS_DEPTH_BIAS=<units of minimum resolvable depth>, 0 turns it off.
     static const float tess_bias = [] {
-        const char* env = std::getenv("RYGT_TESS_DEPTH_BIAS");
+        const char* env = std::getenv("SHADGT_TESS_DEPTH_BIAS");
         return env && *env ? std::strtof(env, nullptr) : 0.0f; // off: a bias, not accuracy
     }();
     const auto func = regs.depth_control.depth_func;

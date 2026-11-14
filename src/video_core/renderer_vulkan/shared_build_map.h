@@ -28,7 +28,7 @@ public:
         values.emplace(key, value);
     }
 
-    /// PERF-GT7-041 (RYGT_GPL=1): the value of the key, built by the first caller only; a caller
+    /// PERF-GT7-041 (SHADGT_GPL=1): the value of the key, built by the first caller only; a caller
     /// that needs one another build is working on waits for it instead of building it again (a
     /// race start queues many cars that share their pixel shaders). Second: it was reused.
     /// FIX-GT7-030: with may_wait false (a draw is waiting for this build) the caller builds its
