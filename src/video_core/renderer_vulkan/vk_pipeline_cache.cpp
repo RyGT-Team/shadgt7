@@ -839,15 +839,20 @@ PrecompileProgress GetPrecompileProgress() {
 class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers()
-        : queue{CompileConcurrency(), std::max(1u, NumWorkers() / 4), CompileConcurrency()} {
-        // PERF-102: extra workers precompile on the splash screen (the queue's boost), but keep
-        // concurrent driver pipeline compilations bounded. Large bursts can overwhelm the driver
-        // while the game and its pipeline linker are already using the GPU.
+        : queue{CompileConcurrency(), std::max(1u, NumWorkers() / 4), AllCores()} {
+        // Concurrent driver pipeline compilations stay bounded (the queue's limit): large bursts
+        // can overwhelm the driver while the game and its pipeline linker use the GPU.
+        // FEAT-GT7-188 (from shadGT FEAT-GTS-470): on the splash screen (the queue's boost) the
+        // game is held, so the precompile builds on every worker, as shadGT's does (there 16
+        // startup workers took a Radeon 610M from 8.2 to 15.1 pipelines a second).
         for (u32 i = 0; i < AllCores(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
     }
     ~PipelineBuildWorkers() {
+        if (boost_wide) {
+            Common::SetCompileCoresWide(false); // FEAT-GT7-188
+        }
         for (auto& thread : threads) {
             thread.request_stop();
         }
@@ -865,6 +870,14 @@ public:
     }
     void SetBoost(bool on) {
         queue.SetBoost(on);
+        // FEAT-GT7-188 (from shadGT FEAT-GTS-470): while the splash precompile runs the game is
+        // held, so compiles use every core. PERF-GT7-024 keeps them on the compile cores for play
+        // (3 of 8 on a Ryzen 7 7745HX in shadGT, where 16 startup workers then shared 6 logical
+        // processors at half the CPU). Counted as SetCompileCoresWide's other callers.
+        if (on != boost_wide) {
+            boost_wide = on;
+            Common::SetCompileCoresWide(on);
+        }
     }
     size_t BackgroundQueued() {
         return queue.BackgroundQueued();
@@ -991,6 +1004,7 @@ private:
     bool backlog = false; ///< FIX-GT7-106
     bool in_play = false; ///< FIX-GT7-109
     u32 pace = 64; ///< PERF-GT7-034: no limit
+    bool boost_wide = false; ///< FEAT-GT7-188: SetBoost widened the compile cores
 
     static u32 AllCores() {
         return std::max(std::thread::hardware_concurrency(), NumWorkers());
@@ -1731,7 +1745,11 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     struct Stored {
         u32 next_idx = 0;
         std::vector<Shader::StageSpecialization> specs;
+        std::vector<size_t> perms; // FEAT-GT7-188: the permutation each spec was stored at
     };
+    // FEAT-GT7-188 (from shadGT FEAT-GTS-470): which local permutation each record became
+    // (program, the record's SPIR-V hash, permutation), for other GPUs' pipeline recipes.
+    std::vector<std::array<u64, 3>> recipe_perms;
     std::unordered_map<u64, Stored> programs;
     // FEAT-GT7-187: while the splash precompile holds the game for it, every logical processor
     // translates at normal priority; during play up to 4 low-priority threads, as before.
@@ -1739,6 +1757,11 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     const auto work = [&] {
         Common::SetCurrentThreadPriority(held ? Common::ThreadPriority::Normal
                                               : Common::ThreadPriority::Low);
+        // FEAT-GT7-188: and on every core (without a set of its own a thread runs on the process
+        // default, the game's cores only when a core owner is set, PERF-GT7-048).
+        if (held) {
+            Common::AllowAllCores();
+        }
         Shader::Pools pools;
         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
             ++g_pretranslate_done; // FEAT-GT7-187: counted as taken up
@@ -1839,7 +1862,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 ++in_use; // the game took the program up meanwhile: left alone from here
                 continue;
             }
-            if (std::ranges::find(program.specs, *spec) != program.specs.end()) {
+            if (const auto same = std::ranges::find(program.specs, *spec);
+                same != program.specs.end()) {
+                recipe_perms.push_back(
+                    {r.hash, r.spv_xxh, program.perms[size_t(same - program.specs.begin())]});
                 ++duplicate;
                 continue;
             }
@@ -1864,6 +1890,8 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                                perm_idx);
             RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
             program.specs.push_back(std::move(*spec));
+            program.perms.push_back(perm_idx);
+            recipe_perms.push_back({r.hash, r.spv_xxh, perm_idx});
             ++stored;
         }
     };
@@ -1875,6 +1903,19 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     }
     for (auto& thread : threads) {
         thread.join();
+    }
+    if (!recipe_perms.empty()) {
+        // FEAT-GT7-188: appended; a later start finds these programs stored and skips them. The
+        // store's clear (SHD-010) removes it with the translations it names.
+        const auto path = Storage::DataBase::Instance().StorePath() / "recipe-perms.txt";
+        if (std::FILE* f = std::fopen(path.string().c_str(), "ab")) {
+            for (const auto& [pgm, spv_xxh, perm] : recipe_perms) {
+                std::fprintf(f, "%016llx %016llx %llu\n", static_cast<unsigned long long>(pgm),
+                             static_cast<unsigned long long>(spv_xxh),
+                             static_cast<unsigned long long>(perm));
+            }
+            std::fclose(f);
+        }
     }
     LOG_WARNING(Render_Vulkan,
                 "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
@@ -2986,10 +3027,37 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
     return build;
 }
 
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470, RYGT_DIAG_PRECOMPILE=1): the splash precompile's
+// throughput, logged every 5 s from IdlePrewarm: are the workers starved (few builds in flight) or
+// blocked (many in flight, each slower), e.g. on a lock in the driver.
+static bool DiagPrecompile() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DIAG_PRECOMPILE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+static std::atomic<u32> g_diag_in_flight{};
+static std::atomic<u64> g_diag_built{}, g_diag_build_us{}, g_diag_installed{}, g_diag_install_us{};
+
 void PipelineCache::FinishBuild(PipelineBuild& build, bool draw_waits) {
     // FIX-044: the GPU thread waiting for (or doing) a pipeline build holds the guest clocks.
     Common::GuestClock::CompilePause hold;
     if (!build.started.exchange(true)) {
+        const bool diag = DiagPrecompile(); // FEAT-GT7-188
+        const auto diag_start = std::chrono::steady_clock::now();
+        if (diag) {
+            ++g_diag_in_flight;
+        }
+        SCOPE_EXIT {
+            if (diag) {
+                --g_diag_in_flight;
+                ++g_diag_built;
+                g_diag_build_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - diag_start)
+                                           .count());
+            }
+        };
         g_pipeline_build_urgent = draw_waits || build.urgent; // FIX-GT7-030
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
@@ -4997,6 +5065,42 @@ void PipelineCache::IdlePrewarm(bool splash) {
         ReleasePrecompileHold();
         return;
     }
+    if (DiagPrecompile()) { // FEAT-GT7-188
+        using namespace std::chrono;
+        static auto window = steady_clock::now();
+        static u64 samples = 0, in_flight_sum = 0, built_at = 0, build_us_at = 0, installed_at = 0,
+                   install_us_at = 0;
+        static u32 in_flight_max = 0;
+        const u32 now_in_flight = g_diag_in_flight.load();
+        ++samples;
+        in_flight_sum += now_in_flight;
+        in_flight_max = std::max(in_flight_max, now_in_flight);
+        const auto now = steady_clock::now();
+        if (now - window >= seconds{5}) {
+            const double wall_us = double(duration_cast<microseconds>(now - window).count());
+            const u64 built = g_diag_built.load(), build_us = g_diag_build_us.load();
+            const u64 installed = g_diag_installed.load(), install_us = g_diag_install_us.load();
+            const u64 d_built = built - built_at;
+            LOG_WARNING(Render_Vulkan,
+                        "PRECOMPILE-DIAG: {:.1f} s: {} built ({:.1f}/s), {:.0f} ms each, "
+                        "parallelism {:.1f}; in flight avg {:.1f} max {}; {} installed by the "
+                        "command thread ({:.0f}% of its time), {} waiting to install",
+                        wall_us / 1e6, d_built, d_built / (wall_us / 1e6),
+                        d_built ? double(build_us - build_us_at) / 1000.0 / double(d_built) : 0.0,
+                        double(build_us - build_us_at) / wall_us,
+                        samples ? double(in_flight_sum) / double(samples) : 0.0, in_flight_max,
+                        installed - installed_at,
+                        100.0 * double(install_us - install_us_at) / wall_us,
+                        prewarm_queued.load());
+            window = now;
+            samples = in_flight_sum = 0;
+            in_flight_max = 0;
+            built_at = built;
+            build_us_at = build_us;
+            installed_at = installed;
+            install_us_at = install_us;
+        }
+    }
     // PERF-102: released once every stored pipeline is built (or after 15 minutes at most).
     static const auto first_call = std::chrono::steady_clock::now();
     if (PrecompileHoldsGame() &&
@@ -5266,6 +5370,15 @@ void PipelineCache::InstallPrewarmed(bool force) {
         }
         --prewarm_queued;
         prewarm_cv.notify_one();
+        const auto diag_install = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            if (DiagPrecompile()) { // FEAT-GT7-188
+                ++g_diag_installed;
+                g_diag_install_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - diag_install)
+                                             .count());
+            }
+        };
         if (InstallPrewarmRecord(*record)) {
             ++prewarm_stats.installed;
         } else {

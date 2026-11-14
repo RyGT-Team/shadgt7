@@ -205,7 +205,9 @@ void DrawProgressBar(const Vulkan::PrecompileProgress& progress, ProgressBarStat
     const float fraction =
         progress.total ? float(progress.done) / float(progress.total) : 0.0f;
     char text[128];
-    if (progress.active) {
+    if (progress.active && progress.total <= 1) {
+        std::snprintf(text, sizeof(text), "%s", doing); // a step without a count (FEAT-GT7-188)
+    } else if (progress.active) {
         std::snprintf(text, sizeof(text), "%s   %llu / %llu   %.0f%%", doing,
                       static_cast<unsigned long long>(progress.done),
                       static_cast<unsigned long long>(progress.total), fraction * 100.0f);
@@ -234,16 +236,35 @@ void DrawProgressBar(const Vulkan::PrecompileProgress& progress, ProgressBarStat
 }
 
 void DrawPrecompileProgress() {
-    // FEAT-GT7-187 (from shadGT FEAT-GTS-469): one bar for both: the manifest pre-translation
-    // (PERF-GT7-117), which ran with no sign that it ran, then the stored pipelines the precompile
-    // builds (it waits for the translations).
+    // FEAT-GT7-187 (from shadGT FEAT-GTS-469): one bar for the manifest pre-translation
+    // (PERF-GT7-117), which ran with no sign that it ran, and then the stored pipelines the
+    // precompile builds (it waits for the translations).
+    // FEAT-GT7-188 (FEAT-GTS-470): the second step's count is known only after the translations,
+    // so the steps are counted one after the other, named, and the bar stays up for as long as
+    // the game is held on the splash screen: summed, it reached 100% and said "Shaders ready"
+    // after the translations while thousands of pipelines were still to be built.
     const auto compile = Vulkan::GetPrecompileProgress();
     const auto translate = Vulkan::GetPretranslateProgress();
-    const Vulkan::PrecompileProgress both{compile.total + translate.total,
-                                          compile.done + translate.done,
-                                          compile.active || translate.active};
+    const bool held = Vulkan::PrecompileHoldsGame();
+    static bool translated = false; // a translation step ran: the build step is step 2 of 2
     static ProgressBarState state;
-    DrawProgressBar(both, state, "Compiling shaders", "Shaders ready", 0.90f);
+    const char* doing = "Compiling shaders";
+    Vulkan::PrecompileProgress shown{1, 1, false};
+    if (translate.active) {
+        translated = translated || held;
+        shown = translate;
+        doing = held ? "Compiling shaders  -  step 1 of 2: translating"
+                     : "Compiling shaders  -  translating";
+    } else if (compile.active) {
+        shown = compile;
+        doing = translated ? "Compiling shaders  -  step 2 of 2: building pipelines"
+                           : "Compiling shaders";
+    } else if (held) {
+        shown = {1, 0, true}; // between the steps: the listing of the stored pipelines
+        doing = translated ? "Compiling shaders  -  step 2 of 2: preparing pipelines"
+                           : "Compiling shaders  -  preparing";
+    }
+    DrawProgressBar(shown, state, doing, "Shaders ready", 0.90f);
 }
 
 // PERF-100: while a new shader compiles and the game is held, the same translucent style: a
