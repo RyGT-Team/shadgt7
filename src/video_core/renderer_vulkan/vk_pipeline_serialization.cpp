@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "ryty_gpu/ryty_upscale.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -52,9 +53,28 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // 17 (FIX-GT7-043): the Info's FMask list has another layout, holds every read as an FMask and
 // their key another meaning. Older entries are not read: their Info can't be read at this layout.
 // 18 (FIX-GT7-043): an FMask's T# is kept as the way to fetch it.
-// 19 (FIX-GT7-182): samplers record whether they are read at an explicit level.
+// 19 (FIX-GT7-182): samplers record whether they are read at an explicit level, in a byte that
+// was padding. Only temporal DLSS's texture bias reads that flag, so version 18 entries are still
+// read where temporal DLSS is not asked for: those players keep their stored translations. Where
+// it is asked for they are translated again, once.
 static constexpr u32 ShaderMetaVersion = 19u;
+static constexpr u32 ShaderMetaVersionNoExplicitLod = 18u;
 } // namespace Serialization
+
+namespace {
+// FIX-GT7-182: a version 18 entry is read into today's Info, so the flag must sit in what was
+// padding and move nothing.
+struct SamplerResourceV18 {
+    Shader::SharpFetch<AmdGpu::Sampler> sharp_fetch;
+    Shader::SharpFetchPostOp post_op;
+    Shader::SharpLocation post_op_tsharp_dw3_off;
+    bool is_depth;
+    bool is_cube;
+};
+static_assert(sizeof(Shader::SamplerResource) == sizeof(SamplerResourceV18) &&
+                  alignof(Shader::SamplerResource) == alignof(SamplerResourceV18),
+              "the explicit-level flag must not change the stored layout");
+} // namespace
 
 namespace Vulkan {
 std::atomic<bool> single_sample_barycentric_cache_enabled{false};
@@ -254,7 +274,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    const bool no_explicit_lod =
+        meta_version == Serialization::ShaderMetaVersionNoExplicitLod; // FIX-GT7-182
+    if (meta_version != Serialization::ShaderMetaVersion &&
+        !(no_explicit_lod && !Vulkan::RytyUpscale::TemporalWanted())) {
         return false;
     }
 
@@ -309,6 +332,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         spec.runtime_info.hw.fs.quad_sample_mask = false;
     }
     info.Deserialize(ar, perm_hash_ar);
+    if (no_explicit_lod) {
+        for (auto& sampler : info.samplers) {
+            sampler.explicit_lod = true; // not recorded: the game's own bias, whatever comes
+        }
+    }
     ReadResourceUsage(meta, info);
     if (!StoredCubesFit(spec, info, face_cubes,
                         native_cube_cache_enabled.load(std::memory_order_relaxed))) {

@@ -97,7 +97,7 @@ inline bool NativeAA() {
     return GetQuality() == Quality::Native;
 }
 
-// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1, off by default): DLSS fed with the game's own
+// DLSS-GT7-001, temporal DLSS (when it runs: TemporalWanted below): DLSS fed with the game's own
 // depth, motion vectors and sub-pixel jitter instead of a flat depth, zero motion and a history
 // reset every frame. GT7's race draws a jittered 1920x1080 scene (49 positions of +-0.25 pixel)
 // with a motion-vector target, and resolves it with its own temporal anti-aliasing pass (pixel
@@ -227,32 +227,8 @@ inline bool TemporalActive() {
 
 /// The jitter's sign, measured on 2026-11-12: with the car at a standstill, 126 pairs of frames
 /// in a row of the un-resolved scene moved by -1.0 x the change of (c14*c20, c15*c21) on both
-/// axes (correlation -0.97; dev\captures\lire-jitter-dlss.py on
-/// partie-20261112-091150-jitter-dlss), and by eye the user found choice A the steadiest. So the
-/// scene's shift, which is what DLSS takes as its jitter, is -(c14*c20, c15*c21): choice A,
-/// what NoteTemporalDraw notes. GT Sport's DLSS pass (shadGT, ryty_gts_dlss.cpp) hands DLSS the
-/// opposite for the same pass. Page Down still steps through the other signs while playing, for
-/// comparison. Factors of the noted jitter.
-struct TemporalJitterChoice {
-    float x;
-    float y;
-    const char* name; ///< for the FPS counter and the log
-};
-inline constexpr TemporalJitterChoice TemporalJitterChoices[] = {
-    {1.0f, 1.0f, "A"},   // -(c14*c20, c15*c21): the prototype's first reading
-    {-1.0f, -1.0f, "B"}, // +(c14*c20, c15*c21): GT Sport's
-    {1.0f, -1.0f, "C"},
-    {-1.0f, 1.0f, "D"},
-    {0.0f, 0.0f, "0"},   // none given: DLSS takes every frame as centred
-};
-inline std::atomic<u32>& TemporalJitterIndex() {
-    static std::atomic<u32> index{0};
-    return index;
-}
-inline const TemporalJitterChoice& TemporalJitterNow() {
-    return TemporalJitterChoices[TemporalJitterIndex().load(std::memory_order_relaxed) %
-                                 std::size(TemporalJitterChoices)];
-}
+/// axes (correlation -0.97). So the scene's shift, which is what DLSS takes as its jitter, is
+/// -(c14*c20, c15*c21): what NoteTemporalDraw notes.
 
 /// How a frame's HUD is drawn, switched with Page Down while playing (2026-11-12, to measure
 /// what each way costs: the main menu fell from 60 to 57 frames a second with the frames "left
@@ -260,26 +236,12 @@ inline const TemporalJitterChoice& TemporalJitterNow() {
 ///   auto     as the game draws it only while its interface reads the display back, or a scene
 ///            has just started; else out of the display, with the record over white in place
 ///            outside a race and in the HUD's own list in a race
-///   miroir   every frame left as the game draws it (three records a HUD draw)
+///   mirror   every frame left as the game draws it (three records a HUD draw)
 ///   direct   HUD kept out of the display, the record over white in place (two)
-///   liste    HUD kept out of the display, the record over white in the HUD's own list (run after
+///   list     HUD kept out of the display, the record over white in the HUD's own list (run after
 ///            the main list: a menu's pieces then come out with the wrong textures)
-inline constexpr const char* TemporalHudModes[] = {"auto", "miroir", "direct", "liste"};
+inline constexpr const char* TemporalHudModes[] = {"auto", "mirror", "direct", "list"};
 inline std::atomic<u32>& TemporalHudMode() {
-    static std::atomic<u32> mode{0};
-    return mode;
-}
-
-/// The light glows GT7 draws after its anti-aliasing into the pass's result (the halo sprites,
-/// ps 0x12b8ffe0 in a race, 56 quads over a depth test), switched with Home while playing. They
-/// land on the un-resolved colour DLSS gets, which is shifted by the frame's jitter; if the game
-/// draws them for the un-jittered picture (where they go in its own pipeline), DLSS moves them
-/// by the jitter each frame and they shimmer (the user's report of 2026-11-12, to be checked).
-///   normaux  drawn as the game draws them
-///   decales  drawn shifted by the frame's jitter, like the scene under them
-///   sans     left out of DLSS's picture (a test only: the glows then go missing)
-inline constexpr const char* TemporalHaloModes[] = {"normaux", "decales", "sans"};
-inline std::atomic<u32>& TemporalHaloMode() {
     static std::atomic<u32> mode{0};
     return mode;
 }
@@ -304,23 +266,6 @@ inline std::atomic<bool>& TemporalUiMask() {
     return on;
 }
 
-/// The HUD pictures at twice the display's size (true) or at its size, switched with End while
-/// playing: the 4K pictures cost four times the fill for every interface draw, drawn two or three
-/// times over (2026-11-12, the main menu at 45 frames a second instead of 60).
-inline std::atomic<bool>& TemporalHudFull() {
-    static std::atomic<bool> full{true};
-    return full;
-}
-
-/// The DLSS model (preset): no key any more (Home was tried on 2026-11-12, no change seen); the
-/// default of the quality mode
-/// (M in performance mode), then K, L and J. To judge which keeps small lights the steadiest.
-inline constexpr const char* TemporalPresets[] = {"defaut", "K", "L", "J"};
-inline std::atomic<u32>& TemporalPreset() {
-    static std::atomic<u32> preset{0};
-    return preset;
-}
-
 /// The two factors of RYGT_DLSS_TEMPORAL_JITTER or _MVEC (1,1 when unset or unreadable).
 inline void TemporalFactors(const char* name, float out[2]) {
     out[0] = out[1] = 1.0f;
@@ -338,13 +283,15 @@ inline void TemporalFactors(const char* name, float out[2]) {
     }
 }
 
-/// DLSS-GT7-002 (test of 2026-11-13): the texture LOD bias NVIDIA's guide asks for with DLSS,
+/// DLSS-GT7-002: the texture LOD bias NVIDIA's guide asks for with DLSS,
 /// log2(render width / display width) - 1, so -2 from 1920 to 3840, on the samplers RyGT-Team/
 /// shadgt7 PR 42 gives it to. The scene is drawn at half the display's size: without the bias
 /// the game picks its mips for 1080p and DLSS has nothing finer to rebuild (leaves, grass).
 /// Zero until DLSS has taken a frame with the game's depth, motion vectors and jitter, so a run
 /// without the prototype samples as before; then kept for the run, as menus alternate frames
 /// with and without the pass and a bias that followed them would swap every sampler each time.
+/// Set once: a window resized afterwards keeps the first bias. Every new value would add a copy
+/// of each material sampler to a pool the driver limits (about 4,000 on NVIDIA), never trimmed.
 ///   RYGT_DLSS_TEMPORAL_MIP_BIAS=0   no bias
 ///   RYGT_DLSS_TEMPORAL_MIP_EXTRA=x  the term added to the ratio (default -1; from -2 to 0)
 inline std::atomic<float>& TemporalMipBias() {
@@ -363,19 +310,18 @@ inline void NoteTemporalScale(vk::Extent2D render, vk::Extent2D display) {
         const float value = env && *env ? std::strtof(env, nullptr) : -1.0f;
         return std::isfinite(value) ? std::clamp(value, -2.0f, 0.0f) : -1.0f;
     }();
-    if (!wanted || render.width == 0 || display.width <= render.width) {
+    auto& bias = TemporalMipBias();
+    if (!wanted || render.width == 0 || display.width <= render.width ||
+        bias.load(std::memory_order_relaxed) != 0.0f) {
         return;
     }
     const float value =
         std::log2(static_cast<float>(render.width) / static_cast<float>(display.width)) + extra;
-    auto& bias = TemporalMipBias();
-    if (bias.load(std::memory_order_relaxed) != value) {
-        bias.store(value, std::memory_order_relaxed);
-        LOG_WARNING(Render_Vulkan,
-                    "DLSS-GT7-002: texture bias {:.2f} on the material samplers from now on "
-                    "({}x{} scaled to {}x{})",
-                    value, render.width, render.height, display.width, display.height);
-    }
+    bias.store(value, std::memory_order_relaxed);
+    LOG_WARNING(Render_Vulkan,
+                "DLSS-GT7-002: texture bias {:.2f} on the material samplers from now on "
+                "({}x{} scaled to {}x{})",
+                value, render.width, render.height, display.width, display.height);
 }
 
 } // namespace Vulkan::RytyUpscale

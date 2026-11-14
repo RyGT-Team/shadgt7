@@ -1738,10 +1738,14 @@ static void InstallWideCamera(u8* base) {
 // forced where the game computes it (its first value and the one after a display change, keeping
 // the latter's comparison) and set now. The idea and the three addresses are Gabarsolon's, from
 // RyGT-Team/shadgt7 PR 42 (InstallHdUiAssetsGt7); rewritten here on this file's Apply.
-// With temporal DLSS asked for (as ryty_upscale.h's TemporalWanted, read here from the settings
-// file: the renderer's settings are not loaded yet); RYGT_DLSS_TEMPORAL_UI_4K=0 leaves the game's
-// flag alone, =1 forces it whatever the upscaler. Costs texture memory and loading; where the HUD
-// is not drawn larger (a GPU without 32768-wide viewports) the images are only minified.
+// Only where temporal DLSS is asked for and can run, decided as ryty_upscale.h's TemporalWanted
+// and TemporalRequested decide it, from the settings file (the renderer's settings are not loaded
+// yet): NVIDIA DLSS chosen, Streamline's sl.dlss.dll there and not switched off, no frame
+// generation, not the PS4 Pro mode on a 4K TV (the game picks its own images there). What cannot
+// be known here is whether Streamline will start: a GPU that falls back from DLSS gets the 4K
+// images minified. RYGT_DLSS_TEMPORAL_UI_4K=0 leaves the game's flag alone, =1 forces it whatever
+// the upscaler. Costs texture memory and loading, neither measured; menus draw the 4K images
+// into the 1080p picture, minified, as does a GPU without 32768-wide viewports in a race.
 void InstallUi4kImagesGt7(u8* base) {
     const char* own = std::getenv("RYGT_DLSS_TEMPORAL_UI_4K");
     if (own && own[0] == '0') {
@@ -1749,12 +1753,21 @@ void InstallUi4kImagesGt7(u8* base) {
     }
     if (!(own && own[0] == '1')) {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
+        const char* streamline = std::getenv("RYGT_DLSS_STREAMLINE");
+        const bool plugin =
+            !(streamline && streamline[0] == '0') &&
+            GetFileAttributesW((Common::RytyExeDirW() + L"dlss\\sl.dlss.dll").c_str()) !=
+                INVALID_FILE_ATTRIBUTES;
         const bool temporal = env && (env[0] == '0' || env[0] == '1')
                                   ? env[0] == '1'
-                                  : ConfigFlag("dlss_enabled", false) &&
+                                  : ConfigFlag("dlss_enabled", false) && plugin &&
                                         !ConfigFlag("dlssg_enabled", false) &&
                                         !ConfigFlag("framegen_enabled", false);
-        if (!temporal) {
+        const char* neo = std::getenv("RYGT_NEO");
+        const char* tv = std::getenv("RYGT_NEO_TV");
+        const bool pro_4k =
+            neo && neo[0] == '1' && neo[1] == '\0' && !(tv && std::string_view{tv} == "1080");
+        if (!temporal || pro_4k) {
             return;
         }
     }

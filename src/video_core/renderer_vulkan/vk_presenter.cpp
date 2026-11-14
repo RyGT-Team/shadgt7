@@ -1452,14 +1452,13 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     // DLSS-GT7-001: the test keys, with RYGT_DLSS_TEMPORAL_KEY=1 only (DLSS-GT7-004). Page Up
     // switches temporal DLSS off and on while playing.
     if (RytyUpscale::TemporalRequested() && RytyUpscale::TemporalKeys()) {
-        static const bool key = true;
 #ifdef _WIN32
         // The key's state now, and a press when it goes down (the "pressed since the last
         // call" bit is shared with every other program that asks). Only while the game's window
         // is in front: a key pressed in another program changes nothing here.
         DWORD foreground_pid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
-        const bool keys = key && foreground_pid == GetCurrentProcessId();
+        const bool keys = foreground_pid == GetCurrentProcessId();
         static bool was_down = false;
         const bool down = keys && (GetAsyncKeyState(0x21 /* Page Up */) & 0x8000) != 0;
         if (down && !was_down) {
@@ -1502,8 +1501,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         end_was_down = end_down;
 #endif
     }
-    const bool time_passes = RytyUpscale::TemporalRequested() &&
-                             g_presenter_times.Ready(instance); // DLSS-GT7-001 (diagnosis)
+    // DLSS-GT7-001 (diagnosis): the passes' GPU time, with the test keys only. It costs three
+    // timestamps and a line of log every two seconds, which a player has no use for.
+    const bool time_passes = RytyUpscale::TemporalRequested() && RytyUpscale::TemporalKeys() &&
+                             g_presenter_times.Ready(instance);
     if (time_passes) {
         g_presenter_times.Begin(pass_cmdbuf, display->temporal.has_value() &&
                                                  RytyUpscale::TemporalActive());

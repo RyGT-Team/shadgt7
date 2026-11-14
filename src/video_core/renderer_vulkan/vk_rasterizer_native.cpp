@@ -1006,8 +1006,7 @@ u32 NativeRenderer::HudScale() const {
         const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_SCALE");
         return !(env && env[0] == '1');
     }();
-    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f ||
-        !RytyUpscale::TemporalHudFull().load(std::memory_order_relaxed)) {
+    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f) {
         return 1;
     }
     return r.instance.GetMaxViewportWidth() >= 32768 && r.instance.GetMaxViewportHeight() >= 32768
@@ -1353,7 +1352,9 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     std::array<u64, 2> raw;
     std::memcpy(raw.data(), &sharp, sizeof(raw));
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
-    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
+    // (explicit_lod in the key: one S# read both ways would else evict itself from its slot)
+    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0) |
+                      (explicit_lod ? u64{1} << 63 : 0);
     if (NextOn()) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
         if (cache->sampler && cache->sharp == raw && cache->extra == extra &&
@@ -9421,7 +9422,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     kept_result_state = targets.state;
                     kept_result_state->color_attachments[0].image_view = view;
                     beside = true;
-                    ++temporal.beside_draws;
                     if (temporal.beside_logged < 8) {
                         ++temporal.beside_logged;
                         const Shader::Info* fs =
@@ -9478,28 +9478,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     }
-    // DLSS-GT7-001: a draw into the pass's result while it holds the un-resolved colour (GT7's
-    // light glows, drawn after its anti-aliasing): Home chooses how it goes into DLSS's picture
-    // (ryty_upscale.h). The game's own copy of the result, in a frame left as it draws it, gets
-    // the draw as it is.
-    bool halo_shift = false;
-    bool halo_skip = false;
-    if (temporal.result && temporal.frame == frame && targets.colors[0] == temporal.result &&
-        !raw_scene_state &&
-        (temporal.swapped_out == temporal.result || temporal.replaced_frame == frame)) {
-        const u32 halo_mode = RytyUpscale::TemporalHaloMode().load(std::memory_order_relaxed);
-        halo_shift = halo_mode == 1;
-        halo_skip = halo_mode == 2;
-        if (temporal.halo_logged < 12) {
-            ++temporal.halo_logged;
-            const Shader::Info* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
-            LOG_WARNING(Render_Vulkan,
-                        "DLSS-GT7-001: frame {}: a draw into the anti-aliased picture after the "
-                        "pass (ps {:#x}, {} vertices), glows {}",
-                        frame, fs ? fs->pgm_hash : 0, regs.num_indices,
-                        RytyUpscale::TemporalHaloModes[halo_mode % 3]);
-        }
-    }
+    // DLSS-GT7-001: set below for a menu's interface, drawn shifted by the frame's jitter.
+    bool jitter_shift = false;
     // DLSS-GT7-001: in a menu frame whose interface goes through DLSS, the interface (the draws
     // into the display after the frame's first, the scene) is drawn shifted by the frame's jitter
     // like the scene, so DLSS gathers it as it gathers the scene (Home switches it).
@@ -9526,7 +9506,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 }
             }
             if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
-                halo_shift = true;
+                jitter_shift = true;
             }
         }
     }
@@ -9994,7 +9974,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
             s.dynamic.SetScissors(scissors);
         }
-        if (halo_shift) {
+        if (jitter_shift) {
             // DLSS-GT7-001: drawn where the jittered scene under it is (temporal.jitter: the
             // scene's shift in pixels, x right, y down).
             auto viewports = s.dynamic.viewports;
@@ -10178,7 +10158,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                              (pipeline->LdsEmulation() & 0xff) |
                                  (u32(regs.stage_enable.hs_en != 0) << 8));
         }
-        if (!lds_deferred && !halo_skip) {
+        if (!lds_deferred) {
             record_draw();
         }
         // DIAG-241 (diagnosis): in a dumped frame, the LDS scratch of the first such draw.
@@ -10226,8 +10206,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
             // stay bound across the change of attachment).
             BeginRendering(*hud_white_state);
-            if (halo_shift) {
-                halo_shift = false; // DLSS-GT7-001: the game's own copy, unshifted
+            if (jitter_shift) {
+                jitter_shift = false; // DLSS-GT7-001: the game's own copy, unshifted
                 bind_state();
             }
             record_draw();
@@ -10338,7 +10318,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     Report();
 }
 
-// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1; see ryty_upscale.h): GT7's temporal
+// DLSS-GT7-001 (temporal DLSS; see ryty_upscale.h): GT7's temporal
 // anti-aliasing pass in a race. Its pixel shader 0xcfa125dd reads the depth, the motion vectors
 // (RG16F, written by every scene draw as a second target), the frame's colour and the history,
 // and writes the new history (target 0) and the resolved picture (target 1). Its constants hold
@@ -10577,6 +10557,7 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     }
     temporal.pending_color = color;
     temporal.pending_out = out;
+    temporal.raw_result_frame = ~u64{0}; // DLSS-GT7-003: a new pass, a new copy (two in a frame)
     if (!late && !mirror) {
         ApplyTemporalReplace();
     }

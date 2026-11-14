@@ -1037,25 +1037,12 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
     std::scoped_lock lock{g_sl.mutex};
     const sl::ViewportHandle viewport{1u};
-    // DLSS-GT7-001: the model chosen with Home (ryty_upscale.h); a change sets the options again.
-    static u32 preset_set = 0;
-    const u32 preset_now = RytyUpscale::TemporalPreset().load(std::memory_order_relaxed) %
-                           static_cast<u32>(std::size(RytyUpscale::TemporalPresets));
-    if (preset_now != preset_set) {
-        g_sl.sr_options_set = false;
-    }
     if (!g_sl.sr_options_set) {
         sl::DLSSOptions options{};
         options.mode = static_cast<sl::DLSSMode>(g_sl.sr_mode);
         options.outputWidth = output_size.width;
         options.outputHeight = output_size.height;
         options.colorBuffersHDR = sl::Boolean::eFalse;
-        constexpr sl::DLSSPreset presets[] = {sl::DLSSPreset::eDefault, sl::DLSSPreset::ePresetK,
-                                              sl::DLSSPreset::ePresetL, sl::DLSSPreset::ePresetJ};
-        options.dlaaPreset = options.qualityPreset = options.balancedPreset =
-            options.performancePreset = options.ultraPerformancePreset =
-                options.ultraQualityPreset = presets[preset_now];
-        preset_set = preset_now;
         const sl::Result set = g_sl.dlss_set_options(viewport, options);
         if (set != sl::Result::eOk) {
             LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline refused the options (result {})",
@@ -1067,7 +1054,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!g_sl.sr.Ready(input_size)) {
         CreateAuxImages(g_sl.sr, device, allocator, cmdbuf, input_size);
     }
-    // DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1; ryty_upscale.h): with the frame's own depth,
+    // DLSS-GT7-001 (temporal DLSS; ryty_upscale.h): with the frame's own depth,
     // motion vectors and jitter, DLSS keeps its history from frame to frame. A refusal from
     // Streamline ends the prototype for the run, and the frame is scaled as before.
     static bool temporal_refused = false;
@@ -1096,13 +1083,9 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
             RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_MVEC", &f[2]);
             return f;
         }();
-        static u32 last_choice = 0;
-        const u32 choice_index = RytyUpscale::TemporalJitterIndex().load(std::memory_order_relaxed);
-        const auto& choice = RytyUpscale::TemporalJitterNow();
-        const bool reset = t->reset || !last_temporal || choice_index != last_choice;
-        last_choice = choice_index;
-        constants.jitterOffset = sl::float2(t->jitter[0] * factors[0] * choice.x,
-                                            t->jitter[1] * factors[1] * choice.y);
+        const bool reset = t->reset || !last_temporal;
+        constants.jitterOffset =
+            sl::float2(t->jitter[0] * factors[0], t->jitter[1] * factors[1]);
         constants.mvecScale =
             sl::float2(t->mvec_scale[0] * factors[2], t->mvec_scale[1] * factors[3]);
         constants.depthInverted = sl::Boolean::eTrue;

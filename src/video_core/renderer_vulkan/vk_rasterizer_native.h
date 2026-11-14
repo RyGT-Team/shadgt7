@@ -352,7 +352,7 @@ private:
     std::unordered_map<VAddr, HudLayer> hud_layers;
     static bool HudSplitOn();
 
-    /// DLSS-GT7-001 (prototype, RYGT_DLSS_TEMPORAL=1): what GT7's temporal anti-aliasing pass
+    /// DLSS-GT7-001 (temporal DLSS): what GT7's temporal anti-aliasing pass
     /// read in the frame being drawn, for the presenter's DLSS pass (ryty_upscale.h).
     struct TemporalCapture {
         const Native::ImageEntry* depth = nullptr;
@@ -383,7 +383,6 @@ private:
         u32 left_changes = 0;       ///< logged
         const Native::ImageEntry* result = nullptr; ///< the pass's result picture
         u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
-        u32 halo_logged = 0;          ///< draws after the pass into its result, logged
         u64 through_frame = ~u64{0};  ///< the last menu frame whose interface goes through DLSS
         u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
         bool through = false;         ///< logged
@@ -405,7 +404,6 @@ private:
         /// pass (motion blur, glows), while the result itself stays resolved for the game.
         Native::ImageEntry* raw_result = nullptr;
         u64 raw_result_frame = ~u64{0}; ///< the frame it was last started in
-        u64 beside_draws = 0;           ///< draws recorded into it too
         u32 beside_logged = 0;          ///< logged
         /// The result picture, while it holds the un-resolved colour.
         const Native::ImageEntry* swapped_out = nullptr;
@@ -450,7 +448,7 @@ private:
     /// explicit_lod (FIX-GT7-182): the shader reads this S# at a level it chose, which must not
     /// get the DLSS texture bias (DLSS-GT7-002).
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                           bool is_depth, bool explicit_lod = false);
+                           bool is_depth, bool explicit_lod);
     /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool), with the
     /// DLSS texture bias SamplerFor chose for it.
     vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
