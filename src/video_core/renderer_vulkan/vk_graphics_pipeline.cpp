@@ -1333,6 +1333,12 @@ GraphicsPipeline::GraphicsPipeline(
         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
         library_link->owned_libraries[1] = vk::UniquePipeline{library_handles[3], device};
         const auto libraries_done = std::chrono::steady_clock::now();
+        if (g_pipeline_libraries_only) {
+            // FEAT-GT7-188: the stage libraries are in the driver cache now; the link, AMD's
+            // costly part, is left to the draw that needs this pipeline, if one ever does.
+            link_skipped = true;
+            return;
+        }
 
         const vk::PipelineLibraryCreateInfoKHR link_libraries = {
             .libraryCount = static_cast<u32>(library_handles.size()),

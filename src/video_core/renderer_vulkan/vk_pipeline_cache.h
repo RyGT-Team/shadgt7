@@ -536,6 +536,8 @@ private:
     /// does (PERF-038).
     tsl::robin_map<GraphicsPipelineKey, GraphicsPipeline::SerializationSupport> prewarm_unclaimed;
     u64 prewarm_adopted{};
+    u64 prewarm_installed{}; ///< FEAT-GT7-188: precompile builds queued, in install order
+    bool PrecompileLibrariesOnly() const;
     u64 prewarm_dropped{};
     void AdoptPrewarmed();
     /// FIX-GT7-186: the shader modules the precompile made (program hash, permutation). Once it is

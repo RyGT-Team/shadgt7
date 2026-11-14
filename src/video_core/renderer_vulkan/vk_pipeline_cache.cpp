@@ -144,18 +144,22 @@ static bool TranslateJobsDiag() {
 // PERF-GT7-111 : the precompile manifest. A record per translation made on a worker:
 // its inputs and the guest reads it made (descriptors, the SRT walker's output: values, no code),
 // and its SPIR-V's hash. The code and the fetch shader go to a local capture, never into a record.
-// RYGT_MANIFEST_RECORD=1 writes them; RYGT_MANIFEST_VERIFY=1 translates every record again at
-// start from the capture, replaying the reads, and compares the SPIR-V.
+// RYGT_MANIFEST_RECORD (on unless =0, FEAT-GT7-188) writes them; RYGT_MANIFEST_VERIFY=1 translates
+// every record again at start from the capture, replaying the reads, and compares the SPIR-V.
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
 // FEAT-GT7-188 (from shadGT FEAT-GTS-470): one manifest folder for every GPU (it was one per
 // <vendor>-<device>). A record names the GPU that recorded it (format 3); records of the older
 // per-GPU folders take it from the folder's name when they are merged in (MergeManifestFolders).
 static u32 g_manifest_vendor{}, g_manifest_device{}; // this GPU
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): on by default (RYGT_MANIFEST_RECORD=0 turns it off):
+// every translation and every stored one a draw first uses gets a record, so the manifest covers
+// what was played and a pre-translation after a renderer or driver update, here or on another
+// GPU, misses less.
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_MANIFEST_RECORD");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     return on;
 }
@@ -749,10 +753,18 @@ bool PrecompileHoldsGame() {
     return g_precompile_hold.load(std::memory_order_relaxed);
 }
 
+// FEAT-GT7-188: when the hold was taken, for the splash's length in the log.
+static std::atomic<s64> g_precompile_hold_since_ms{};
+
 static void ReleasePrecompileHold() {
     if (g_precompile_hold.exchange(false)) {
         Common::GuestClock::ReleaseHold();
-        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done; the game continues");
+        const s64 since = g_precompile_hold_since_ms.load();
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done after {:.1f} s; the game continues",
+                    since ? double(now - since) / 1000.0 : 0.0);
     }
 }
 
@@ -1110,6 +1122,8 @@ struct PipelineCache::PipelineBuild {
     bool urgent{};
     // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
     bool preloading{};
+    // FEAT-GT7-188: a precompile build of only the stage libraries (PrecompileLibrariesOnly).
+    bool libraries_only{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
     // Whoever sets this first builds the pipeline: a worker, or the command thread when a
@@ -3053,10 +3067,30 @@ void PipelineCache::FinishBuild(PipelineBuild& build, bool draw_waits) {
             if (diag) {
                 --g_diag_in_flight;
                 ++g_diag_built;
-                g_diag_build_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
-                                           std::chrono::steady_clock::now() - diag_start)
-                                           .count());
+                const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - diag_start)
+                                       .count());
+                g_diag_build_us += us;
+                if (!build.preloading) {
+                    // Built for play, not by the precompile: their cost is what a player sees.
+                    static std::atomic<u64> count{}, total_us{}, max_us{};
+                    total_us += us;
+                    u64 seen = max_us.load();
+                    while (us > seen && !max_us.compare_exchange_weak(seen, us)) {
+                    }
+                    if (const u64 c = ++count; c % 50 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRECOMPILE-DIAG in game: {} pipelines built, {:.0f} ms "
+                                    "each on average, longest {:.0f} ms",
+                                    c, double(total_us.load()) / 1000.0 / double(c),
+                                    double(max_us.load()) / 1000.0);
+                    }
+                }
             }
+        };
+        g_pipeline_libraries_only = build.libraries_only; // FEAT-GT7-188
+        SCOPE_EXIT {
+            g_pipeline_libraries_only = false;
         };
         g_pipeline_build_urgent = draw_waits || build.urgent; // FIX-GT7-030
         build.pipeline = std::make_unique<GraphicsPipeline>(
@@ -3954,6 +3988,16 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
         auto pending = pending_builds.find(S().graphics_key);
+        if (pending != pending_builds.end() && pending->second->libraries_only) {
+            // FEAT-GT7-188: a precompile build of the stage libraries only has no pipeline to
+            // draw with: dropped (or left to finish) and this draw builds its own as usual.
+            if (CancelBuild(*pending->second) ||
+                pending->second->done.wait_for(std::chrono::seconds{0}) ==
+                    std::future_status::ready) {
+                pending_builds.erase(pending);
+            }
+            pending = pending_builds.end();
+        }
         if (pending != pending_builds.end() &&
             (pending->second->preloading || pending->second->async)) {
             auto stored = pending->second;
@@ -4902,6 +4946,9 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
 #ifdef RYTY_GPU
     // PERF-102: the game waits on the splash screen until the precompile is done.
     if (!g_precompile_hold.exchange(true)) {
+        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count(); // FEAT-GT7-188
         Common::GuestClock::TakeHold();
         LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
     }
@@ -5162,6 +5209,26 @@ static bool PrecompileRamPressure() {
 // memory for shader code by ~0.7 GB, which it kept after they were destroyed. shadgt7 has no
 // retention trim (shadGT's TrimUnusedPipelines): its RAM-pressure check stops keeping any here.
 // Command thread, lookup mutex held (InstallPrewarmed's callers).
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470, opt-in, RYGT_PRECOMPILE_LIBRARIES_ONLY=1): past the
+// pipelines the precompile keeps (RYGT_PRECOMPILE_KEEP), compile only their stage libraries and
+// skip the link. In shadGT (Radeon 610M, 3,000 pipelines) the splash went from 414 to 142 s, but
+// play then built 487 pipelines at 871 ms each (longest 4.2 s) against 294 at 221 ms (1.5 s):
+// AMD's driver cache keeps linked pipelines, so a link at the splash makes the game's one cheap.
+// Off by default: hitches in play cost more than a first splash.
+bool PipelineCache::PrecompileLibrariesOnly() const {
+    static const bool asked = [] {
+        const char* env = std::getenv("RYGT_PRECOMPILE_LIBRARIES_ONLY");
+        return env && env[0] == '1';
+    }();
+    static const bool whole = [] {
+        const char* precompile_whole = std::getenv("RYGT_PRECOMPILE_WHOLE_PIPELINES");
+        const char* no_libraries = std::getenv("SHADGT_NO_LIBRARIES");
+        return (precompile_whole && precompile_whole[0] == '1') ||
+               (no_libraries && no_libraries[0] == '1');
+    }();
+    return asked && !whole && instance.IsGraphicsPipelineLibrarySupported();
+}
+
 void PipelineCache::AdoptPrewarmed() {
     if (!prewarm_finished_any.load(std::memory_order_acquire)) {
         return;
@@ -5191,8 +5258,8 @@ void PipelineCache::AdoptPrewarmed() {
             pending_builds.erase(pending); // a draw builds it again the usual way
             continue;
         }
-        if ((ram_pressure || prewarm_adopted >= PrecompileKeep()) &&
-            !graphics_pipelines.contains(build->key)) {
+        if (build->libraries_only || ((ram_pressure || prewarm_adopted >= PrecompileKeep()) &&
+                                      !graphics_pipelines.contains(build->key))) {
             dropped.push_back(std::move(build->pipeline));
             pending_builds.erase(pending);
             ++adopted;
@@ -5462,6 +5529,8 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
     S().graphics_key = record.key;
     auto build = MakePipelineBuild();
     build->preloading = true;
+    // FEAT-GT7-188: past the pipelines the precompile keeps, only the stage libraries (opt-in).
+    build->libraries_only = PrecompileLibrariesOnly() && ++prewarm_installed > PrecompileKeep();
     build->sdata = record.sdata;
     pending_builds.emplace(record.key, build);
     QueueBackgroundBuild(build);
@@ -6552,6 +6621,23 @@ void PipelineCache::RecordStoredUse(HwStage hw_stage, SwStage sw_stage,
         sw_stage == SwStage::Geometry) {
         return;
     }
+    // FEAT-GT7-188: with recording on by default, play pays for it: at most ~2 ms of these per
+    // 16 ms on the command thread. A shader over the budget is recorded at a later use (this one or
+    // the next session's), so nothing is lost, only spread out.
+    using namespace std::chrono;
+    static steady_clock::time_point window{};
+    static microseconds spent{};
+    const auto now = steady_clock::now();
+    if (now - window > milliseconds{16}) {
+        window = now;
+        spent = microseconds{0};
+    }
+    if (spent >= milliseconds{2}) {
+        return;
+    }
+    SCOPE_EXIT {
+        spent += duration_cast<microseconds>(steady_clock::now() - now);
+    };
     static std::unordered_set<u64> looked_at;
     if (!looked_at.insert(HashCombine(params.hash, u64{perm_idx})).second) {
         return;
