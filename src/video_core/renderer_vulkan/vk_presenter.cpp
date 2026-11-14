@@ -1259,6 +1259,93 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 #ifdef RYTY_GPU
+namespace {
+// DLSS-GT7-001 (diagnosis, with RYGT_DLSS_TEMPORAL=1): timestamps around the presenter's DLSS
+// pass and the composition of the picture (HUD pictures laid over it), read four frames later,
+// summed for temporal and classic frames apart and logged every 2 s. The main menu ran at 45
+// frames a second with temporal DLSS and 60 without, with the engine's own lists taking the same
+// ~13 ms of GPU a frame: the rest is here or in the HUD lists.
+struct PresenterTimes {
+    static constexpr u32 Slots = 8;
+    vk::Device device{};
+    vk::QueryPool pool{};
+    double period_ns = 1.0;
+    u64 frame = 0;
+    std::array<bool, Slots> temporal{};
+    std::array<bool, Slots> written{};
+    double sum[2][2]{}; // [temporal][dlss, compose] in ms
+    u64 count[2]{};
+    std::chrono::steady_clock::time_point report = std::chrono::steady_clock::now();
+
+    bool Ready(const Instance& instance) {
+        if (pool) {
+            return true;
+        }
+        device = instance.GetDevice();
+        period_ns = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+        auto [result, made] = device.createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = Slots * 3,
+        });
+        if (result != vk::Result::eSuccess) {
+            return false;
+        }
+        pool = made;
+        return true;
+    }
+    void Begin(vk::CommandBuffer cmd, bool is_temporal) {
+        const u32 slot = static_cast<u32>(frame % Slots);
+        Collect(static_cast<u32>((frame + Slots - 4) % Slots));
+        cmd.resetQueryPool(pool, slot * 3, 3);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, slot * 3);
+        temporal[slot] = is_temporal;
+        written[slot] = true;
+    }
+    void Mark(vk::CommandBuffer cmd, u32 which) {
+        const u32 slot = static_cast<u32>(frame % Slots);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, slot * 3 + which);
+    }
+    void End() {
+        ++frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - report < std::chrono::seconds{2}) {
+            return;
+        }
+        report = now;
+        for (int t = 1; t >= 0; --t) {
+            if (count[t] == 0) {
+                continue;
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: presenter GPU time (2 s), {} frames: {} frames, DLSS {:.2f} "
+                        "ms, composition {:.2f} ms a frame",
+                        t ? "temporal" : "classic", count[t], sum[t][0] / double(count[t]),
+                        sum[t][1] / double(count[t]));
+        }
+        sum[0][0] = sum[0][1] = sum[1][0] = sum[1][1] = 0.0;
+        count[0] = count[1] = 0;
+    }
+    void Collect(u32 slot) {
+        if (!written[slot]) {
+            return;
+        }
+        std::array<u64, 6> values{}; // value, availability, three times
+        const vk::Result result = device.getQueryPoolResults(
+            pool, slot * 3, 3, sizeof(values), values.data(), 2 * sizeof(u64),
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        written[slot] = false;
+        if (result != vk::Result::eSuccess || !values[1] || !values[3] || !values[5]) {
+            return;
+        }
+        const int t = temporal[slot] ? 1 : 0;
+        sum[t][0] += double(values[2] - values[0]) * period_ns / 1e6;
+        sum[t][1] += double(values[4] - values[2]) * period_ns / 1e6;
+        ++count[t];
+    }
+};
+PresenterTimes g_presenter_times;
+} // namespace
+
 Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                      VAddr cpu_address) {
@@ -1362,8 +1449,69 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool scaled = false;
     const vk::Extent2D upscale_target =
         RytyUpscale::Target(image_size, {frame->width, frame->height});
-    if (const auto dlss_view = dlss_pass.Render(pass_cmdbuf, display->image, image_view,
-                                                view_format, image_size, upscale_target);
+    // DLSS-GT7-001: the test keys, with RYGT_DLSS_TEMPORAL_KEY=1 only (DLSS-GT7-004). Page Up
+    // switches temporal DLSS off and on while playing.
+    if (RytyUpscale::TemporalRequested() && RytyUpscale::TemporalKeys()) {
+#ifdef _WIN32
+        // The key's state now, and a press when it goes down (the "pressed since the last
+        // call" bit is shared with every other program that asks). Only while the game's window
+        // is in front: a key pressed in another program changes nothing here.
+        DWORD foreground_pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
+        const bool keys = foreground_pid == GetCurrentProcessId();
+        static bool was_down = false;
+        const bool down = keys && (GetAsyncKeyState(0x21 /* Page Up */) & 0x8000) != 0;
+        if (down && !was_down) {
+            const bool on = !RytyUpscale::TemporalSwitch().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalSwitch().store(on, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Up, temporal DLSS {}", on ? "on" : "off");
+        }
+        was_down = down;
+        // Page Down: the next way of drawing the HUD; Home: the menus' interface shifted by the
+        // jitter or not; End: its motion mask (ryty_upscale.h).
+        static bool next_was_down = false;
+        const bool next_down = keys && (GetAsyncKeyState(0x22 /* Page Down */) & 0x8000) != 0;
+        if (next_down && !next_was_down) {
+            const u32 mode = (RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed) + 1) %
+                             static_cast<u32>(std::size(RytyUpscale::TemporalHudModes));
+            RytyUpscale::TemporalHudMode().store(mode, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Page Down, HUD mode {} (frame {})",
+                        RytyUpscale::TemporalHudModes[mode], DebugState.GetFrameNum());
+        }
+        next_was_down = next_down;
+        static bool home_was_down = false;
+        const bool home_down = keys && (GetAsyncKeyState(0x24 /* Home */) & 0x8000) != 0;
+        if (home_down && !home_was_down) {
+            const bool on = !RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalUiJitter().store(on, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: Home, menu interface {} (frame {})",
+                        on ? "shifted by the jitter" : "where the game draws it",
+                        DebugState.GetFrameNum());
+        }
+        home_was_down = home_down;
+        static bool end_was_down = false;
+        const bool end_down = keys && (GetAsyncKeyState(0x23 /* End */) & 0x8000) != 0;
+        if (end_down && !end_was_down) {
+            const bool on = !RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed);
+            RytyUpscale::TemporalUiMask().store(on, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: End, menu interface {} (frame {})",
+                        on ? "without motion for DLSS" : "with the scene's motion",
+                        DebugState.GetFrameNum());
+        }
+        end_was_down = end_down;
+#endif
+    }
+    // DLSS-GT7-001 (diagnosis): the passes' GPU time, with the test keys only. It costs three
+    // timestamps and a line of log every two seconds, which a player has no use for.
+    const bool time_passes = RytyUpscale::TemporalRequested() && RytyUpscale::TemporalKeys() &&
+                             g_presenter_times.Ready(instance);
+    if (time_passes) {
+        g_presenter_times.Begin(pass_cmdbuf, display->temporal.has_value() &&
+                                                 RytyUpscale::TemporalActive());
+    }
+    if (const auto dlss_view = dlss_pass.Render(
+            pass_cmdbuf, display->image, image_view, view_format, image_size, upscale_target,
+            display->temporal ? &*display->temporal : nullptr);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
@@ -1384,6 +1532,9 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     if (!scaled) {
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
+    if (time_passes) {
+        g_presenter_times.Mark(pass_cmdbuf, 1);
     }
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
@@ -1418,6 +1569,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
                    display->hud_white, hud_widgets);
+    if (time_passes) {
+        g_presenter_times.Mark(pass_cmdbuf, 2);
+        g_presenter_times.End();
+    }
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,

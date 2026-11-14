@@ -26,6 +26,7 @@
 #include "common/diagnostics.h"
 #include "common/types.h"
 #include "ryty_gpu/native/same_texel.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -129,6 +130,9 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
+        /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
+        std::optional<RytyUpscale::TemporalInputs> temporal;
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
 
@@ -340,20 +344,115 @@ private:
         u64 hud_frame = ~u64{0};       ///< the frame HUD draws went to the layer in
         bool clear_pending = false;    ///< the next HUD draw clears both pictures first
         u64 race_frame = ~u64{0};      ///< the frame its HUD showed a race's maps
+        u32 scale = 1;                 ///< DLSS-GT7-001: the pictures' size over the display's
     };
     /// GT7-UW: small pictures drawn with a depth buffer, and the frame (a race HUD's track
     /// and course maps are drawn so every frame; menus' HUDs take none).
     std::unordered_map<VAddr, u64> hud_depth_drawn; ///< by address
     std::unordered_map<VAddr, HudLayer> hud_layers;
     static bool HudSplitOn();
-    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like);
+
+    /// DLSS-GT7-001 (temporal DLSS): what GT7's temporal anti-aliasing pass
+    /// read in the frame being drawn, for the presenter's DLSS pass (ryty_upscale.h).
+    struct TemporalCapture {
+        const Native::ImageEntry* depth = nullptr;
+        const Native::ImageEntry* motion = nullptr;
+        u64 frame = ~u64{0}; ///< the frame the pass was last seen in
+        bool reset = true;   ///< the frame before that one had none
+        float jitter[2]{};
+        float mvec_scale[2]{};
+        /// The pass's result is replaced with this colour before the next draw into it or into
+        /// a display buffer (after the game's bloom and exposure passes read it).
+        const Native::ImageEntry* pending_color = nullptr;
+        const Native::ImageEntry* pending_out = nullptr;
+        u64 seen = 0;     ///< passes noted
+        u64 replaced = 0; ///< results replaced with the un-resolved colour
+        u64 refused = 0;  ///< passes whose inputs or constants did not fit
+        /// The frame a draw into a display buffer last showed a race's HUD maps; the pass is
+        /// only taken in a race (NoteTemporalDraw).
+        u64 race_hud_frame = ~u64{0};
+        /// The frame a draw last sampled a display picture (the interface reading it back).
+        u64 display_read_frame = ~u64{0};
+        /// Outside a race the game's pictures are left as it draws them, and the tone-mapped
+        /// un-resolved scene DLSS needs is drawn beside them (NoteTemporalDraw).
+        bool mirror = false;        ///< the frame being drawn is such a frame
+        bool white_inline = false;  ///< else: the HUD's record over white runs in place
+        u64 run_start = 0;          ///< the frame the pass came back in after frames without it
+        u64 seen_frame = ~u64{0};   ///< the last frame the pass was seen in, taken or not
+        bool left = false;          ///< the last pass seen was left to the game (logged)
+        u32 left_changes = 0;       ///< logged
+        const Native::ImageEntry* result = nullptr; ///< the pass's result picture
+        u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
+        u64 through_frame = ~u64{0};  ///< the last menu frame whose interface goes through DLSS
+        u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
+        bool through = false;         ///< logged
+        u32 through_changes = 0;      ///< logged
+        /// The display as it was before its interface, in such frames (two, by frame parity:
+        /// the presenter may still read the last one while the next frame draws).
+        std::array<Native::ImageEntry*, 2> ui_scene{};
+        u64 ui_scene_frame = ~u64{0}; ///< the frame the last one was taken in
+        u32 ui_scene_slot = 0;        ///< which
+        VAddr ui_scene_address = 0;   ///< the display buffer it was taken from
+        bool hud_batch_open = false;  ///< HUD records wait in the HUD lists
+        bool display_draw_now = false; ///< the draw being recorded goes into a display buffer
+        u64 batches = 0;              ///< batches closed
+        u64 batched_draws = 0;        ///< HUD draws recorded so
+        u64 mirror_frame = ~u64{0}; ///< the last such frame
+        Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
+        Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it
+        /// DLSS-GT7-003: the un-resolved colour with the game's draws into the result since the
+        /// pass (motion blur, glows), while the result itself stays resolved for the game.
+        Native::ImageEntry* raw_result = nullptr;
+        u64 raw_result_frame = ~u64{0}; ///< the frame it was last started in
+        u32 beside_logged = 0;          ///< logged
+        /// The result picture, while it holds the un-resolved colour.
+        const Native::ImageEntry* swapped_out = nullptr;
+        u64 raw_frame = ~u64{0}; ///< the frame raw_display was last drawn in
+        VAddr raw_address = 0;   ///< the display buffer it stands for
+        u64 mirrored = 0;        ///< frames drawn so
+        std::vector<Native::ImageEntry*> retired; ///< pictures of another size, kept alive
+        bool race = false;    ///< as of the last pass seen
+        u32 race_changes = 0; ///< logged
+        /// The pass's result was replaced but its size is not the display's (a picture cropped
+        /// or scaled before it is shown): DLSS could not take the inputs, so the pass is left
+        /// to the game for the rest of the run (FindDisplay).
+        bool size_refused = false;
+        u32 size_mismatches = 0; ///< frames in a row so, before it is refused
+    };
+    TemporalCapture temporal;
+    /// Called at the end of a draw: notes the pass's inputs and replaces its result.
+    void NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
+                          const DrawBindings& b);
+    void ApplyTemporalReplace();
+    /// DLSS-GT7-001, frames left as the game draws them: the pass's result is put aside and
+    /// holds the un-resolved colour until the tone mapping has been drawn for DLSS; then back.
+    bool TemporalSwapIn();
+    void TemporalSwapOut();
+    /// DLSS-GT7-003: the result stays resolved until the tone mapping (default; off with
+    /// RYGT_DLSS_TEMPORAL_BLOOM=0 or 1).
+    static bool TemporalKeepsResolved();
+    void CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to);
+    /// A picture of the prototype's own like another, made again when the size changes.
+    /// size: the picture's size, when not like's.
+    Native::ImageEntry* TemporalPicture(Native::ImageEntry*& slot, const Native::ImageEntry& like,
+                                        vk::Extent2D size = {});
+    /// DLSS-GT7-001: the HUD split for this frame: a wide screen's, or a frame with the pass.
+    bool HudSplitNow() const;
+    /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.
+    u32 HudScale() const;
+    /// size: the picture's size before scale, when not like's.
+    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1,
+                                       vk::Extent2D size = {});
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
+    /// explicit_lod (FIX-GT7-182): the shader reads this S# at a level it chose, which must not
+    /// get the DLSS texture bias (DLSS-GT7-002).
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                           bool is_depth);
-    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool).
+                           bool is_depth, bool explicit_lod);
+    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool), with the
+    /// DLSS texture bias SamplerFor chose for it.
     vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                            bool is_depth);
+                            bool is_depth, float resolution_bias);
 
     Stream& Begin();
     /// PERF-GT7-018: a list for the stream, with its commands going where RingOn says.
@@ -1292,9 +1391,16 @@ private:
     /// the main one (which draws them over black): neither list switches between the two
     /// pictures, so consecutive HUD draws stay in one pass without barriers between them.
     Stream hud_stream;
+    /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list of
+    /// their own too (the main list then draws them into the display as the game does).
+    Stream hud_black_stream;
     static bool HudStreamOn();
     void BeginHudStream();
     void SpliceHudStream(u64 tick);
+    void SpliceStream(Stream& s, u64 tick);
+    /// DLSS-GT7-001: the open batch of HUD draws runs (main list first, then the HUD lists).
+    void CloseHudBatch();
+    static bool HudBatchOn();
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001

@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <algorithm>
 #include <bit>
@@ -819,13 +820,19 @@ NativeRenderer::~NativeRenderer() {
 // GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
 namespace {
 std::array<std::atomic<VAddr>, 16> g_display_addresses{};
+/// DLSS-GT7-001: the size each was registered with (width << 32 | height; 0 unknown).
+std::array<std::atomic<u64>, 16> g_display_sizes{};
 } // namespace
 
-void NoteDisplayAddress(VAddr address) {
-    for (auto& slot : g_display_addresses) {
+void NoteDisplayAddress(VAddr address, u32 width, u32 height) {
+    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
+        auto& slot = g_display_addresses[i];
         VAddr expected = 0;
         if (slot.load(std::memory_order_relaxed) == address ||
             slot.compare_exchange_strong(expected, address)) {
+            if (width != 0 && height != 0) {
+                g_display_sizes[i].store((u64{width} << 32) | height, std::memory_order_relaxed);
+            }
             return;
         }
     }
@@ -846,10 +853,38 @@ static bool IsDisplayAddress(VAddr address) {
 
 float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
 
+// DLSS-GT7-001: the part of a picture drawn at a display buffer's address that the screen shows:
+// the size the buffer was registered with, from the top left corner. In the PS4 Pro mode GT7
+// draws into a 3840x2160 surface and shows its 1920x1080 or 3200x1800 corner (NEO-GT7-006); the
+// prototype's pictures standing for the display (HUD pictures, the scene drawn beside, the scene
+// before a menu's interface) are made that size, so they match what FindDisplay shows. Elsewhere
+// the picture's own size.
+static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
+    vk::Extent2D size{picture.info.size.width, picture.info.size.height};
+    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
+        const VAddr value = g_display_addresses[i].load(std::memory_order_relaxed);
+        if (value == 0) {
+            break;
+        }
+        if (value == picture.info.guest_address) {
+            const u64 shown = g_display_sizes[i].load(std::memory_order_relaxed);
+            if (shown != 0) {
+                size.width = std::min(size.width, static_cast<u32>(shown >> 32));
+                size.height = std::min(size.height, static_cast<u32>(shown & 0xffffffffu));
+            }
+            break;
+        }
+    }
+    return size;
+}
+
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_HUD_SPLIT");
-        return RytyDisplayAspect() > 0.0f && !(env && env[0] == '0');
+        // DLSS-GT7-001: the temporal prototype wants the HUD out of the picture DLSS scales (its
+        // pixels would take the scene's motion vectors); it is laid over the result as here.
+        return (RytyDisplayAspect() > 0.0f || RytyUpscale::TemporalRequested()) &&
+               !(env && env[0] == '0');
     }();
     return on;
 }
@@ -892,7 +927,35 @@ void NativeRenderer::BeginHudStream() {
 
 // Runs the HUD list after the main one (in the same command buffer, at the same tick).
 void NativeRenderer::SpliceHudStream(u64 tick) {
-    Stream& s = hud_stream;
+    SpliceStream(hud_stream, tick);
+    SpliceStream(hud_black_stream, tick); // DLSS-GT7-001
+    temporal.hud_batch_open = false;
+}
+
+bool NativeRenderer::HudBatchOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void NativeRenderer::CloseHudBatch() {
+    temporal.hud_batch_open = false;
+    if (++temporal.batches == 1 || temporal.batches % 6000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: HUD draws batched in their own lists: {} draws in {} batches",
+                    temporal.batched_draws, temporal.batches);
+    }
+    if (stream.list) {
+        Splice(); // the main list, then the HUD lists
+        return;
+    }
+    r.scheduler.EndRendering();
+    SpliceHudStream(r.scheduler.CurrentTick());
+}
+
+void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
     if (!s.list) {
         return;
     }
@@ -924,9 +987,43 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     ForgetBindings(s); // OPT-014
 }
 
-Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
+// DLSS-GT7-001: with the temporal prototype the HUD is only split in a frame that had the game's
+// temporal pass (a race). Menus keep their pictures as they are drawn: split, their 2D pages
+// came out wrong (seen by the user on 2026-11-11).
+bool NativeRenderer::HudSplitNow() const {
+    // DLSS-GT7-001: not in a menu frame whose interface goes through DLSS (NoteTemporalDraw).
+    return HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
+                            (temporal.frame == frame && temporal.through_frame != frame));
+}
+
+// DLSS-GT7-001: the prototype's HUD pictures are twice the display's size, and the HUD's draws
+// get their viewports and scissors doubled, so a 1920x1080 HUD is drawn at 3840x2160 instead of
+// being stretched (the user saw it "left in low resolution" beside the DLSS picture). The draws
+// that give screen positions use a 16384-wide viewport: doubled, it needs 32768 (NVIDIA has it;
+// without it the HUD stays at the display's size).
+u32 NativeRenderer::HudScale() const {
+    static const bool wanted = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_HUD_SCALE");
+        return !(env && env[0] == '1');
+    }();
+    if (!wanted || !RytyUpscale::TemporalRequested() || RytyDisplayAspect() > 0.0f) {
+        return 1;
+    }
+    return r.instance.GetMaxViewportWidth() >= 32768 && r.instance.GetMaxViewportHeight() >= 32768
+               ? 2
+               : 1;
+}
+
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale,
+                                                   vk::Extent2D size) {
     auto* entry = new Native::ImageEntry{};
     entry->info = like.info;
+    if (size.width != 0 && size.height != 0) {
+        entry->info.size.width = size.width;
+        entry->info.size.height = size.height;
+    }
+    entry->info.size.width *= scale;
+    entry->info.size.height *= scale;
     Native::MadeImage made = MakeImage(entry->info, true);
     if (!made.image) {
         delete entry;
@@ -956,8 +1053,9 @@ Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& lik
     };
     s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
                                               .pImageMemoryBarriers = &barrier});
-    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{})",
-             like.info.guest_address, like.info.size.width, like.info.size.height);
+    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{}), {}x{}",
+             like.info.guest_address, like.info.size.width, like.info.size.height,
+             entry->info.size.width, entry->info.size.height);
     return entry;
 }
 
@@ -1201,8 +1299,40 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     return handle;
 }
 
+// DLSS-GT7-002: the bias temporal DLSS adds to a guest sampler (ryty_upscale.h), zero for those
+// it does not apply to. As in RyGT-Team/shadgt7 PR 42, it goes to the samplers of material
+// textures: filtered linearly over a mip chain. Shadow compares, point samplers and single-level
+// samplers keep the game's bias.
+// FIX-GT7-182: so does a sampler some instruction reads at an explicit level. Vulkan adds a
+// sampler's mipLodBias to explicit levels too ("LOD Operation"), and a level the shader computed
+// (GT7's roughness-to-mip reflection lookups) is not the screen-space footprint the bias
+// corrects: biased, dry roads looked wet. RYGT_DLSS_BIAS_EXPLICIT_LOD=1 biases those too.
+static float TemporalSamplerBias(const AmdGpu::Sampler& sampler, bool is_depth,
+                                 bool explicit_lod) {
+    const float bias = RytyUpscale::TemporalMipBias().load(std::memory_order_relaxed);
+    if (bias == 0.0f || is_depth) {
+        return 0.0f;
+    }
+    static const bool bias_explicit = [] {
+        const char* env = std::getenv("RYGT_DLSS_BIAS_EXPLICIT_LOD");
+        return env && env[0] == '1';
+    }();
+    if (explicit_lod && !bias_explicit) {
+        return 0.0f;
+    }
+    const auto linear = [](AmdGpu::Filter f) {
+        return f == AmdGpu::Filter::Bilinear || f == AmdGpu::Filter::AnisoLinear;
+    };
+    const bool material = sampler.mip_filter != AmdGpu::MipFilter::None &&
+                          sampler.MaxLod() > sampler.MinLod() && linear(sampler.xy_min_filter) &&
+                          linear(sampler.xy_mag_filter) &&
+                          sampler.filter_mode == AmdGpu::FilterMode::Blend;
+    return material ? bias : 0.0f;
+}
+
 vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
-                                       AmdGpu::BorderColorBuffer border, bool is_depth) {
+                                       AmdGpu::BorderColorBuffer border, bool is_depth,
+                                       bool explicit_lod) {
     auto sharp = original;
     if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
         sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
@@ -1213,31 +1343,38 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
         std::array<u64, 2> sharp;
         u64 extra;
         vk::Sampler sampler;
+        float resolution_bias{};
     };
+    const float resolution_bias = TemporalSamplerBias(sharp, is_depth, explicit_lod);
     static thread_local std::array<CachedSampler, 256> cached{};
     static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
     CachedSampler* cache = nullptr;
     std::array<u64, 2> raw;
     std::memcpy(raw.data(), &sharp, sizeof(raw));
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
-    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
+    // (explicit_lod in the key: one S# read both ways would else evict itself from its slot)
+    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0) |
+                      (explicit_lod ? u64{1} << 63 : 0);
     if (NextOn()) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
-        if (cache->sampler && cache->sharp == raw && cache->extra == extra) {
+        if (cache->sampler && cache->sharp == raw && cache->extra == extra &&
+            cache->resolution_bias == resolution_bias) {
             return cache->sampler;
         }
     }
-    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
+    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth, resolution_bias);
     if (cache) {
-        *cache = {raw, extra, sampler};
+        *cache = {raw, extra, sampler, resolution_bias};
     }
     return sampler;
 }
 
 vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
-                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+                                        AmdGpu::BorderColorBuffer border, bool is_depth,
+                                        float resolution_bias) {
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
+                     (u64(std::bit_cast<u32>(resolution_bias)) << 16) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
                      (custom ? u64(border.Address()) << 1 : 0);
     std::scoped_lock lock{sampler_mutex};
@@ -1300,6 +1437,12 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         const float bias = std::clamp(state.LodBias() + texture_lod_bias, -max_bias, max_bias);
         state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
     }
+    if (resolution_bias != 0.0f) {
+        // DLSS-GT7-002: the sampler's own state carries the bias, so the pool keys on it.
+        const float max_bias = r.instance.MaxSamplerLodBias();
+        const float bias = std::clamp(state.LodBias() + resolution_bias, -max_bias, max_bias);
+        state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
+    }
     struct Key {
         AmdGpu::Sampler state;
         std::array<float, 4> color;
@@ -1354,12 +1497,19 @@ CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
     if (hud_stream.list == &list) {
         return hud_stream.cmd;
     }
+    if (hud_black_stream.list == &list) {
+        return hud_black_stream.cmd;
+    }
     ASSERT_MSG(list.NativeHandleSlot() == nullptr,
                "PERF-GT7-018: commands for a deferred list of no stream");
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
+    // DLSS-GT7-001: work other than a HUD draw of the open batch runs after the batch.
+    if (temporal.hud_batch_open && !temporal.display_draw_now) {
+        CloseHudBatch();
+    }
     Stream& s = stream;
     if (s.list) {
         return s;
@@ -7180,7 +7330,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                         u32(ssharp.xy_mag_filter.Value()), ssharp.MinLod(), ssharp.MaxLod(),
                         u32(ssharp.lod_bias.Value()));
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth,
+                                       sampler.explicit_lod),
+                            VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -8887,6 +9039,17 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     std::scoped_lock lock{mutex};
+    // DLSS-GT7-001: a draw into a display buffer may join the open batch of HUD draws (Begin).
+    struct DisplayDraw {
+        bool& flag;
+        ~DisplayDraw() {
+            flag = false;
+        }
+    } display_draw{temporal.display_draw_now};
+    if (RytyUpscale::TemporalRequested()) { // (a static: nothing a draw without the prototype)
+        const auto& cb0 = r.liverpool->DrawRegs().color_buffers[0];
+        temporal.display_draw_now = cb0 && IsDisplayAddress(cb0.Address());
+    }
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Draws}; // DIAG-GT7-005
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
@@ -9215,11 +9378,144 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
+    // DLSS-GT7-001: the temporal pass's result is replaced before the first draw into it or
+    // into a display buffer.
+    // In a frame left as the game draws it (temporal.mirror), the result is only lent: it holds
+    // the un-resolved colour from here until the tone mapping, which is drawn first into the
+    // prototype's own display picture (what DLSS will see), then, with the game's result back,
+    // into the game's. A draw into the result in between (the flares) is drawn into the kept
+    // result too.
+    std::optional<RenderState> raw_scene_state;
+    std::optional<RenderState> kept_result_state;
+    if (temporal.pending_out) {
+        const bool to_display =
+            targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        bool to_out = false;
+        for (const auto* color : targets.colors) {
+            to_out |= color == temporal.pending_out;
+        }
+        // DLSS-GT7-003: a draw into the result before the tone mapping (GT7's motion blur in a
+        // pre-race, a replay or a TV camera; its light glows in a race). The result used to be
+        // replaced right here, so whatever the game read from it afterwards was the un-resolved
+        // colour: the bloom, when it comes after the motion blur, and its halos then blinked
+        // with the jitter (RECHERCHE-SCINTILLEMENT-LUMIERES-GT7.md, C1). Now the game's result
+        // stays resolved until the tone mapping, and the draw is recorded twice: into the result
+        // as the game draws it, and into a copy of the un-resolved colour, which is what replaces
+        // the result at the tone mapping. RYGT_DLSS_TEMPORAL_BLOOM=1: as before.
+        bool beside = false;
+        if (to_out && !to_display && TemporalKeepsResolved() &&
+            targets.state.num_color_attachments == 1 &&
+            targets.colors[0] == temporal.pending_out) {
+            if (temporal.raw_result_frame != frame) {
+                if (Native::ImageEntry* raw =
+                        TemporalPicture(temporal.raw_result, *temporal.pending_out)) {
+                    CopyPicture(*temporal.pending_color, *raw);
+                    temporal.pending_color = raw;
+                    temporal.raw_result_frame = frame;
+                }
+            }
+            if (temporal.raw_result_frame == frame) {
+                const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                              r.liverpool->DrawCbExtent(0)};
+                if (const vk::ImageView view =
+                        View(*temporal.raw_result, desc.view_info, ViewUse::Attachment)) {
+                    kept_result_state = targets.state;
+                    kept_result_state->color_attachments[0].image_view = view;
+                    beside = true;
+                    if (temporal.beside_logged < 8) {
+                        ++temporal.beside_logged;
+                        const Shader::Info* fs =
+                            pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                        LOG_WARNING(Render_Vulkan,
+                                    "DLSS-GT7-003: frame {}: a draw into the anti-aliased picture "
+                                    "before the tone mapping (ps {:#x}, {} vertices): the game "
+                                    "keeps its resolved picture, DLSS's copy gets the draw too",
+                                    frame, fs ? fs->pgm_hash : 0, regs.num_indices);
+                    }
+                }
+            }
+        }
+        if (beside) {
+            // (the result is replaced, or lent, at the tone mapping)
+        } else if ((to_display || to_out) && !temporal.mirror) {
+            ApplyTemporalReplace();
+        } else if (to_display || to_out) {
+            const bool single = targets.state.num_color_attachments == 1;
+            if (TemporalSwapIn()) {
+                const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                              r.liverpool->DrawCbExtent(0)};
+                if (to_display) {
+                    Native::ImageEntry* raw =
+                        single ? TemporalPicture(temporal.raw_display, *targets.colors[0],
+                                                 ShownPart(*targets.colors[0]))
+                               : nullptr;
+                    const vk::ImageView view =
+                        raw ? View(*raw, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
+                    if (view) {
+                        raw_scene_state = targets.state;
+                        raw_scene_state->color_attachments[0].image_view = view;
+                        // (the shown part only: a PS4 Pro surface is larger, NEO-GT7-006)
+                        raw_scene_state->width = static_cast<u16>(
+                            std::min<u32>(raw_scene_state->width, raw->info.size.width));
+                        raw_scene_state->height = static_cast<u16>(
+                            std::min<u32>(raw_scene_state->height, raw->info.size.height));
+                    } else {
+                        TemporalSwapOut(); // nothing for DLSS in this frame
+                    }
+                    temporal.pending_color = nullptr;
+                    temporal.pending_out = nullptr;
+                } else if (single && targets.colors[0] == temporal.pending_out) {
+                    const vk::ImageView view =
+                        View(*temporal.kept, desc.view_info, ViewUse::Attachment);
+                    if (view) {
+                        kept_result_state = targets.state;
+                        kept_result_state->color_attachments[0].image_view = view;
+                    }
+                }
+            } else {
+                temporal.pending_color = nullptr;
+                temporal.pending_out = nullptr;
+            }
+        }
+    }
+    // DLSS-GT7-001: set below for a menu's interface, drawn shifted by the frame's jitter.
+    bool jitter_shift = false;
+    // DLSS-GT7-001: in a menu frame whose interface goes through DLSS, the interface (the draws
+    // into the display after the frame's first, the scene) is drawn shifted by the frame's jitter
+    // like the scene, so DLSS gathers it as it gathers the scene (Home switches it).
+    if (temporal.through_frame == frame && temporal.frame == frame && targets.colors[0] &&
+        targets.state.num_color_attachments == 1 &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        if (temporal.scene_draw_frame != frame) {
+            temporal.scene_draw_frame = frame;
+        } else {
+            // The interface's first draw: the display as it is now (the scene alone) is kept,
+            // so DLSS's motion pass finds where the interface drew and gives it no motion where
+            // it stays put on the screen (End switches it; dlss_motion.comp). One copy and two
+            // barriers a frame.
+            if (temporal.ui_scene_frame != frame &&
+                RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
+                const u32 slot = static_cast<u32>(frame & 1);
+                if (Native::ImageEntry* scene =
+                        TemporalPicture(temporal.ui_scene[slot], *targets.colors[0],
+                                        ShownPart(*targets.colors[0]))) {
+                    CopyPicture(*targets.colors[0], *scene);
+                    temporal.ui_scene_frame = frame;
+                    temporal.ui_scene_slot = slot;
+                    temporal.ui_scene_address = targets.colors[0]->info.guest_address;
+                }
+            }
+            if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
+                jitter_shift = true;
+            }
+        }
+    }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
     // drawn into the display's black and white HUD pictures instead.
     std::optional<RenderState> hud_black_state;
     std::optional<RenderState> hud_white_state;
     HudLayer* hud_layer = nullptr;
+    u32 hud_scale = 1; // DLSS-GT7-001
     // (Multisampled, as a race's track and course maps are; a menu's small pictures drawn with
     // depth, like the World Map's 256x256 probe, are not.)
     if (HudSplitOn() && targets.colors[0] && targets.depth &&
@@ -9227,15 +9523,30 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
         hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
     }
-    if (HudSplitOn() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+    if (HudSplitNow() && targets.colors[0] &&
+        targets.state.num_color_attachments == 1 &&
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
         HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
         if (layer.composite_frame != frame) {
             layer.composite_frame = frame;
             layer.clear_pending = true;
-            if (!layer.black) {
-                layer.black = MakeHudPicture(*targets.colors[0]);
-                layer.white = MakeHudPicture(*targets.colors[0]);
+            // DLSS-GT7-001: the shown part of the display (ShownPart), times the HUD's scale.
+            const vk::Extent2D shown = ShownPart(*targets.colors[0]);
+            const u32 scale = HudScale();
+            if (!layer.black || layer.scale != scale ||
+                layer.black->info.size.width != shown.width * scale ||
+                layer.black->info.size.height != shown.height * scale) {
+                // DLSS-GT7-001: made again when End changes their size (the old ones are kept:
+                // recorded commands may still name them).
+                if (layer.black) {
+                    temporal.retired.push_back(layer.black);
+                }
+                if (layer.white) {
+                    temporal.retired.push_back(layer.white);
+                }
+                layer.scale = scale;
+                layer.black = MakeHudPicture(*targets.colors[0], layer.scale, shown);
+                layer.white = MakeHudPicture(*targets.colors[0], layer.scale, shown);
             }
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
@@ -9257,8 +9568,41 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 layer.clear_pending = false;
                 layer.hud_frame = frame;
                 hud_layer = &layer;
+                // DLSS-GT7-001: larger pictures, larger render area; never past the pictures
+                // (made the shown part's size: a PS4 Pro surface is larger, NEO-GT7-006).
+                if (layer.scale > 1) {
+                    hud_scale = layer.scale;
+                }
+                for (auto* state : {&*hud_black_state, &*hud_white_state}) {
+                    state->width = static_cast<u16>(std::min<u32>(
+                        u32{state->width} * layer.scale, layer.black->info.size.width));
+                    state->height = static_cast<u16>(std::min<u32>(
+                        u32{state->height} * layer.scale, layer.black->info.size.height));
+                }
             }
         }
+    }
+    // DLSS-GT7-001: the two records above go the way a HUD draw's do: first into the first
+    // state, then again into the second. A HUD draw of a frame left as the game draws it is
+    // recorded a third time, into the display itself, at its own size.
+    bool second_inline = false;
+    bool hud_unscaled = false;
+    const bool hud_mirrored =
+        hud_black_state && hud_layer && temporal.mirror && temporal.frame == frame;
+    if (raw_scene_state) {
+        hud_black_state = raw_scene_state;
+    }
+    if (kept_result_state) {
+        hud_white_state = kept_result_state;
+        second_inline = true;
+    }
+    if (hud_mirrored || (hud_black_state && hud_layer && temporal.frame == frame &&
+                         temporal.white_inline)) {
+        // A menu's interface draws its pieces through one scratch picture, written again for
+        // each piece: the record over white must run where it stands, not later in the HUD's
+        // own list, or it samples the scratch as a later piece left it (colours off in menus,
+        // seen by the user on 2026-11-12; my reading of the cause, not measured).
+        second_inline = true;
     }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         if (r.FrameDumpCollecting()) {
@@ -9274,14 +9618,27 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
+    // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
-        if (!hud_layer || hud_layer->race_frame == frame) {
+        const bool for_layer = hud_layer && hud_layer->race_frame != frame;
+        const bool for_temporal =
+            RytyUpscale::TemporalRequested() && temporal.race_hud_frame != frame &&
+            targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        if (!for_layer && !for_temporal) {
             return;
         }
         for (const auto* sampled : b.sampled) {
+            if (!sampled) {
+                continue;
+            }
             const auto it = hud_depth_drawn.find(sampled->info.guest_address);
             if (it != hud_depth_drawn.end() && it->second == frame) {
-                hud_layer->race_frame = frame;
+                if (for_layer) {
+                    hud_layer->race_frame = frame;
+                }
+                if (for_temporal) {
+                    temporal.race_hud_frame = frame;
+                }
                 return;
             }
         }
@@ -9337,6 +9694,34 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
             }
         }
+    }
+    // DLSS-GT7-001: in a frame left as the game draws it, a HUD draw goes into the display in the
+    // main list as the game draws it, and into the HUD pictures in two lists of their own that
+    // run after the main one: consecutive HUD draws then stay in one pass each, instead of
+    // switching between three pictures at every draw (2026-11-12, the main menu: 1,450 passes
+    // and 360 pass barriers a frame instead of 350 and 24, 45 frames a second instead of 60).
+    // A draw that reads a display picture, and any other work, runs after the batch (Begin).
+    // Decided before the draw's barrier and its pictures' preparation: with the HUD pictures as
+    // its target the main list saw a change of pass at every draw and put a barrier there
+    // (the first try on 2026-11-12 halved the passes, but kept 365 barriers a frame).
+    // RYGT_DLSS_TEMPORAL_HUD_BATCH=0: every HUD draw switches pictures as before.
+    bool hud_batched = false;
+    std::optional<RenderState> batched_black;
+    std::optional<RenderState> batched_white;
+    if (hud_mirrored && HudBatchOn() && hud_black_state && hud_white_state && !regs.stage_enable.hs_en) {
+        bool reads_display = false;
+        for (const auto* sampled : b.sampled) {
+            reads_display |= sampled && IsDisplayAddress(sampled->info.guest_address);
+        }
+        hud_batched = !reads_display;
+    }
+    if (temporal.hud_batch_open && !hud_batched) {
+        CloseHudBatch();
+        Begin();
+    }
+    if (hud_batched) {
+        batched_black = std::exchange(hud_black_state, std::nullopt);
+        batched_white = std::exchange(hud_white_state, std::nullopt);
     }
     {
         PhaseClock clock{stats.phase_ns[6]};
@@ -9569,6 +9954,36 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             r.ctx->attachment_feedback_loop |= vk::ImageAspectFlagBits::eDepth;
         }
         r.UpdateViewportScissorState();
+        if (hud_scale > 1 && hud_black_state && !hud_unscaled) {
+            // DLSS-GT7-001: the HUD's pictures are hud_scale times the display's size.
+            const float k = static_cast<float>(hud_scale);
+            auto viewports = s.dynamic.viewports;
+            for (auto& viewport : viewports) {
+                viewport.x *= k;
+                viewport.y *= k;
+                viewport.width *= k;
+                viewport.height *= k;
+            }
+            s.dynamic.SetViewports(viewports);
+            auto scissors = s.dynamic.scissors;
+            for (auto& scissor : scissors) {
+                scissor.offset.x *= static_cast<s32>(hud_scale);
+                scissor.offset.y *= static_cast<s32>(hud_scale);
+                scissor.extent.width *= hud_scale;
+                scissor.extent.height *= hud_scale;
+            }
+            s.dynamic.SetScissors(scissors);
+        }
+        if (jitter_shift) {
+            // DLSS-GT7-001: drawn where the jittered scene under it is (temporal.jitter: the
+            // scene's shift in pixels, x right, y down).
+            auto viewports = s.dynamic.viewports;
+            for (auto& viewport : viewports) {
+                viewport.x += temporal.jitter[0];
+                viewport.y += temporal.jitter[1];
+            }
+            s.dynamic.SetViewports(viewports);
+        }
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
         r.UpdateRasterizationState();
@@ -9614,6 +10029,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     };
     note_race_hud();
+    // DLSS-GT7-001: a draw that reads a display picture back (GT7's interface copies what is
+    // under a panel or a page into its scratch picture, for frosted panels and whole pages).
+    if (RytyUpscale::TemporalRequested() && temporal.display_read_frame != frame) {
+        for (const auto* sampled : b.sampled) {
+            if (sampled && IsDisplayAddress(sampled->info.guest_address)) {
+                temporal.display_read_frame = frame;
+                break;
+            }
+        }
+    }
     // FIX-227: hull shaders that read other patches' LS outputs (GCN LDS) get them from a
     // scratch buffer: the draw first runs as a writer pass (each patch stores its inputs, nothing
     // is drawn), then, after a barrier, as itself.
@@ -9769,7 +10194,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                      b.push.quad_sample_mask.data());
         }
         lds_snap_address = 0;
-        if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
+        if (hud_white_state && HudStreamOn() && !stream.wrapped_list && !second_inline) {
             // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
             std::swap(stream, hud_stream);
             BeginHudStream();
@@ -9781,7 +10206,45 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
             // stay bound across the change of attachment).
             BeginRendering(*hud_white_state);
+            if (jitter_shift) {
+                jitter_shift = false; // DLSS-GT7-001: the game's own copy, unshifted
+                bind_state();
+            }
             record_draw();
+        }
+        if (raw_scene_state) {
+            // DLSS-GT7-001: the tone mapping is drawn for DLSS; now for the game, with its own
+            // result back.
+            EndRendering();
+            TemporalSwapOut();
+            temporal.raw_frame = frame;
+            temporal.raw_address = targets.colors[0]->info.guest_address;
+            ++temporal.mirrored;
+            BeginRendering(targets.state);
+            bind_state();
+            record_draw();
+        } else if (hud_mirrored && !hud_batched) {
+            // DLSS-GT7-001: the HUD draw into the display itself, as the game expects to read it.
+            hud_unscaled = true;
+            BeginRendering(targets.state);
+            bind_state();
+            record_draw();
+            hud_unscaled = false;
+        }
+        if (hud_batched) {
+            // DLSS-GT7-001: the same draw over black and over white, in the HUD lists.
+            hud_black_state = batched_black; // bind_state sizes it for the HUD pictures
+            for (const bool white : {false, true}) {
+                Stream& side = white ? hud_stream : hud_black_stream;
+                std::swap(stream, side);
+                BeginHudStream();
+                BeginRendering(white ? *batched_white : *batched_black);
+                bind_state();
+                record_draw();
+                std::swap(stream, side);
+            }
+            temporal.hud_batch_open = true;
+            ++temporal.batched_draws;
         }
     }
     {
@@ -9848,8 +10311,356 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         ++stats.indirect_draws;
     }
     ++s.commands;
+    if (RytyUpscale::TemporalActive()) {
+        NoteTemporalDraw(*pipeline, targets, b); // DLSS-GT7-001
+    }
     ChunkFlushCheck();
     Report();
+}
+
+// DLSS-GT7-001 (temporal DLSS; see ryty_upscale.h): GT7's temporal
+// anti-aliasing pass in a race. Its pixel shader 0xcfa125dd reads the depth, the motion vectors
+// (RG16F, written by every scene draw as a second target), the frame's colour and the history,
+// and writes the new history (target 0) and the resolved picture (target 1). Its constants hold
+// the frame's jitter: the shader samples at position - c14*c20, - c15*c21 (c14/c15 turn motion
+// units into pixels: 960, -540 at 1920x1080; c20/c21 follow a 49-frame sequence within +-0.25
+// pixel), and reads the history at position - motion * (c14, c15). Measured in two of the user's
+// races on 2026-11-11 (dry and rain, chase and cockpit views); the frame of a camera cut has no
+// such pass, which is the history reset. The pictures are noted for the presenter's DLSS pass,
+// and the resolved picture is replaced with the un-resolved colour, so that what reaches DLSS
+// still carries the jitter. Only while DLSS can take the inputs (TemporalActive).
+void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
+                                      const DrawBindings& b) {
+    constexpr u64 Gt7TemporalAa = 0xcfa125dd;
+    const Shader::Info* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fs || fs->pgm_hash != Gt7TemporalAa) {
+        return;
+    }
+    // Set again below once the result's replacement is scheduled: a pass left to the game must
+    // not inherit the last frame's way.
+    temporal.mirror = false;
+    if (temporal.size_refused) {
+        return; // the result's size is not the display's (FindDisplay): left to the game
+    }
+    // Only in a race, and only while the interface does not read the display back. The game
+    // runs the same pass behind menus that have a 3D scene (the title screen over the world
+    // map, the layout cards over the globe, the pre-race page; seen by the user on 2026-11-12),
+    // and their pages and frosted panels copy the display picture while they draw: with the
+    // interface kept in the HUD pictures they copied the bare scene (the title's artwork lost
+    // to the map, cards showing the globe, panels shimmering with the un-resolved frames).
+    // There the pass is left alone and DLSS runs as without the prototype. A race is told as
+    // GT7-UW tells it, by its HUD's track and course maps, seen in one of the last two frames
+    // (menus that draw a course map pass for one, hence the second rule); a read of the display
+    // keeps the prototype off for half a second. RYGT_DLSS_TEMPORAL_MENUS=1: every frame with
+    // the pass.
+    // Since the same day those frames are taken another way (temporal.mirror): the game's
+    // pictures are left as it draws them, so what it reads back is its own, and the tone mapping
+    // and the HUD are drawn a second time beside them for DLSS (Draw). That costs a record more
+    // a HUD draw, which is why a race keeps the first way. RYGT_DLSS_TEMPORAL_MIRROR=0: such
+    // frames are left to the game as before; =2: every frame goes this way, races too.
+    static const bool menus_too = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENUS");
+        return env && env[0] == '1';
+    }();
+    const bool race_hud =
+        temporal.race_hud_frame != ~u64{0} && frame - temporal.race_hud_frame <= 2;
+    const bool read_back =
+        temporal.display_read_frame != ~u64{0} && frame - temporal.display_read_frame <= 30;
+    const bool race = race_hud && !read_back;
+    if (race != temporal.race && temporal.race_changes++ < 32) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    race ? "a race's HUD and no read of the display, the temporal pass is taken"
+                    : read_back ? "the interface reads the display back, the temporal pass is "
+                                  "left to the game"
+                                : "no race's HUD, the temporal pass is left to the game");
+    }
+    temporal.race = race;
+    static const int mirror_mode = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIRROR");
+        return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 0;
+    }();
+    // 2026-11-12: three records a HUD draw took the main menu from 60 to 57 frames a second,
+    // which a G-SYNC screen shows as flicker. Only where it is needed, then: while the interface
+    // reads the display back, and in a scene's first half second (a page that keeps a copy of
+    // the display, as the title screen's artwork, must find it whole in its first frame).
+    // Elsewhere the HUD stays out of the display, its record over white run in place outside a
+    // race (a menu's pieces share one scratch picture). Page Down forces one way (ryty_upscale.h).
+    //
+    // Measured the same day on the title screen: even so, drawing the interface beside the game's
+    // costs the GPU about 3.4 ms a frame there (it alternates ~50 times a frame between a scratch
+    // picture and the display, and each time the GPU must drain before the scratch is drawn
+    // again): 46 frames a second instead of 60. The quick way chosen by the user: outside a race,
+    // where the interface reads the display back or a scene has just started, the pass is left to
+    // the game (classic DLSS there; the title screen's 3D map is hidden behind its artwork
+    // anyway). A race keeps the frames left as drawn while its HUD reads the display back (a
+    // race is held by the game's own pace, the cost does not show there). RYGT_DLSS_TEMPORAL_
+    // MIRROR=1: such menu frames left as drawn and drawn beside (the way before), =2 every frame.
+    if (temporal.seen_frame == ~u64{0} || temporal.seen_frame + 1 < frame) {
+        temporal.run_start = frame;
+    }
+    temporal.seen_frame = frame;
+    const bool fresh = frame - temporal.run_start < 30;
+    const u32 hud_mode = RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed);
+    const bool mirror =
+        hud_mode == 1 ||
+        (hud_mode == 0 && !menus_too &&
+         (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh)) ||
+          (mirror_mode == 0 && race_hud && read_back)));
+    // Menus (no race HUD), since the same day: the interface is not split off; it stays in the
+    // display DLSS gets, drawn shifted by the frame's jitter like the scene (Draw; Home switches
+    // it). The game's pages read their display as the game drew it, and no record is added: the
+    // menus cost what the classic DLSS costs (the title screen held 60 frames a second only that
+    // way; with the interface drawn apart it fell to 45, whatever the way). Animated interface
+    // pieces may leave trails, since they carry the scene's motion.
+    // RYGT_DLSS_TEMPORAL_MENU_CLASSIC=1: classic DLSS where a menu reads its display back (the
+    // quick way of earlier the same day).
+    static const bool menu_classic = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MENU_CLASSIC");
+        return env && env[0] == '1';
+    }();
+    // Not with GT7-UW's wide screen (RytyDisplayAspect): there the menus' interface is split off
+    // in the black and white HUD pictures and laid over DLSS's picture, where a jitter shift
+    // would only make it shake (and its record over white is not shifted).
+    const bool through = !menu_classic && hud_mode == 0 && !menus_too &&
+                         mirror_mode == 0 && !race_hud && RytyDisplayAspect() <= 0.0f;
+    if (through) {
+        temporal.through_frame = frame;
+    }
+    if (through != temporal.through && temporal.through_changes++ < 64) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    through ? "a menu: its interface goes through DLSS"
+                            : "a race's HUD: drawn apart at twice the size");
+    }
+    temporal.through = through;
+    const bool left = menu_classic && hud_mode == 0 && !menus_too &&
+                      mirror_mode == 0 && !race_hud && (read_back || fresh);
+    if (left != temporal.left && temporal.left_changes++ < 64) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    !left ? "the temporal pass is taken"
+                    : read_back
+                        ? "the interface reads the display back: classic DLSS for this frame"
+                        : "a scene has just started: classic DLSS for this frame");
+    }
+    temporal.left = left;
+    temporal.white_inline = hud_mode == 2 || (hud_mode == 0 && !race_hud);
+    static bool mirror_logged = false;
+    static u32 mirror_changes = 0;
+    if (mirror != mirror_logged && mirror_changes++ < 32) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {} ({} frames drawn beside so far)",
+                    frame,
+                    mirror ? "the frame is left as the game draws it and drawn beside for DLSS"
+                           : "the pass's result is replaced in place",
+                    temporal.mirrored);
+    }
+    mirror_logged = mirror;
+    if (left) {
+        return;
+    }
+    const auto refuse = [&](const char* why) {
+        if (temporal.refused++ < 8) {
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: the temporal pass is not used: {}",
+                        frame, why);
+        }
+    };
+    const Native::ImageEntry* out = targets.colors[1];
+    if (!out) {
+        refuse("no second colour target");
+        return;
+    }
+    const Native::ImageEntry* depth = nullptr;
+    const Native::ImageEntry* motion = nullptr;
+    const Native::ImageEntry* color = nullptr;
+    for (const auto* entry : b.sampled) {
+        // (Single-sample only: DLSS takes a 2D view; the PS4 Pro mode's depth has 2 samples.)
+        if (!entry || entry->info.num_samples != 1 ||
+            entry->info.size.width != out->info.size.width ||
+            entry->info.size.height != out->info.size.height) {
+            continue;
+        }
+        if (entry->info.props.is_depth) {
+            depth = entry;
+        } else if (entry->info.pixel_format == vk::Format::eR16G16Sfloat) {
+            motion = entry;
+        } else if (entry != out && entry != targets.colors[0] &&
+                   entry->image->Desc().format == out->image->Desc().format) {
+            color = entry;
+        }
+    }
+    if (!depth || !motion) {
+        refuse("no depth or no RG16F motion picture of the result's size among its textures");
+        return;
+    }
+    // The constants: the stage's first guest buffer (128 bytes of floats).
+    std::array<float, 24> c{};
+    bool read = false;
+    for (const auto& desc : fs->buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(*fs);
+        const u64 base = vsharp.base_address;
+        read = base != 0 && vsharp.GetSize() >= sizeof(c) &&
+               Core::RytyMemory::GuardedCopy(c.data(), reinterpret_cast<const void*>(base),
+                                             sizeof(c));
+        break;
+    }
+    const float width = static_cast<float>(out->info.size.width);
+    const float height = static_cast<float>(out->info.size.height);
+    const float jitter_x = -c[14] * c[20];
+    const float jitter_y = -c[15] * c[21];
+    if (!read || !std::isfinite(jitter_x) || !std::isfinite(jitter_y) ||
+        std::abs(jitter_x) > 1.0f || std::abs(jitter_y) > 1.0f || c[14] == 0.0f || c[15] == 0.0f ||
+        std::abs(c[14]) > width || std::abs(c[15]) > height) {
+        refuse("its constants are unreadable or not the ones measured");
+        return;
+    }
+    if (!color) {
+        refuse("no colour picture of the result's format to replace it with");
+        return;
+    }
+    // From here the result is replaced: only then are the frame's jitter and pictures handed to
+    // DLSS (a resolved picture given with a jitter would be shifted back and forth by DLSS).
+    if (temporal.frame != frame) {
+        temporal.reset = temporal.frame + 1 != frame;
+    }
+    temporal.depth = depth;
+    temporal.result = out;
+    temporal.motion = motion;
+    temporal.frame = frame;
+    temporal.jitter[0] = jitter_x;
+    temporal.jitter[1] = jitter_y;
+    // motion * (c14, c15) = current - previous position in pixels; DLSS wants the opposite.
+    temporal.mvec_scale[0] = -c[14] / width;
+    temporal.mvec_scale[1] = -c[15] / height;
+    if (temporal.seen++ < 4) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: frame {}: temporal pass, depth {:#x} motion {:#x} colour {:#x} "
+                    "-> {:#x} {}x{}, c14 {} c15 {}, jitter {:.4f},{:.4f} px{}",
+                    frame, depth->info.guest_address, motion->info.guest_address,
+                    color->info.guest_address, out->info.guest_address, out->info.size.width,
+                    out->info.size.height, c[14], c[15], jitter_x, jitter_y,
+                    temporal.reset ? ", after a frame without one" : "");
+    }
+    // The game's bloom and exposure passes read the pass's result right after it, at a quarter
+    // of its size and less: they keep the game's resolved picture (steady from frame to frame;
+    // on the un-resolved one the highlights of car bodies flickered, seen by the user on
+    // 2026-11-11), and the result is replaced before the first draw into a display buffer, which
+    // is the tone mapping (DLSS-GT7-003, Draw). RYGT_DLSS_TEMPORAL_BLOOM=1: before the next draw
+    // into the result too, as until 2026-11-13; =0: replaced at once.
+    static const bool late = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_BLOOM");
+        return !(env && env[0] == '0');
+    }();
+    temporal.mirror = mirror;
+    if (mirror) {
+        temporal.mirror_frame = frame;
+    }
+    temporal.pending_color = color;
+    temporal.pending_out = out;
+    temporal.raw_result_frame = ~u64{0}; // DLSS-GT7-003: a new pass, a new copy (two in a frame)
+    if (!late && !mirror) {
+        ApplyTemporalReplace();
+    }
+}
+
+bool NativeRenderer::TemporalKeepsResolved() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_BLOOM");
+        return !(env && (env[0] == '0' || env[0] == '1'));
+    }();
+    return on;
+}
+
+void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1};
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .dstSubresource = layers,
+        .extent{to.info.size.width, to.info.size.height, 1},
+    };
+    CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(from.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral,
+                            vk::Image{Handle<VkImage_T>(to.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, copy);
+    s.buffers_written = true;
+    ++s.commands;
+}
+
+Native::ImageEntry* NativeRenderer::TemporalPicture(Native::ImageEntry*& slot,
+                                                    const Native::ImageEntry& like,
+                                                    vk::Extent2D size) {
+    if (size.width == 0 || size.height == 0) {
+        size = vk::Extent2D{like.info.size.width, like.info.size.height};
+    }
+    if (slot && (slot->info.size.width != size.width || slot->info.size.height != size.height ||
+                 slot->image->Desc().format != like.image->Desc().format)) {
+        temporal.retired.push_back(slot); // commands recorded may still name it
+        slot = nullptr;
+    }
+    if (!slot) {
+        slot = MakeHudPicture(like, 1, size);
+    }
+    return slot;
+}
+
+bool NativeRenderer::TemporalSwapIn() {
+    if (temporal.swapped_out) {
+        return true;
+    }
+    const Native::ImageEntry* color = temporal.pending_color;
+    const Native::ImageEntry* out = temporal.pending_out;
+    if (!color || !out || !TemporalPicture(temporal.kept, *out)) {
+        return false;
+    }
+    CopyPicture(*out, *temporal.kept);
+    CopyPicture(*color, *out);
+    temporal.swapped_out = out;
+    return true;
+}
+
+void NativeRenderer::TemporalSwapOut() {
+    const Native::ImageEntry* out = std::exchange(temporal.swapped_out, nullptr);
+    if (!out || !temporal.kept) {
+        return;
+    }
+    CopyPicture(*temporal.kept, *out);
+    Written(out);
+    // The tone mapping drawn again for the game (Draw, a frame left as the game draws it) reads
+    // the result right after this copy, past the draw's own barrier decision.
+    GlobalBarrier();
+}
+
+void NativeRenderer::ApplyTemporalReplace() {
+    const Native::ImageEntry* color = std::exchange(temporal.pending_color, nullptr);
+    const Native::ImageEntry* out = std::exchange(temporal.pending_out, nullptr);
+    if (!color || !out) {
+        return;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1};
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .dstSubresource = layers,
+        .extent{out->info.size.width, out->info.size.height, 1},
+    };
+    const vk::Image src_image{Handle<VkImage_T>(color->image->NativeHandle())};
+    const vk::Image dst_image{Handle<VkImage_T>(out->image->NativeHandle())};
+    CmdBuf{s.cmd}.copyImage(src_image, vk::ImageLayout::eGeneral, dst_image,
+                            vk::ImageLayout::eGeneral, copy);
+    Written(out);
+    s.buffers_written = true;
+    ++s.commands;
+    ++temporal.replaced;
+    temporal.replaced_frame = frame;
 }
 
 std::optional<NativeRenderer::IndirectBuffers> NativeRenderer::ResolveIndirect(
@@ -10522,7 +11333,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth,
+                                       sampler.explicit_lod),
+                            VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -12913,6 +13726,90 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.hud_race = it->second.race_frame + 1 == frame;
         }
     }
+    // DLSS-GT7-001: a result no draw came to replace stays the game's.
+    temporal.pending_color = nullptr;
+    temporal.pending_out = nullptr;
+    if (temporal.swapped_out) {
+        TemporalSwapOut(); // no tone mapping came: the result goes back as it was
+    }
+    // DLSS-GT7-001: a frame left as the game drew it is shown from the prototype's own display
+    // picture (the tone-mapped un-resolved scene), with the HUD pictures laid over it as in a
+    // race. Without that picture the game's display is shown as it is, HUD and all.
+    const bool mirror_frame =
+        temporal.mirror_frame != ~u64{0} && temporal.mirror_frame + 1 == frame;
+    bool raw_shown = false;
+    if (mirror_frame && temporal.raw_display && temporal.raw_frame + 1 == frame &&
+        temporal.raw_address == entry->info.guest_address &&
+        temporal.raw_display->info.size.width == entry->info.size.width &&
+        temporal.raw_display->info.size.height == entry->info.size.height) {
+        if (const vk::ImageView raw = View(*temporal.raw_display, view_info, ViewUse::Sampled)) {
+            display.image =
+                vk::Image{Handle<VkImage_T>(temporal.raw_display->image->NativeHandle())};
+            display.view = raw;
+            raw_shown = true;
+        }
+    }
+    if (mirror_frame && !raw_shown) {
+        display.hud_black = vk::ImageView{};
+        display.hud_white = vk::ImageView{};
+    }
+    // DLSS-GT7-001: a pass whose result is not the display's size (a picture cropped or scaled
+    // before it is shown, as NEO-GT7-006 crops the PS4 Pro's) cannot give DLSS its inputs, and
+    // its replaced result would reach DLSS un-resolved as a single frame: after a few such frames
+    // in a row the pass is left to the game for the run.
+    if (temporal.frame + 1 == frame && temporal.result && !temporal.size_refused) {
+        const bool same_size = temporal.result->info.size.width == entry->info.size.width &&
+                               temporal.result->info.size.height == entry->info.size.height;
+        temporal.size_mismatches = same_size ? 0 : temporal.size_mismatches + 1;
+        if (temporal.size_mismatches >= 8) {
+            temporal.size_refused = true;
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: the temporal pass's result is {}x{}, the display {}x{}: "
+                        "left to the game for this run (classic DLSS)",
+                        temporal.result->info.size.width, temporal.result->info.size.height,
+                        entry->info.size.width, entry->info.size.height);
+        }
+    }
+    // DLSS-GT7-001: the depth and motion vectors of the frame just finished, when it had the
+    // game's temporal pass, its result was replaced (or drawn beside) and they are the display's
+    // size.
+    const bool replaced =
+        temporal.replaced_frame != ~u64{0} && temporal.replaced_frame + 1 == frame;
+    if (RytyUpscale::TemporalActive() && (!mirror_frame || raw_shown) &&
+        (replaced || raw_shown) && temporal.frame + 1 == frame && temporal.depth &&
+        temporal.motion && temporal.depth->info.size.width == entry->info.size.width &&
+        temporal.depth->info.size.height == entry->info.size.height) {
+        VideoCore::ImageViewInfo depth_info{};
+        depth_info.format = vk::Format::eR32Sfloat;
+        VideoCore::ImageViewInfo motion_info{};
+        motion_info.format = vk::Format::eR16G16Sfloat;
+        RytyUpscale::TemporalInputs inputs{};
+        inputs.depth = vk::Image{Handle<VkImage_T>(temporal.depth->image->NativeHandle())};
+        inputs.depth_view = View(*temporal.depth, depth_info, ViewUse::Sampled);
+        inputs.depth_format = static_cast<vk::Format>(temporal.depth->image->Desc().format);
+        inputs.motion = vk::Image{Handle<VkImage_T>(temporal.motion->image->NativeHandle())};
+        inputs.motion_view = View(*temporal.motion, motion_info, ViewUse::Sampled);
+        inputs.motion_format = static_cast<vk::Format>(temporal.motion->image->Desc().format);
+        inputs.size = vk::Extent2D{entry->info.size.width, entry->info.size.height};
+        inputs.jitter[0] = temporal.jitter[0];
+        inputs.jitter[1] = temporal.jitter[1];
+        inputs.mvec_scale[0] = temporal.mvec_scale[0];
+        inputs.mvec_scale[1] = temporal.mvec_scale[1];
+        inputs.reset = temporal.reset;
+        // A menu frame whose interface went through DLSS: the display before its interface,
+        // seen through the display's own view (same channel order as what DLSS gets).
+        const Native::ImageEntry* ui_scene = temporal.ui_scene[temporal.ui_scene_slot];
+        if (ui_scene && temporal.ui_scene_frame + 1 == frame &&
+            temporal.ui_scene_address == entry->info.guest_address &&
+            ui_scene->info.size.width == entry->info.size.width &&
+            ui_scene->info.size.height == entry->info.size.height &&
+            RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
+            inputs.ui_scene_view = View(*ui_scene, view_info, ViewUse::Sampled);
+        }
+        if (inputs.depth_view && inputs.motion_view) {
+            display.temporal = inputs;
+        }
+    }
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     return display;
@@ -13957,8 +14854,10 @@ void NativeRenderer::Report() {
         targets_memo.valid = false;
         ForgetBindings(stream);
         ForgetBindings(hud_stream);
+        ForgetBindings(hud_black_stream);
         ++stream.serial;
         ++hud_stream.serial;
+        ++hud_black_stream.serial;
         // DIAG-GT7-002: the mode, and the window for the raw samples.
         RyDiag::SetProfileTag(u32(ab_window << 8) | (mode + 1));
     }

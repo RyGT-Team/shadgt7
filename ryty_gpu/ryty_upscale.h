@@ -3,10 +3,17 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <string_view>
 
+#include "common/logging/log.h"
+#include "common/types.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -16,6 +23,10 @@
 // times the mode's scale (Native 1x, Quality 1.5x, Balanced 1.72x, Performance 2x, Ultra
 // Performance 3x), and the post-process pass then fits that output to the window. "auto" (the
 // default) scales to the window size, as before.
+namespace Vulkan::RytyDlssG {
+bool UpscaleRequested(); // ryty_dlssg.h: GPU.dlss_enabled and Streamline's DLSS plugin
+} // namespace Vulkan::RytyDlssG
+
 namespace Vulkan::RytyUpscale {
 
 enum class Quality { Auto, Native, Quality, Balanced, Performance, UltraPerformance };
@@ -84,6 +95,233 @@ inline vk::Extent2D Target(vk::Extent2D input, vk::Extent2D window) {
 /// Whether the upscaler should run at the picture's own size (DLAA / FSR native AA).
 inline bool NativeAA() {
     return GetQuality() == Quality::Native;
+}
+
+// DLSS-GT7-001, temporal DLSS (when it runs: TemporalWanted below): DLSS fed with the game's own
+// depth, motion vectors and sub-pixel jitter instead of a flat depth, zero motion and a history
+// reset every frame. GT7's race draws a jittered 1920x1080 scene (49 positions of +-0.25 pixel)
+// with a motion-vector target, and resolves it with its own temporal anti-aliasing pass (pixel
+// shader 0xcfa125dd); the native renderer notes that pass's inputs and replaces its result with
+// the frame's un-resolved colour, so DLSS, at the present, gets jittered frames it can
+// accumulate. In a race the HUD is drawn apart (twice the size) and laid over DLSS's picture; in
+// menus with a 3D scene the interface stays in the picture, shifted by the jitter (NoteTemporalDraw).
+// A frame without that pass is scaled as before. Measured and written up in
+// RECHERCHE-DLSS-TEMPOREL-GT7.md; seen on an RTX 4070 only.
+// Nothing is changed in the game's pictures unless Streamline's DLSS scales them and takes the
+// inputs (TemporalUsable): with FSR, the plain scaling, the NGX plugin or a refusal the game
+// draws as without the prototype. Off in the PS4 Pro mode on a 4K TV (TemporalRequested).
+//   RYGT_DLSS_TEMPORAL_KEY=1     the test keys and their line in the FPS counter; none by
+//                                default since DLSS-GT7-004, a player must not switch the
+//                                picture's parts by accident (Page Up switches it off and on while
+//                                playing; Page Down steps through the ways the HUD is drawn,
+//                                Home shifts the menus' interface by the jitter or not, End
+//                                switches the menus' interface motion mask). Only read while
+//                                the game's window is in front. Not function keys: the emulator's
+//                                own hotkeys take them all (F9 pauses the game, F10 hides the FPS
+//                                counter), which the first builds' F9 and F10 ran into.
+//   RYGT_DLSS_TEMPORAL_MENUS=1   also outside a race (menus with a 3D scene: their pages come
+//                                out wrong, see NoteTemporalDraw)
+//   RYGT_DLSS_TEMPORAL_BLOOM=0   the result is replaced at once, so the game's bloom and exposure
+//                                read the un-resolved colour too (the first prototype)
+//   RYGT_DLSS_TEMPORAL_BLOOM=1   the result is replaced before the first draw into it, so a bloom
+//                                that comes after the game's motion blur reads the un-resolved
+//                                colour (until 2026-11-13; lights shimmered in pre-races). By
+//                                default it stays resolved until the tone mapping (DLSS-GT7-003)
+//   RYGT_DLSS_TEMPORAL_HUD_SCALE=1  the HUD is drawn at the game's size, not twice it
+//   RYGT_DLSS_TEMPORAL_JITTER=x,y  factors applied to the jitter (default 1,1; -1 flips an axis)
+//   RYGT_DLSS_TEMPORAL_MVEC=x,y    factors applied to the motion vectors (default 1,1)
+
+/// The frame's inputs for a temporal upscale, all at the game picture's size.
+struct TemporalInputs {
+    vk::Image depth;
+    vk::ImageView depth_view; ///< depth aspect; larger = nearer (GT7 draws reversed depth)
+    vk::Format depth_format;
+    vk::Image motion;
+    vk::ImageView motion_view;
+    vk::Format motion_format;
+    vk::Extent2D size;
+    float jitter[2];     ///< this frame's jitter in pixels: the scene's shift, x right, y down
+    float mvec_scale[2]; ///< motion * scale = (previous - current position) / picture size
+    bool reset;          ///< the frame before had no such pass (a camera cut): history starts over
+    /// A menu frame whose interface went through DLSS: the display as it was before its interface
+    /// (same view as the display's), so the motion pass finds where the interface drew. Else null.
+    vk::ImageView ui_scene_view;
+};
+
+/// DLSS-GT7-004: temporal DLSS is what NVIDIA DLSS means by default. It is asked for when
+/// Streamline's DLSS is the upscaler the settings choose (GPU.dlss_enabled with sl.dlss.dll there)
+/// and no frame generation is on: with FSR, with no upscaler, on another vendor's GPU, nothing
+/// of the prototype runs, the HUD split it needs included. Frame generation, DLSS's or FSR's, was
+/// never tried with it, so it keeps DLSS on single frames. RYGT_DLSS_TEMPORAL=0 turns it off, =1
+/// asks for it whatever the settings (the test launchers). Seen on an RTX 4070 only.
+inline bool TemporalWanted() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
+        if (env && (env[0] == '0' || env[0] == '1')) {
+            return env[0] == '1';
+        }
+        return RytyDlssG::UpscaleRequested() && !EmulatorSettings.IsDlssgEnabled() &&
+               !EmulatorSettings.IsFrameGenEnabled();
+    }();
+    return on;
+}
+
+/// The test keys listed above and their line in the FPS counter: RYGT_DLSS_TEMPORAL_KEY=1.
+inline bool TemporalKeys() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_KEY");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+/// Temporal DLSS is wanted (TemporalWanted), and the game does not run in the PS4 Pro mode on a
+/// 4K TV. There GT7 draws 3200x1800 in a checkerboard and rebuilds the full picture with its own
+/// temporal compute pass (cs 0x7aa5f0ad): no 0xcfa125dd pass to replace, and DLSS's history on
+/// top of the game's would accumulate twice (trails doubled where nothing moves, as rain). DLSS
+/// scales that picture as a single frame, as without the prototype. The Pro mode on a 1080p TV
+/// (RYGT_NEO_TV=1080) draws 1920x1080 without the checkerboard and keeps the prototype. First
+/// called while drawing, after the game's parameters are read (sceKernelIsNeoMode keeps its
+/// first answer).
+inline bool TemporalRequested() {
+    static const bool on = [] {
+        if (!TemporalWanted()) {
+            return false;
+        }
+        const char* tv = std::getenv("RYGT_NEO_TV");
+        if (Libraries::Kernel::sceKernelIsNeoMode() && !(tv && std::string_view{tv} == "1080")) {
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: off in the PS4 Pro mode on a 4K TV (the "
+                                       "game rebuilds its checkerboard itself); classic DLSS");
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+/// Set by the presenter's DLSS pass: Streamline's DLSS scaled the last frame and has not refused
+/// the temporal inputs. False until a first frame is scaled, and whenever DLSS is not what scales
+/// the picture (FSR, the plain scaling, the NGX plugin, a size DLSS cannot take, a failure).
+inline std::atomic<bool>& TemporalUsable() {
+    static std::atomic<bool> usable{false};
+    return usable;
+}
+
+inline std::atomic<bool>& TemporalSwitch() {
+    static std::atomic<bool> on{true};
+    return on;
+}
+
+/// What the last DLSS pass ran with, for the FPS counter: 0 a single frame (as without the
+/// prototype), 1 the game's depth, motion vectors and jitter.
+inline std::atomic<int>& TemporalStatus() {
+    static std::atomic<int> status{0};
+    return status;
+}
+
+/// The prototype is requested, not switched off with its key, and DLSS can take its inputs.
+inline bool TemporalActive() {
+    return TemporalRequested() && TemporalSwitch().load(std::memory_order_relaxed) &&
+           TemporalUsable().load(std::memory_order_relaxed);
+}
+
+/// The jitter's sign, measured on 2026-11-12: with the car at a standstill, 126 pairs of frames
+/// in a row of the un-resolved scene moved by -1.0 x the change of (c14*c20, c15*c21) on both
+/// axes (correlation -0.97). So the scene's shift, which is what DLSS takes as its jitter, is
+/// -(c14*c20, c15*c21): what NoteTemporalDraw notes.
+
+/// How a frame's HUD is drawn, switched with Page Down while playing (2026-11-12, to measure
+/// what each way costs: the main menu fell from 60 to 57 frames a second with the frames "left
+/// as the game draws them", which a G-SYNC screen shows as flicker).
+///   auto     as the game draws it only while its interface reads the display back, or a scene
+///            has just started; else out of the display, with the record over white in place
+///            outside a race and in the HUD's own list in a race
+///   mirror   every frame left as the game draws it (three records a HUD draw)
+///   direct   HUD kept out of the display, the record over white in place (two)
+///   list     HUD kept out of the display, the record over white in the HUD's own list (run after
+///            the main list: a menu's pieces then come out with the wrong textures)
+inline constexpr const char* TemporalHudModes[] = {"auto", "mirror", "direct", "list"};
+inline std::atomic<u32>& TemporalHudMode() {
+    static std::atomic<u32> mode{0};
+    return mode;
+}
+
+/// In menus the interface stays in the picture DLSS gets (no HUD pictures there): drawn shifted
+/// by the frame's jitter like the scene under it (true), or where the game puts it. Switched with
+/// Home while playing (2026-11-12, to judge which DLSS keeps the sharper and steadier).
+inline std::atomic<bool>& TemporalUiJitter() {
+    static std::atomic<bool> on{true};
+    return on;
+}
+
+/// In such menus, where the interface drew and stays put on the screen, the motion handed to DLSS
+/// is none (true): the labels stay put while the camera turns (the garage's smeared behind it,
+/// 2026-11-12), while what follows the scene (the World Map's icons) keeps the scene's motion
+/// (dlss_motion.comp). Switched with End while playing; RYGT_DLSS_TEMPORAL_UI_MASK=0 starts off.
+inline std::atomic<bool>& TemporalUiMask() {
+    static std::atomic<bool> on{[] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_UI_MASK");
+        return !(env && env[0] == '0');
+    }()};
+    return on;
+}
+
+/// The two factors of RYGT_DLSS_TEMPORAL_JITTER or _MVEC (1,1 when unset or unreadable).
+inline void TemporalFactors(const char* name, float out[2]) {
+    out[0] = out[1] = 1.0f;
+    if (const char* env = std::getenv(name); env && *env) {
+        char* end = nullptr;
+        const float x = std::strtof(env, &end);
+        if (end != env && *end == ',') {
+            const char* second = end + 1;
+            const float y = std::strtof(second, &end);
+            if (end != second && std::isfinite(x) && std::isfinite(y)) {
+                out[0] = x;
+                out[1] = y;
+            }
+        }
+    }
+}
+
+/// DLSS-GT7-002: the texture LOD bias NVIDIA's guide asks for with DLSS,
+/// log2(render width / display width) - 1, so -2 from 1920 to 3840, on the samplers RyGT-Team/
+/// shadgt7 PR 42 gives it to. The scene is drawn at half the display's size: without the bias
+/// the game picks its mips for 1080p and DLSS has nothing finer to rebuild (leaves, grass).
+/// Zero until DLSS has taken a frame with the game's depth, motion vectors and jitter, so a run
+/// without the prototype samples as before; then kept for the run, as menus alternate frames
+/// with and without the pass and a bias that followed them would swap every sampler each time.
+/// Set once: a window resized afterwards keeps the first bias. Every new value would add a copy
+/// of each material sampler to a pool the driver limits (about 4,000 on NVIDIA), never trimmed.
+///   RYGT_DLSS_TEMPORAL_MIP_BIAS=0   no bias
+///   RYGT_DLSS_TEMPORAL_MIP_EXTRA=x  the term added to the ratio (default -1; from -2 to 0)
+inline std::atomic<float>& TemporalMipBias() {
+    static std::atomic<float> bias{0.0f};
+    return bias;
+}
+
+/// Called by the presenter's DLSS pass after a frame scaled with the temporal inputs.
+inline void NoteTemporalScale(vk::Extent2D render, vk::Extent2D display) {
+    static const bool wanted = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIP_BIAS");
+        return !(env && env[0] == '0');
+    }();
+    static const float extra = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MIP_EXTRA");
+        const float value = env && *env ? std::strtof(env, nullptr) : -1.0f;
+        return std::isfinite(value) ? std::clamp(value, -2.0f, 0.0f) : -1.0f;
+    }();
+    auto& bias = TemporalMipBias();
+    if (!wanted || render.width == 0 || display.width <= render.width ||
+        bias.load(std::memory_order_relaxed) != 0.0f) {
+        return;
+    }
+    const float value =
+        std::log2(static_cast<float>(render.width) / static_cast<float>(display.width)) + extra;
+    bias.store(value, std::memory_order_relaxed);
+    LOG_WARNING(Render_Vulkan,
+                "DLSS-GT7-002: texture bias {:.2f} on the material samplers from now on "
+                "({}x{} scaled to {}x{})",
+                value, render.width, render.height, display.width, display.height);
 }
 
 } // namespace Vulkan::RytyUpscale

@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "common/guest_clock.h"
 #include "common/io_file.h"
 #include "common/logging/log.h"
@@ -282,11 +283,29 @@ void DrawFpsCounter() {
         window_shown = shown;
         window_start = now;
     }
-    char text[48];
+    char text[192];
+    int written = 0;
     if (shown_fps > 0.0) {
-        std::snprintf(text, sizeof(text), "%.0f FPS (%.0f shown)", fps, shown_fps);
+        written = std::snprintf(text, sizeof(text), "%.0f FPS (%.0f shown)", fps, shown_fps);
     } else {
-        std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+        written = std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    }
+    // DLSS-GT7-001: what the DLSS pass runs with, and its test keys, with RYGT_DLSS_TEMPORAL_KEY=1
+    // only (DLSS-GT7-004): players see the plain counter.
+    if (Vulkan::RytyUpscale::TemporalRequested() && Vulkan::RytyUpscale::TemporalKeys() &&
+        written > 0 &&
+        written < static_cast<int>(sizeof(text))) {
+        const bool wanted = Vulkan::RytyUpscale::TemporalActive();
+        const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;
+        std::snprintf(
+            text + written, sizeof(text) - written,
+            " | DLSS %s (Page Up) | menu interface %s (Home), %s (End)",
+            !wanted ? "single frames" : used ? "TEMPORAL" : "temporal, waiting",
+            Vulkan::RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed) ? "shifted"
+                                                                                   : "in place",
+            Vulkan::RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)
+                ? "no motion"
+                : "the scene's motion");
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImVec2 origin = ImGui::GetMainViewport()->Pos;

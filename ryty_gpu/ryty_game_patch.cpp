@@ -1729,6 +1729,88 @@ static void InstallWideCamera(u8* base) {
     }
 }
 
+// DLSS-GT7-005: the game's own 4K interface images with temporal DLSS. GT7 (CUSA24769 v1.71) keeps
+// a flag ([0x1462fda71]) that says its output is high resolution: set, the interface loads its
+// /4k/ images and draws its maps larger (513x326 for 308x196); clear, it rewrites /4k/ paths to
+// /2k/. The temporal DLSS path draws the HUD at twice the game's size (NativeRenderer::HudScale),
+// where the 2k images were merely magnified: icons, gauges and maps came out soft beside a build
+// that selects the 4K ones (measured on 2026-11-14: bottom HUD detail 11.7 -> 15.8). The flag is
+// forced where the game computes it (its first value and the one after a display change, keeping
+// the latter's comparison) and set now. The idea and the three addresses are Gabarsolon's, from
+// RyGT-Team/shadgt7 PR 42 (InstallHdUiAssetsGt7); rewritten here on this file's Apply.
+// Only where temporal DLSS is asked for and can run, decided as ryty_upscale.h's TemporalWanted
+// and TemporalRequested decide it, from the settings file (the renderer's settings are not loaded
+// yet): NVIDIA DLSS chosen, Streamline's sl.dlss.dll there and not switched off, no frame
+// generation, not the PS4 Pro mode on a 4K TV (the game picks its own images there). What cannot
+// be known here is whether Streamline will start: a GPU that falls back from DLSS gets the 4K
+// images minified. RYGT_DLSS_TEMPORAL_UI_4K=0 leaves the game's flag alone, =1 forces it whatever
+// the upscaler. Costs texture memory and loading, neither measured; menus draw the 4K images
+// into the 1080p picture, minified, as does a GPU without 32768-wide viewports in a race.
+void InstallUi4kImagesGt7(u8* base) {
+    const char* own = std::getenv("RYGT_DLSS_TEMPORAL_UI_4K");
+    if (own && own[0] == '0') {
+        return;
+    }
+    if (!(own && own[0] == '1')) {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL");
+        const char* streamline = std::getenv("RYGT_DLSS_STREAMLINE");
+        const bool plugin =
+            !(streamline && streamline[0] == '0') &&
+            GetFileAttributesW((Common::RytyExeDirW() + L"dlss\\sl.dlss.dll").c_str()) !=
+                INVALID_FILE_ATTRIBUTES;
+        const bool temporal = env && (env[0] == '0' || env[0] == '1')
+                                  ? env[0] == '1'
+                                  : ConfigFlag("dlss_enabled", false) && plugin &&
+                                        !ConfigFlag("dlssg_enabled", false) &&
+                                        !ConfigFlag("framegen_enabled", false);
+        const char* neo = std::getenv("RYGT_NEO");
+        const char* tv = std::getenv("RYGT_NEO_TV");
+        const bool pro_4k =
+            neo && neo[0] == '1' && neo[1] == '\0' && !(tv && std::string_view{tv} == "1080");
+        if (!temporal || pro_4k) {
+            return;
+        }
+    }
+    const Patch patches[] = {
+        {0x181bc7c, {0x20, 0xd0, 0x88, 0x05, 0xed, 0x1d, 0xae, 0x04},
+         {0xb0, 0x01, 0x88, 0x05, 0xed, 0x1d, 0xae, 0x04},
+         "DLSS-GT7-005 4K interface images (1/2)"},
+        {0x18f3751, {0x20, 0xca, 0x40, 0x38, 0xd6, 0x0f, 0x85, 0xc2, 0x02, 0x00, 0x00},
+         {0xb2, 0x01, 0x40, 0x38, 0xd6, 0x0f, 0x85, 0xc2, 0x02, 0x00, 0x00},
+         "DLSS-GT7-005 4K interface images (2/2)"},
+    };
+    constexpr u64 flag_rva = 0x62fda71;
+    // Both writers and the flag are checked before anything changes: another executable must not
+    // get half of this.
+    for (const Patch& patch : patches) {
+        if (!ReadableRange(base + patch.rva, patch.original.size()) ||
+            std::memcmp(base + patch.rva, patch.original.data(), patch.original.size()) != 0) {
+            std::fprintf(stderr,
+                         "[patch] DLSS-GT7-005 4K interface images: the bytes at %#llx differ, "
+                         "not applied\n",
+                         static_cast<unsigned long long>(patch.rva));
+            return;
+        }
+    }
+    if (!ReadableRange(base + flag_rva, 1) || base[flag_rva] > 1) {
+        std::fprintf(stderr, "[patch] DLSS-GT7-005 4K interface images: the flag is unreadable or "
+                             "not a flag, not applied\n");
+        return;
+    }
+    for (const Patch& patch : patches) {
+        if (!Apply(base, patch)) {
+            return;
+        }
+    }
+    DWORD old_protect = 0;
+    if (VirtualProtect(base + flag_rva, 1, PAGE_READWRITE, &old_protect)) {
+        base[flag_rva] = 1;
+        DWORD ignored = 0;
+        VirtualProtect(base + flag_rva, 1, old_protect, &ignored);
+        std::fprintf(stderr, "[patch] DLSS-GT7-005: the game's 4K interface images are selected\n");
+    }
+}
+
 void InstallMirrorHalfRate(u8* base) {
     bool wanted = ConfigFlag("mirror_half_rate", false);
     if (const char* env = std::getenv("RYGT_MIRROR_HALF")) {
@@ -2582,6 +2664,7 @@ void RytyApplyGamePatches() {
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallUi4kImagesGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DLSS-GT7-005
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
         Apply(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)),
