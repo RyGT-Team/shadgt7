@@ -355,9 +355,9 @@ void ForwardInput() {
             }
             // Telemetry describes the locally driven car (player 1 only). Explicit
             // game trigger commands take priority, including an explicit release.
-            // RYGT_ADAPTIVE_TRIGGERS=1 forces the effects on even with the slider at 0%.
+            // SHADGT_ADAPTIVE_TRIGGERS=1 forces the effects on even with the slider at 0%.
             static const bool forced = [] {
-                const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+                const char* env = std::getenv("SHADGT_ADAPTIVE_TRIGGERS");
                 return env && env[0] == '1';
             }();
             const unsigned slider = TriggerStrength();
@@ -378,16 +378,16 @@ void ForwardInput() {
                 left_rumble = Input::TriggerFeedback::Scale(saved.trigger[0].fallback, strength);
                 right_rumble = Input::TriggerFeedback::Scale(saved.trigger[1].fallback, strength);
             }
-            const char* triggers = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+            const char* triggers = std::getenv("SHADGT_ADAPTIVE_TRIGGERS");
             if ((triggers && triggers[0] == '0') || Input::TriggerFeedback::stopping) {
                 left = right = Input::TriggerFeedback::Vibration(0);
                 left_rumble = right_rumble = 0;
             }
             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
             {
-                // (diagnosis) RYGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, at each change.
+                // (diagnosis) SHADGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, at each change.
                 static const bool log = [] {
-                    const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
+                    const char* env = std::getenv("SHADGT_ADAPTIVE_TRIGGERS_LOG");
                     return env && env[0] == '1';
                 }();
                 static Input::TriggerFeedback::Effect logged_left{}, logged_right{};

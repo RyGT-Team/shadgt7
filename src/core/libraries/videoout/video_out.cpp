@@ -525,14 +525,14 @@ s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     u32 port_width = EmulatorSettings.GetInternalScreenWidth();
     u32 port_height = EmulatorSettings.GetInternalScreenHeight();
-    // NEO-GT7-001: in the PS4 Pro mode (RYGT_NEO=1 in libkernel.prx) the port reports a 2160p TV,
+    // NEO-GT7-001: in the PS4 Pro mode (SHARED_NEO=1 in libkernel.prx) the port reports a 2160p TV,
     // as a Pro on a 4K set does: GT7 picks its 3200x1800 (or 2160p=1: 3840x2160) picture from the
     // TV height. The base mode keeps the configured port.
-    // NEO-GT7-013: RYGT_NEO_TV=1080 reports a 1080p TV instead, as a Pro on a 1080p set: GT7 then
+    // NEO-GT7-013: SHADGT_NEO_TV=1080 reports a 1080p TV instead, as a Pro on a 1080p set: GT7 then
     // draws 1920x1080 without its checkerboard and takes its third preset, GT7_PS4Pro_2K (60 fps
     // replays and photo mode, motion blur in the race; see NEO-GT7-014 in ryty_game_patch.cpp).
     if (Libraries::Kernel::sceKernelIsNeoMode()) {
-        const char* tv = std::getenv("RYGT_NEO_TV");
+        const char* tv = std::getenv("SHADGT_NEO_TV");
         const bool tv_1080 = tv && std::string_view{tv} == "1080";
         port_width = tv_1080 ? 1920 : 3840;
         port_height = tv_1080 ? 1080 : 2160;

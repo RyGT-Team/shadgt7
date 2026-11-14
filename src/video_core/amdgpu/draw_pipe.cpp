@@ -50,8 +50,8 @@ void Charge(std::chrono::steady_clock::time_point now) {
 
 bool On() {
     static const bool on = [] {
-        const char* ab = Common::DiagEnv("RYGT_NATIVE_AB");
-        const char* parts = Common::DiagEnv("RYGT_DIAG_RECORDER_PARTS");
+        const char* ab = Common::DiagEnv("SHADGT_NATIVE_AB");
+        const char* parts = Common::DiagEnv("SHADGT_DIAG_RECORDER_PARTS");
         return (ab && ab[0] == '1') || (parts && parts[0] == '1');
     }();
     return on;
@@ -598,13 +598,13 @@ void DrawPipe::Run(std::stop_token stop) {
         while (!batch.empty()) {
             Work work = std::move(batch.front());
             batch.pop_front();
-            // PERF-GT7-124 (RYGT_JOB_PREFETCH=0 off): the next job's captures were written by the
+            // PERF-GT7-124 (SHADGT_JOB_PREFETCH=0 off): the next job's captures were written by the
             // command thread on another core: the register delta, the extents and the selected
             // pipeline with each stage's user data, about 1 KB. Asked for now, they arrive
             // while this job is recorded; their first reads were ~8% of the recorder's busy
             // time in a 20-car race (the job itself, InstallDrawStages and the selection's move).
             static const bool prefetch_next = [] {
-                const char* env = std::getenv("RYGT_JOB_PREFETCH");
+                const char* env = std::getenv("SHADGT_JOB_PREFETCH");
                 return !(env && env[0] == '0');
             }();
             // PERF-GT7-126: the job after it gets its captures asked for too, so that by the

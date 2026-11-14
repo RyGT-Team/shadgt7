@@ -201,9 +201,9 @@ private:
 // At most two of them are created at the same time; -DisablePerf 79 lets them all run.
 // (PERF-GT7-029's three while compiles use every core gave way to PERF-172's limit.)
 // PERF-172: GT7's tessellated pipelines are compiled without optimization (FIX-057, PERF-081),
-// and two at a time held its cars back for most of a race start; up to RYGT_TESS_BUILDS
+// and two at a time held its cars back for most of a race start; up to SHADGT_TESS_BUILDS
 // (default 4) run at once while the process commits under half the RAM and 4 GB stay free, two
-// otherwise. RYGT_TESS_BUILDS=2 is the old limit. (Six, with twelve builds at a time, cost fps
+// otherwise. SHADGT_TESS_BUILDS=2 is the old limit. (Six, with twelve builds at a time, cost fps
 // during a race start's backlog: the CPU is the limit.)
 class HeavyBuildGate {
 public:
@@ -254,7 +254,7 @@ private:
     }
     static u32 Limit() {
         static const u32 asked = [] {
-            if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
+            if (const char* env = std::getenv("SHADGT_TESS_BUILDS"); env && *env) {
                 return std::clamp(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 16u);
             }
             return 4u;
@@ -307,10 +307,10 @@ static std::atomic<s64> last_pipeline_miss_ms{};
 // SHD-001: pipelines are not linked a second time with link-time optimization. That link is a
 // full driver compile of every new pipeline again (after new content, minutes of compiling in
 // the background on up to four threads, competing with the game for cores), for GPU time the
-// renderer no longer lacks. RYGT_PIPELINE_LTO=1 links them as before (with counts and times).
+// renderer no longer lacks. SHADGT_PIPELINE_LTO=1 links them as before (with counts and times).
 static bool LinkTimeOptimization() {
     static const bool lto = [] {
-        const char* env = std::getenv("RYGT_PIPELINE_LTO");
+        const char* env = std::getenv("SHADGT_PIPELINE_LTO");
         return env && env[0] == '1';
     }();
     return lto;
@@ -318,10 +318,10 @@ static bool LinkTimeOptimization() {
 // AMD-320: fast-linked pipelines without the optimizer cost AMD far more GPU time than NVIDIA.
 // On AMD tessellated pipelines keep the optimizer. AMD-322: no link-time data and no second,
 // optimized link on AMD: on an RX 7600 (GT Sport) they made each menu pipeline take 0.4-0.7 s and
-// filled pipeline memory. RYGT_AMD_PIPELINE_POLICY=0 keeps the shared policy.
+// filled pipeline memory. SHADGT_AMD_PIPELINE_POLICY=0 keeps the shared policy.
 static bool AmdPipelinePolicy(u32 vendor_id) {
     static const bool allowed = [] {
-        const char* env = std::getenv("RYGT_AMD_PIPELINE_POLICY");
+        const char* env = std::getenv("SHADGT_AMD_PIPELINE_POLICY");
         return !(env && env[0] == '0');
     }();
     return allowed && vendor_id == 0x1002;
@@ -469,7 +469,7 @@ GraphicsPipeline::GraphicsPipeline(
         std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
                             [&](u8 samples) { return samples == 0 || samples == key.num_samples; });
     static const bool so_independent = [] {
-        const char* env = std::getenv("RYGT_SO_INDEPENDENT");
+        const char* env = std::getenv("SHADGT_SO_INDEPENDENT");
         return !(env && env[0] == '0');
     }();
     const bool independent_sets =
@@ -856,14 +856,14 @@ GraphicsPipeline::GraphicsPipeline(
     // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
     // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
     // AMD's mixed sample counts, which shader objects can't express.
-    // SO-016 (diagnosis): kinds of pipelines kept as pipelines, a bit mask from RYGT_SO_SKIP or
+    // SO-016 (diagnosis): kinds of pipelines kept as pipelines, a bit mask from SHADGT_SO_SKIP or
     // so_skip.txt in the game folder: 1 blending, 2 alpha to coverage, 4 logic op, 8 dual-source
     // factors, 16 no pixel shader, 32 a partial colour write mask.
     // SO-017: blended pipelines stay pipelines by default (with shader objects GT7's HUD lost
     // its rev counter ticks and mirror frame and the menu cursor vanished). "0" in so_skip.txt or
-    // RYGT_SO_SKIP=0 draws them with shader objects again.
+    // SHADGT_SO_SKIP=0 draws them with shader objects again.
     static const u32 so_skip = [] {
-        const char* env = std::getenv("RYGT_SO_SKIP");
+        const char* env = std::getenv("SHADGT_SO_SKIP");
         u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : 1u;
         if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
             char text[32]{};
@@ -979,7 +979,7 @@ GraphicsPipeline::GraphicsPipeline(
     // sample shading: the fragment library's multisample state must then be the interface
     // library's (VUID-VkGraphicsPipelineCreateInfo-pLibraries-06636/09567) and shared fragment
     // libraries are not keyed by the mode. With NEO-GT7-005 on, mixed pipelines have none;
-    // RYGT_NEO_PIXEL_RATE=0 keeps the former MERGE with sample shading.
+    // SHADGT_NEO_PIXEL_RATE=0 keeps the former MERGE with sample shading.
     vk::PipelineCoverageReductionStateCreateInfoNV coverage_reduction{
         .coverageReductionMode = vk::CoverageReductionModeNV::eTruncate,
     };
@@ -1040,14 +1040,14 @@ GraphicsPipeline::GraphicsPipeline(
     // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
     // summary their library compiles (with link-time optimization info kept) took the process
     // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
-    // PERF-GT7-040 (on by default, RYGT_GPL=0 turns it and PERF-GT7-041 off): tessellated
+    // PERF-GT7-040 (on by default, SHADGT_GPL=0 turns it and PERF-GT7-041 off): tessellated
     // pipelines are built from libraries too (still without optimization), so GT7's cars share compiled fragment and pre-raster
     // libraries across their many state combinations and only fast-link. FIX-057's memory blow-up
     // came with link-time optimization info kept in the libraries, which SHD-001 no longer does.
     static const bool gpl_tessellated = [] {
         // Four cold race starts (Deep Forest x3, Monza): car pipelines 607 -> 309 ms each, the
         // same pictures, no new errors.
-        const char* env = std::getenv("RYGT_GPL");
+        const char* env = std::getenv("SHADGT_GPL");
         return !(env && env[0] == '0') && !LinkTimeOptimization();
     }();
     static const bool whole_tessellated = Common::PerfFeatureEnabled(80) && !gpl_tessellated;
@@ -1456,11 +1456,11 @@ bool GraphicsPipeline::CreateShaderObjects(
     constexpr std::array<vk::ShaderStageFlagBits, 4> stage_bits{
         vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
         vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
-    // SO-007: the stages are made together, linked (RYGT_SO_LINK=0: each on its own), so the
+    // SO-007: the stages are made together, linked (SHADGT_SO_LINK=0: each on its own), so the
     // driver sees the whole set as it does a pipeline's: it can merge the stages the GPU runs as
     // one program and drop what the next stage never reads. SO-006: for independent-sets layouts.
     static const bool link = [] {
-        const char* env = std::getenv("RYGT_SO_LINK");
+        const char* env = std::getenv("SHADGT_SO_LINK");
         return !(env && env[0] == '0');
     }();
     vk::ShaderCreateFlagsEXT flags{};
@@ -1525,9 +1525,9 @@ bool GraphicsPipeline::CreateShaderObjects(
             // SO-009: the driver's compiled shader objects are kept on disk (shader_objects in the cache
             // folder, one file a set, keyed by the stage code, layouts, flags, GPU and driver version)
             // and made from those binaries on later starts: the driver compiles a set only once.
-            // RYGT_SO_CACHE=0: always from SPIR-V.
+            // SHADGT_SO_CACHE=0: always from SPIR-V.
             static const bool use_cache = [] {
-                const char* env = std::getenv("RYGT_SO_CACHE");
+                const char* env = std::getenv("SHADGT_SO_CACHE");
                 return !(env && env[0] == '0');
             }();
             const auto cache_file =
@@ -1571,9 +1571,9 @@ bool GraphicsPipeline::CreateShaderObjects(
             if (!from_binary) {
                 // SO-014: AMD's driver compiles a shader object set for up to seconds of CPU time; at
                 // normal priority those compiles competed with the game's threads (game-side stalls in
-                // races). Below normal while it runs. RYGT_SO_COMPILE_PRIORITY=0: unchanged.
+                // races). Below normal while it runs. SHADGT_SO_COMPILE_PRIORITY=0: unchanged.
                 static const bool lower = [] {
-                    const char* env = std::getenv("RYGT_SO_COMPILE_PRIORITY");
+                    const char* env = std::getenv("SHADGT_SO_COMPILE_PRIORITY");
                     return !(env && env[0] == '0');
                 }();
 #ifdef _WIN32

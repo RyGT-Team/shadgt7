@@ -1036,7 +1036,7 @@ void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void*,
 
 namespace Libraries::Kernel {
 
-// NEO-GT7-001: the same answer as Ryty's libkernel.prx export (RYGT_NEO=1 there turns the PS4 Pro
+// NEO-GT7-001: the same answer as Ryty's libkernel.prx export (SHARED_NEO=1 there turns the PS4 Pro
 // mode on), so the game, the Gnm init sequences, the video port and the alternate tiling agree.
 // Read once: it is asked for every draw packet, and it must not change while the game runs. Base
 // PS4 (0) if the export is missing.

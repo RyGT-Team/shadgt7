@@ -69,7 +69,7 @@ std::atomic<bool> g_has_pending{false}; // checked on every bind without the loc
 std::atomic<bool> g_hold_for_splice{false};
 constexpr u64 HeldForSplice = ~u64{0};
 
-// PERF-GT7-129 (RYGT_D1_ASYNC_RELEASE=0 off): GT7 streams a track's textures in 64 KB maps, each
+// PERF-GT7-129 (SHADGT_D1_ASYNC_RELEASE=0 off): GT7 streams a track's textures in 64 KB maps, each
 // a view of its own, and unmaps the ones it leaves: 240 to 960 views dropped at a time while
 // driving, each ~100 us to release (the driver's free, the buffer, the alias), all on the
 // recorder at its next bind: 25 to 100 ms of one frame. The recorder still decides when a
@@ -78,7 +78,7 @@ class ReleaseWorker {
 public:
     static bool On() {
         static const bool on = [] {
-            const char* env = std::getenv("RYGT_D1_ASYNC_RELEASE");
+            const char* env = std::getenv("SHADGT_D1_ASYNC_RELEASE");
             return !(env && env[0] == '0');
         }();
         return on;
@@ -297,11 +297,11 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
-    // PERF-GT7-127 (RYGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
+    // PERF-GT7-127 (SHADGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
     // view ~10,000 times a frame, each time under the lock and down the map (2.5% of its busy
     // time in the map walk alone), almost always for one of a few dozen views.
     static const bool recent_on = [] {
-        const char* env = std::getenv("RYGT_DIRECT_FIND_RECENT");
+        const char* env = std::getenv("SHADGT_DIRECT_FIND_RECENT");
         return !(env && env[0] == '0');
     }();
     RecentFind& recent = t_recent_finds[(address >> 21) % t_recent_finds.size()];
@@ -329,10 +329,10 @@ namespace {
 // PERF-GT7-022: a view was a whole allocation (up to 4 GiB): importing GT7's 2 GiB one pinned its
 // pages for ~440 ms, and the driver held every other call meanwhile, the present's submit too
 // (a frozen loading screen). Views are now pieces of at most this size, imported when something
-// in them is used. RYGT_D1_VIEW_MB=0: whole allocations as before.
+// in them is used. SHADGT_D1_VIEW_MB=0: whole allocations as before.
 u64 ViewPiece() {
     static const u64 piece = [] {
-        const char* env = std::getenv("RYGT_D1_VIEW_MB");
+        const char* env = std::getenv("SHADGT_D1_VIEW_MB");
         const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 256;
         return mb == 0 ? u64{1} << 32 : mb << 20;
     }();

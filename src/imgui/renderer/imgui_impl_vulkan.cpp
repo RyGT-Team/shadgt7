@@ -1314,10 +1314,10 @@ void OnSurfaceFormatChange(vk::Format surface_format, bool hdr) {
     const InitInfo& v = bd->init_info;
     auto& pl_format = bd->color_format; // FIX-GT7-144: where the pipeline's format points
     // FIX-GT7-142: the fragment shader follows the output's encoding as well as its format.
-    // RYGT_HDR_OVERLAY_NITS: the nits of the emulator's white on an HDR output (203 unless set;
+    // SHADGT_HDR_OVERLAY_NITS: the nits of the emulator's white on an HDR output (203 unless set;
     // 0 leaves its colours as they are, as before).
     static const float white_nits = [] {
-        const char* text = std::getenv("RYGT_HDR_OVERLAY_NITS");
+        const char* text = std::getenv("SHADGT_HDR_OVERLAY_NITS");
         if (text == nullptr || text[0] == 0) {
             return 203.0f;
         }

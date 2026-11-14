@@ -44,18 +44,18 @@ using AmdGpu::Regs;
 using State = AmdGpu::Liverpool::RecorderState;
 
 const bool g_compare = [] {
-    const char* env = std::getenv("RYGT_NATIVE_SHADOW");
+    const char* env = std::getenv("SHADGT_NATIVE_SHADOW");
     return env && env[0] == '1';
 }();
 // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
-// FIX-229: not while FIX-227's hull-shader LDS emulation is on (RYGT_TESS_LDS_EMULATION, on by
-// default) unless RYGT_NATIVE_PREPARE_FORCE=1: with eight prepare workers two of three Alsace
+// FIX-229: not while FIX-227's hull-shader LDS emulation is on (SHADGT_TESS_LDS_EMULATION, on by
+// default) unless SHADGT_NATIVE_PREPARE_FORCE=1: with eight prepare workers two of three Alsace
 // runs lost the GPU device (NativeRenderer::PrepareEnabled logs it).
 const bool g_prepare = [] {
-    const char* env = std::getenv("RYGT_NATIVE_PREPARE");
-    const char* native = std::getenv("RYGT_NATIVE");
-    const char* lds = std::getenv("RYGT_TESS_LDS_EMULATION");
-    const char* force = std::getenv("RYGT_NATIVE_PREPARE_FORCE");
+    const char* env = std::getenv("SHADGT_NATIVE_PREPARE");
+    const char* native = std::getenv("SHADGT_NATIVE");
+    const char* lds = std::getenv("SHADGT_TESS_LDS_EMULATION");
+    const char* force = std::getenv("SHADGT_NATIVE_PREPARE_FORCE");
     const bool lds_on = !(lds && lds[0] == '0');
     const bool forced = force && force[0] == '1';
     return env && env[0] == '1' && native && native[0] == '1' && (!lds_on || forced);
@@ -573,9 +573,9 @@ void Snapshot(const u32* packet, const Regs& regs, u32 epoch, bool from_parent,
 }
 
 // Records a snapshot of the state at each draw of a job.
-// NAT-030 (RYGT_NATIVE_PIPELINES=1): each draw's pipeline is looked up on the job's thread too.
+// NAT-030 (SHADGT_NATIVE_PIPELINES=1): each draw's pipeline is looked up on the job's thread too.
 const bool g_lookups = [] {
-    const char* env = std::getenv("RYGT_NATIVE_PIPELINES");
+    const char* env = std::getenv("SHADGT_NATIVE_PIPELINES");
     return env && env[0] == '1';
 }();
 
@@ -1066,12 +1066,12 @@ namespace {
 // GT7-PREP: the walk of an ended job (and the draws it prepares) runs on the renderer's own
 // prepare workers instead of the game's job thread, which is on the game's critical path: there
 // the walks took about as much off the frame as the prepared draws saved the recorder.
-// RYGT_NATIVE_PREPARE_WORKERS=<n> (default 4); 0 walks on the job's thread, as before. A job
+// SHADGT_NATIVE_PREPARE_WORKERS=<n> (default 4); 0 walks on the job's thread, as before. A job
 // still queued a submission after it was queued is dropped: its commands may be reused by then
 // (the recorder then does its draws itself).
 u32 PrepareWorkers() {
     static const u32 workers = [] {
-        const char* env = std::getenv("RYGT_NATIVE_PREPARE_WORKERS");
+        const char* env = std::getenv("SHADGT_NATIVE_PREPARE_WORKERS");
         return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 4u;
     }();
     return workers;

@@ -314,8 +314,8 @@ bool UpscaleRequested() {
     if (!EmulatorSettings.IsDlssEnabled()) {
         return false;
     }
-    // RYGT_DLSS_STREAMLINE=0 keeps upscaling on the self-built ryGT_dlss.dll plugin.
-    if (const char* env = std::getenv("RYGT_DLSS_STREAMLINE"); env && env[0] == '0') {
+    // SHADGT_DLSS_STREAMLINE=0 keeps upscaling on the self-built ryGT_dlss.dll plugin.
+    if (const char* env = std::getenv("SHADGT_DLSS_STREAMLINE"); env && env[0] == '0') {
         return false;
     }
     return GetFileAttributesW(DlssFile(L"sl.dlss.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
@@ -477,12 +477,12 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!g_sl.options_set) {
         sl::DLSSGOptions options{};
         options.mode = sl::DLSSGMode::eOn;
-        // GT-MFG: frames generated between game frames, RYGT_DLSSG_FRAMES=1..5 (2x to 6x;
+        // GT-MFG: frames generated between game frames, SHARED_DLSSG_FRAMES=1..5 (2x to 6x;
         // default 1; multi-frame generation needs an RTX 50, 6x a recent driver). DLSS-G
         // reports what the GPU supports only once it runs, so the request goes in as asked and
         // falls back to one generated frame when refused.
         u32 frames = 1;
-        if (const char* env = std::getenv("RYGT_DLSSG_FRAMES"); env && *env) {
+        if (const char* env = std::getenv("SHARED_DLSSG_FRAMES"); env && *env) {
             frames = std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 5u);
         }
         options.numFramesToGenerate = frames;

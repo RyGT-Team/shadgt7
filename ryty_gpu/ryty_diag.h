@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// ryGT stutter diagnostics (RYGT_DIAG=1). Timed zones go into per-thread rings (no locks, no
+// ryGT stutter diagnostics (SHARED_DIAG=1). Timed zones go into per-thread rings (no locks, no
 // allocation once a thread's ring exists); each frame the screen clock is checked against the
 // recent median, and a spike writes what every thread did during it (zones and stack samples)
 // to <exe dir>\diag\<time>\. Ryty's libraries record their zones through the exported

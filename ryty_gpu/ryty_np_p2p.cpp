@@ -72,7 +72,7 @@ std::deque<Datagram> g_signaling;
 std::deque<Datagram> g_control;
 
 u16 P2PPort() {
-    if (const char* text = std::getenv("RYGT_P2P_PORT")) {
+    if (const char* text = std::getenv("SHARED_P2P_PORT")) {
         const long value = std::strtol(text, nullptr, 10);
         if (value > 0 && value < 65536) return static_cast<u16>(value);
     }
@@ -85,9 +85,9 @@ std::string Trim(std::string text) {
     return start == std::string::npos ? std::string() : text.substr(start, end - start + 1);
 }
 
-// RyGTServer's address: RYGT_ONLINE_SERVER, else online_server in RyGT.ini, else this PC.
+// RyGTServer's address: SHARED_ONLINE_SERVER, else online_server in RyGT.ini, else this PC.
 std::string ServerAddress() {
-    if (const char* text = std::getenv("RYGT_ONLINE_SERVER"); text && *text) return text;
+    if (const char* text = std::getenv("SHARED_ONLINE_SERVER"); text && *text) return text;
     std::ifstream ini("RyGT.ini");
     std::string line;
     while (std::getline(ini, line)) {

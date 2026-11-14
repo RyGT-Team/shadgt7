@@ -8,7 +8,7 @@
 #include <string_view>
 #include <utility>
 
-// NEO-GT7-014: the five options of GT7's PS4 Pro presets RYGT_NEO_EXTRAS turns on one by one
+// NEO-GT7-014: the five options of GT7's PS4 Pro presets SHADGT_NEO_EXTRAS turns on one by one
 // (ryty_game_patch.cpp hooks the copy of the preset the game picked).
 namespace Gt7PresetOptions {
 

@@ -102,7 +102,7 @@ if (Test-Path -LiteralPath $log) {
     Copy-Item -LiteralPath $log -Destination (Join-Path $ProfileDirectory "log-before-performance-$stamp.txt")
 }
 $variables = @('VK_LOADER_LAYERS_DISABLE', 'VK_LOADER_LAYERS_ENABLE', 'VK_LAYER_PATH', 'CDL_OUTPUT_PATH',
-    'SHADGT_DISABLE_PERF', 'SHADGT_FPS_LOCK', 'SHADGT_DRAW_PIPE', 'SHADGT_PREWARM')
+    'SHADGT_DISABLE_PERF', 'SHARED_FPS_LOCK', 'SHADGT_DRAW_PIPE', 'SHADGT_PREWARM')
 $environment = @{}
 foreach ($name in $variables) {
     $environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -113,7 +113,7 @@ try {
     $env:VK_LOADER_LAYERS_ENABLE = $null
     $env:VK_LAYER_PATH = $null
     $env:SHADGT_DISABLE_PERF = $DisablePerf
-    $env:SHADGT_FPS_LOCK = "$FpsLock"
+    $env:SHARED_FPS_LOCK = "$FpsLock"
     # The draw pipe (PERF-031) and background pipeline builds (PERF-038) are the tested default;
     # a value already set in the environment (for example 0) is kept.
     if (-not $env:SHADGT_DRAW_PIPE) { $env:SHADGT_DRAW_PIPE = '1' }

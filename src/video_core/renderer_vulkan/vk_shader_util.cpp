@@ -38,7 +38,7 @@ std::unordered_map<VkShaderModule, std::vector<u32>> module_code;
 // its luminance for 150 nits asked, 0.6 expected).
 //
 // GPU.hdr_paper_white_nits in the launcher's settings (50 to 1000, with HDR output allowed;
-// RYGT_HDR_PAPER_WHITE_NITS overrides it) gives the nits of the interface's white. Unset, or 250,
+// SHADGT_HDR_PAPER_WHITE_NITS overrides it) gives the nits of the interface's white. Unset, or 250,
 // nothing is touched.
 //
 // A shader is taken for one of those when its float constants hold the literal together with the
@@ -70,7 +70,7 @@ constexpr std::array<float, 9> DecodeMatrix{
 u32 InterfaceWhiteWanted() {
     static const u32 wanted = [] {
         double nits = 0.0;
-        const char* env = std::getenv("RYGT_HDR_PAPER_WHITE_NITS");
+        const char* env = std::getenv("SHADGT_HDR_PAPER_WHITE_NITS");
         if (env != nullptr && env[0] != 0) {
             nits = std::atof(env);
         } else {

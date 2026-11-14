@@ -261,7 +261,7 @@ private:
     /// skipped most lately.
     void BuildOnScreen();
     /// PERF-GT7-029: while many draws are skipped for their builds, compiles use every core, 8 at
-    /// a time; back on the compile cores once few are. RYGT_COMPILE_CATCH_UP=0 turns it off.
+    /// a time; back on the compile cores once few are. SHADGT_COMPILE_CATCH_UP=0 turns it off.
     void UpdateCatchUp(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which
@@ -436,7 +436,7 @@ private:
     std::jthread verify_thread;
     std::jthread pretranslate_thread;
     std::jthread warm_compute_thread;
-    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1, with shader
+    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1, with shader
     /// objects only, off by default since FIX-GT7-147).
     void CompilePackShaders(std::stop_token stop);
     std::jthread compile_pack_thread;
@@ -502,7 +502,7 @@ private:
     /// the command thread waiting for the translation.
     bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     /// PERF-GT7-115: the draw's wait for its hull shader translation is bounded by the window's
-    /// budget (RYGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
+    /// budget (SHADGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
     /// or one-off wait).
     bool HullWaitBudgeted(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash

@@ -37,7 +37,7 @@ inline bool IsCompleteSpirv(std::span<const u32> words) {
 
 /// FIX-GT7-011: how a module makes a float atomic min/max of a buffer from integer atomics
 /// (without VK_EXT_shader_atomic_float2): both atomics, each result bitcast to a float, then an
-/// OpSelect by the value's sign (before FIX-226, or RYGT_FLOAT_ATOMIC_EXACT=0), or only the one
+/// OpSelect by the value's sign (before FIX-226, or SHADGT_FLOAT_ATOMIC_EXACT=0), or only the one
 /// the sign picks, the two results merged by an OpPhi that is bitcast to a float (FIX-226). The
 /// pairs are UMin + SMax (max) and UMax + SMin (min). FIX-GT7-013: image atomics (on an
 /// OpImageTexelPointer) are not counted: FIX-226 left their emulation as it was, so a module of

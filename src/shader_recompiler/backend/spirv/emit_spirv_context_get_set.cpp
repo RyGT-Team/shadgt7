@@ -348,8 +348,8 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     case IR::Attribute::PointSize:
         return op_store(ctx.output_point_size);
     case IR::Attribute::RenderTargetIndex: {
-        // DIAG-231 (diagnosis, RYGT_DIAG_TES_LAYER0=1): domain shaders draw into layer 0.
-        static const bool tes_layer0 = Common::DiagEnv("RYGT_DIAG_TES_LAYER0") != nullptr;
+        // DIAG-231 (diagnosis, SHADGT_DIAG_TES_LAYER0=1): domain shaders draw into layer 0.
+        static const bool tes_layer0 = Common::DiagEnv("SHADGT_DIAG_TES_LAYER0") != nullptr;
         if (tes_layer0 && ctx.sw_stage == SwStage::TessellationEval) {
             value = ctx.ConstF32(0.0f);
             return op_store(ctx.output_layer);
@@ -379,9 +379,9 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 }
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
-    // DIAG-238 (diagnosis, RYGT_DIAG_TCS_CLAMP_VERTEX=1): hull shader input reads stay inside the
+    // DIAG-238 (diagnosis, SHADGT_DIAG_TCS_CLAMP_VERTEX=1): hull shader input reads stay inside the
     // patch (an index past gl_PatchVerticesIn reads undefined values in Vulkan).
-    static const bool clamp_vertex = Common::DiagEnv("RYGT_DIAG_TCS_CLAMP_VERTEX") != nullptr;
+    static const bool clamp_vertex = Common::DiagEnv("SHADGT_DIAG_TCS_CLAMP_VERTEX") != nullptr;
     if (clamp_vertex && ctx.sw_stage == SwStage::TessellationControl &&
         Sirit::ValidId(ctx.patch_vertices)) {
         const Id last = ctx.OpISub(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.patch_vertices),
@@ -481,9 +481,9 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
             UNREACHABLE_MSG("Patch {}", u32(patch));
         }
     }()};
-    // DIAG-229 (diagnosis, RYGT_DIAG_TESS_MIN1=1): tessellation levels below 1 or NaN become 1,
+    // DIAG-229 (diagnosis, SHADGT_DIAG_TESS_MIN1=1): tessellation levels below 1 or NaN become 1,
     // so no patch is culled by its factors.
-    static const bool min1 = Common::DiagEnv("RYGT_DIAG_TESS_MIN1") != nullptr;
+    static const bool min1 = Common::DiagEnv("SHADGT_DIAG_TESS_MIN1") != nullptr;
     if (min1 && !IR::IsGeneric(patch)) {
         value = ctx.OpNMax(ctx.F32[1], value, ctx.ConstF32(1.0f));
     }

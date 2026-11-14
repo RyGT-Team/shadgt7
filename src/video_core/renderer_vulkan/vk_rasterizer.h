@@ -337,7 +337,7 @@ public:
     }
 
 #ifdef RYTY_GPU
-    /// NAT-100: native mode's renderer (RYGT_NATIVE=1), or nullptr.
+    /// NAT-100: native mode's renderer (SHADGT_NATIVE=1), or nullptr.
     NativeRenderer* Native() const noexcept {
         return native.get();
     }
@@ -345,7 +345,7 @@ public:
     /// can't be (the caller writes it as before).
     bool NativeInlineWrite(VAddr address, std::span<const u8> data);
 #endif
-    /// NAT-116 (RYGT_FRAME_DUMP_AT=<seconds>): at a flip after that time, every render target
+    /// NAT-116 (SHADGT_FRAME_DUMP_AT=<seconds>): at a flip after that time, every render target
     /// the next frame draws into is saved to user\log\dump-<old|native>-<seconds>\ at the flip
     /// after it (raw texels; tools: dump2png.py). Called by the presenter at each flip.
     void FrameDumpFlip();
@@ -355,7 +355,7 @@ public:
     bool FrameDumpCollecting() const noexcept {
         return frame_dump_collecting;
     }
-    /// NAT-130 (RYGT_TRACE_RANGE=<hex lo>-<hex hi>): passes, dispatches, copies and fills that
+    /// NAT-130 (SHADGT_TRACE_RANGE=<hex lo>-<hex hi>): passes, dispatches, copies and fills that
     /// touch guest memory in [lo, hi) are logged all run long (NAT-130 lines), as the frame dump's
     /// events. The hooks run when this or the dump wants them.
     static std::pair<VAddr, VAddr> TraceRange();
@@ -663,13 +663,13 @@ private:
     std::filesystem::path frame_dump_dir;
     /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
     /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.
-    u32 frame_dump_index{}; ///< FIX-156 (diagnosis): which RYGT_FRAME_DUMP_AT time is next
+    u32 frame_dump_index{}; ///< FIX-156 (diagnosis): which SHADGT_FRAME_DUMP_AT time is next
     std::vector<VAddr> frame_dump_mem;
     std::filesystem::path frame_dump_mem_dir;
     u32 frame_dump_mem_wait{};
 
 public:
-    /// FIX-153 (diagnosis, RYGT_EXPOSURE_LOG=1): the auto exposure's inputs over time: the
+    /// FIX-153 (diagnosis, SHADGT_EXPOSURE_LOG=1): the auto exposure's inputs over time: the
     /// brightness grids the CPU reads back, and the exposure GT Sport's shaders get.
     static bool ExposureLogOn();
     void ExposureLogShader(const Shader::Info& stage, const char* renderer);

@@ -256,11 +256,11 @@ struct FlipStats {
 };
 FlipStats g_flip_stats;
 
-// PERF-075: SHADGT_FPS_LOCK=<fps> (30 in run_gt7.cmd and Run-GTSportPerformance.ps1) paces
+// PERF-075: SHARED_FPS_LOCK=<fps> (30 in run_gt7.cmd and Run-GTSportPerformance.ps1) paces
 // flips evenly at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
 u32 FpsLock() {
     static const u32 fps_lock = [] {
-        const char* env = std::getenv("SHADGT_FPS_LOCK");
+        const char* env = std::getenv("SHARED_FPS_LOCK");
         const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
         if (fps != 0) {
             LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
@@ -515,10 +515,10 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 // at the next vblank, which held a frame up to a vblank period and made
 // frame times alternate between one and two periods whenever the game ran below the refresh
 // rate. Vblanks still tick at their own rate for the game. On by default for native rendering
-// without frame generation; RYGT_FAST_FLIPS=0 restores the previous pacing.
+// without frame generation; SHADGT_FAST_FLIPS=0 restores the previous pacing.
 static bool FastFlips() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_FAST_FLIPS");
+        const char* env = std::getenv("SHADGT_FAST_FLIPS");
         bool native_renderer = false;
 #ifdef RYTY_GPU
         native_renderer = Vulkan::NativeModeRequested();
@@ -527,7 +527,7 @@ static bool FastFlips() {
                                              EmulatorSettings.IsFrameGenEnabled() ||
                                                  EmulatorSettings.IsDlssgEnabled());
         LOG_INFO(Lib_VideoOut, "GT-FF: ready-frame presentation {} ({})",
-                 enabled ? "on" : "off", env && *env ? "RYGT_FAST_FLIPS" : "default");
+                 enabled ? "on" : "off", env && *env ? "SHADGT_FAST_FLIPS" : "default");
         return enabled;
     }();
     return on;
@@ -662,9 +662,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // At most MaxCatchUp periods are made up: a longer stall (a present or driver hitch, a
             // flip blocked behind a compile hold) is not, so that no burst of vblanks tells the
             // game that time passed while the emulator, not the game, was stuck.
-            // RYGT_VBLANK_CATCHUP=0: as before.
+            // SHADGT_VBLANK_CATCHUP=0: as before.
             static const bool catch_up = [] {
-                const char* env = std::getenv("RYGT_VBLANK_CATCHUP");
+                const char* env = std::getenv("SHADGT_VBLANK_CATCHUP");
                 return !(env && env[0] == '0');
             }();
             constexpr int MaxCatchUp = 6; // ~100 ms at 60 Hz: a 3-vblank frame at 20 fps and more

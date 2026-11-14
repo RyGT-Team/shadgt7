@@ -19,7 +19,7 @@
 
 namespace AmdGpu {
 
-/// DIAG-GT7-005 (RYGT_NATIVE_AB=1 or RYGT_DIAG_RECORDER_PARTS=1): the recorder thread's time
+/// DIAG-GT7-005 (SHADGT_NATIVE_AB=1 or SHADGT_DIAG_RECORDER_PARTS=1): the recorder thread's time
 /// while it runs jobs, by part. Each part counts its own time only (a draw inside a draw job is
 /// the draw's); the time waiting for jobs is not counted.
 namespace RecorderParts {

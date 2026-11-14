@@ -25,7 +25,7 @@ option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 # DIAG-056: path to the nvtx3 headers of an NVIDIA Nsight Systems install, for timeline ranges.
 set(SHADGT_NVTX_INCLUDE "" CACHE PATH "nvtx3 include directory (Nsight Systems timeline ranges)")
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
-# Diagnostics (common/diagnostics.h): RYGT_DIAG=1's stutter capture, the per-draw step timers and
+# Diagnostics (common/diagnostics.h): SHARED_DIAG=1's stutter capture, the per-draw step timers and
 # work counters, the 2 s reports, the F1 dumps and every other diagnostic environment switch.
 # AUTO builds them into Debug and RelWithDebInfo and compiles them out of Release and MinSizeRel,
 # where they cost frame time even when unused; ON or OFF overrides the build type (an optimized

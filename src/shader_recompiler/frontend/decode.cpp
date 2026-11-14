@@ -464,9 +464,9 @@ void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSl
             // pair sdst. Compares write dst[1] (vector_alu.cpp; VCC by default), so a mask put in
             // dst[0] was lost: VCC took it and the pair kept its old bits, which the PS4 Pro
             // checkerboard resolve then used as its exec mask (no store at all).
-            // RYGT_NEO_SDWA_CMP=0: as before, in a shader store of its own (cache_storage.cpp).
+            // SHADGT_NEO_SDWA_CMP=0: as before, in a shader store of its own (cache_storage.cpp).
             static const bool sdwa_to_sgpr = [] {
-                const char* env = std::getenv("RYGT_NEO_SDWA_CMP");
+                const char* env = std::getenv("SHADGT_NEO_SDWA_CMP");
                 return !(env && env[0] == '0');
             }();
             if (sdwa.sd && sdwa_to_sgpr) {

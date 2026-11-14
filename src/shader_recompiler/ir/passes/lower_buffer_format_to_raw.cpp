@@ -24,10 +24,10 @@ struct FormatInfo {
 /// the one 4-bit value buffers don't use) reads as a null buffer instead of failing the whole
 /// translation: GT7 leaves other data in descriptor slots it doesn't read. The key records the
 /// V#'s format (an instruction's is in the code), so a real format gets its own translation.
-/// RYGT_NULL_UNKNOWN_BUFFER_FORMAT=0: the translation fails, as before.
+/// SHADGT_NULL_UNKNOWN_BUFFER_FORMAT=0: the translation fails, as before.
 static bool NullUnknownBufferFormat() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NULL_UNKNOWN_BUFFER_FORMAT");
+        const char* env = std::getenv("SHADGT_NULL_UNKNOWN_BUFFER_FORMAT");
         return !(env && env[0] == '0');
     }();
     return enabled;

@@ -70,9 +70,9 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     // points past their own patch's are the next patches', as in GCN's LDS (GT7's car hull
     // shaders read such; with FIX-228 that ends the black patches on the car in the race start's
     // close-ups). Slots count from the patch's own first control point (as GCN, the patch id
-    // folded out). RYGT_TESS_LDS_EMULATION=0: off; =1: slots from the start of the VGT group.
+    // folded out). SHADGT_TESS_LDS_EMULATION=0: off; =1: slots from the start of the VGT group.
     static const u32 mode = [] {
-        const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
+        const char* env = std::getenv("SHADGT_TESS_LDS_EMULATION");
         return env && *env ? u32(env[0] - '0') : 2u;
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
@@ -91,10 +91,10 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
 // program's constants are is learned from its first translation; later ones get them as their
 // draw had them, a first one whose constants don't fit its draw's registers ends and is queued
 // again with them, and the key is made from the constants the translation used.
-// RYGT_HS_PIN_TESS_CONSTANTS=0: read when translated, as before.
+// SHADGT_HS_PIN_TESS_CONSTANTS=0: read when translated, as before.
 static bool PinTessConstants() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_HS_PIN_TESS_CONSTANTS");
+        const char* env = std::getenv("SHADGT_HS_PIN_TESS_CONSTANTS");
         return !(env && env[0] == '0');
     }();
     return enabled;
@@ -124,10 +124,10 @@ bool CompilationInProgress() {
            g_shader_translations_running.load(std::memory_order_relaxed) != 0;
 }
 
-// DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1).
+// DIAG-GT7-073 (diagnosis, SHADGT_DIAG_TRANSLATE_JOBS=1).
 static bool TranslateJobsDiag() {
     static const bool enabled = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_TRANSLATE_JOBS");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_TRANSLATE_JOBS");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -136,13 +136,13 @@ static bool TranslateJobsDiag() {
 // PERF-GT7-111 : the precompile manifest. A record per translation made on a worker:
 // its inputs and the guest reads it made (descriptors, the SRT walker's output: values, no code),
 // and its SPIR-V's hash. The code and the fetch shader go to a local capture, never into a record.
-// RYGT_MANIFEST_RECORD=1 writes them; RYGT_MANIFEST_VERIFY=1 translates every record again at
+// SHADGT_MANIFEST_RECORD=1 writes them; SHADGT_MANIFEST_VERIFY=1 translates every record again at
 // start from the capture, replaying the reads, and compares the SPIR-V.
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
 static bool ManifestRecordOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_MANIFEST_RECORD");
+        const char* env = std::getenv("SHADGT_MANIFEST_RECORD");
         return env && env[0] == '1';
     }();
     return on;
@@ -349,9 +349,9 @@ public:
         // factor writes keep it from being skipped, SHD-005), so it goes before the others, in
         // order, and is never dropped as too old: on a cold Monza race start 211 draws waited
         // 1.5 s for hull shaders queued behind ~2,500 newer jobs, one wait after another.
-        // RYGT_TRANSLATE_URGENT_HS=0: in the common queue, as before.
+        // SHADGT_TRANSLATE_URGENT_HS=0: in the common queue, as before.
         static const bool urgent_hs = [] {
-            const char* env = std::getenv("RYGT_TRANSLATE_URGENT_HS");
+            const char* env = std::getenv("SHADGT_TRANSLATE_URGENT_HS");
             return !(env && env[0] == '0');
         }();
         {
@@ -375,9 +375,9 @@ private:
         // translations started 200-500 ms after their draw (2% of those were ever used, against 93%
         // under 10 ms): they described another draw, which queued another, for 25 s of missing
         // buildings at every launch. So the newest job goes first, and one older than a frame is
-        // dropped: its draw asks again with what it reads then. RYGT_TRANSLATE_MAX_AGE_MS=0: as before.
+        // dropped: its draw asks again with what it reads then. SHADGT_TRANSLATE_MAX_AGE_MS=0: as before.
         static const auto max_age = [] {
-            const char* env = std::getenv("RYGT_TRANSLATE_MAX_AGE_MS");
+            const char* env = std::getenv("SHADGT_TRANSLATE_MAX_AGE_MS");
             return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 33};
         }();
         while (!stop.stop_requested()) {
@@ -548,7 +548,7 @@ private:
         job.translate_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
-        // DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1): what each translation made.
+        // DIAG-GT7-073 (diagnosis, SHADGT_DIAG_TRANSLATE_JOBS=1): what each translation made.
         if (TranslateJobsDiag()) {
             LOG_WARNING(Render_Vulkan,
                         "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start "
@@ -607,10 +607,10 @@ private:
     // PERF-GT7-118: the module of a stored permutation, made here from the SPIR-V just read
     // instead of on the command thread when a draw matches it: GT7's first race frame matched
     // ~700 stored programs and opened, read and turned each one into a module there, one after
-    // another (~0.3 ms each). LoadStoredModule takes it; RYGT_PREFETCH_MODULES=0: as before.
+    // another (~0.3 ms each). LoadStoredModule takes it; SHADGT_PREFETCH_MODULES=0: as before.
     void Prefetch(u64 key, const std::vector<u32>& words) {
         static const bool enabled = [] {
-            const char* env = std::getenv("RYGT_PREFETCH_MODULES");
+            const char* env = std::getenv("SHADGT_PREFETCH_MODULES");
             return !(env && env[0] == '0');
         }();
         if (!enabled || !IsCompleteSpirv(words)) {
@@ -801,13 +801,13 @@ public:
     static u32 UsualWidth() {
         return CompileConcurrency();
     }
-    /// FIX-GT7-109: builds at once in a race (RYGT_COMPILE_PLAY_WIDTH, 2 by default, at most the
+    /// FIX-GT7-109: builds at once in a race (SHADGT_COMPILE_PLAY_WIDTH, 2 by default, at most the
     /// usual width): with 4 the recorder's submits waited in the driver behind the compiles
     /// (frames of 60-115 ms on a new track).
     static u32 PlayWidth() {
         static const u32 width = [] {
             u32 n = 2;
-            if (const char* env = std::getenv("RYGT_COMPILE_PLAY_WIDTH"); env && *env) {
+            if (const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH"); env && *env) {
                 n = u32(std::strtoul(env, nullptr, 10));
             }
             return std::clamp(n, 1u, CompileConcurrency());
@@ -826,7 +826,7 @@ public:
         Common::SetCompileCoresWide(on); // PERF-GT7-024: off the compile cores meanwhile
     }
     /// PERF-GT7-029: during a catch-up, 8 at a time on every core; PERF-GT7-032: below normal
-    /// priority (RYGT_CATCH_UP_LOW=0: normal, as before).
+    /// priority (SHADGT_CATCH_UP_LOW=0: normal, as before).
     /// FIX-GT7-109: in a race no more builds than usual run at once, whatever waits.
     void SetInPlay(bool on) {
         {
@@ -859,7 +859,7 @@ public:
     }
     static bool CatchUpLow() {
         static const bool low = [] {
-            const char* env = std::getenv("RYGT_CATCH_UP_LOW");
+            const char* env = std::getenv("SHADGT_CATCH_UP_LOW");
             return !(env && env[0] == '0');
         }();
         return low;
@@ -1116,7 +1116,7 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
     // FIX-217: whether a pixel shader has a V_INTERP_MOV_F32 selecting P10 or P20 (a vertex's own
     // attribute value; P0 is the provoking vertex, which flat inputs give anyway). VINTRP is
     // 0b110010 in bits 31:26, the opcode in 17:16 (2: MOV) and the selector in 7:0. Each
-    // program's answer is kept by its code address. DIAG-222 (RYGT_DIAG_BARY_COUNT=1) logs the
+    // program's answer is kept by its code address. DIAG-222 (SHADGT_DIAG_BARY_COUNT=1) logs the
     // count of such programs.
     const VAddr address = program.Address<VAddr>();
     if (const auto it = vertex_value_programs.find(address); it != vertex_value_programs.end()) {
@@ -1134,7 +1134,7 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
     static u32 programs = 0, matching = 0;
     ++programs;
     matching += found;
-    if (Common::DiagEnv("RYGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
+    if (Common::DiagEnv("SHADGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
         LOG_WARNING(Render_Vulkan, "DIAG-222: {} of {} pixel shaders read vertex values ({:#x}{})",
                     matching, programs, params.hash, found ? " does" : "");
     }
@@ -1228,12 +1228,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // FIX-217: only for the fragment shaders 217d4011 is about (a V_INTERP_MOV reading a
         // vertex's own value, P10 or P20); every other shader keeps the hardware interpolation and
         // its 27b translation and cache entries. On for all fragment shaders, it made AMD retranslate
-        // and recompile everything with heavier shaders. RYGT_AMD_BARYCENTRIC_ALL=1: all, as before.
+        // and recompile everything with heavier shaders. SHADGT_AMD_BARYCENTRIC_ALL=1: all, as before.
         static const bool all_shaders = [] {
-            const char* env = std::getenv("RYGT_AMD_BARYCENTRIC_ALL");
+            const char* env = std::getenv("SHADGT_AMD_BARYCENTRIC_ALL");
             return env && env[0] == '1';
         }();
-        static const bool diag_count = Common::DiagEnv("RYGT_DIAG_BARY_COUNT") != nullptr;
+        static const bool diag_count = Common::DiagEnv("SHADGT_DIAG_BARY_COUNT") != nullptr;
         const bool candidate = UseSingleSampleBarycentric(
             instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
             S().graphics_key.num_samples, direct_barycentric_requested);
@@ -1260,9 +1260,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // one of its colour targets has fragments runs its pixel shader once per pixel, where
         // Vulkan requires it: VK_NV_framebuffer_mixed_samples (per-sample shading with fewer
         // colour samples lost the GPU, writing to address 0). VK_AMD_mixed_attachment_samples
-        // has no such rule: AMD keeps the shader as it is. RYGT_NEO_PIXEL_RATE=0: as before.
+        // has no such rule: AMD keeps the shader as it is. SHADGT_NEO_PIXEL_RATE=0: as before.
         static const bool neo_pixel_rate = [] {
-            const char* env = std::getenv("RYGT_NEO_PIXEL_RATE");
+            const char* env = std::getenv("SHADGT_NEO_PIXEL_RATE");
             return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
         }();
         if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
@@ -1371,8 +1371,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
         info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs)); // FIX-227
         info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
-        // DIAG-239 (diagnosis, RYGT_DIAG_TCS_CONFIG=1): the LS/HS configuration, 60 lines at most.
-        if (static const bool diag = Common::DiagEnv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
+        // DIAG-239 (diagnosis, SHADGT_DIAG_TCS_CONFIG=1): the LS/HS configuration, 60 lines at most.
+        if (static const bool diag = Common::DiagEnv("SHADGT_DIAG_TCS_CONFIG") != nullptr; diag) {
             static std::mutex seen_mutex;
             static std::set<u32> seen;
             const u32 combo = u32(regs.ls_hs_config.num_patches) |
@@ -1418,9 +1418,9 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
     u32 records = 0, same = 0, differ = 0, failed = 0, no_code = 0, with_misses = 0;
     u32 from_description = 0;
     std::unordered_set<u64> spv_hashes;
-    // RYGT_MANIFEST_CODE=scan: the code found in the game's memory by the shader scan
+    // SHADGT_MANIFEST_CODE=scan: the code found in the game's memory by the shader scan
     // (RYGT_DIAG_SHADER_SCAN_CODE=1), as a player would have it, instead of the translations' own.
-    const char* code_env = std::getenv("RYGT_MANIFEST_CODE");
+    const char* code_env = std::getenv("SHADGT_MANIFEST_CODE");
     const bool from_scan = code_env && std::string_view{code_env} == "scan";
     const auto code_dir =
         from_scan ? g_capture_dir.parent_path() / (g_capture_dir.stem().string() + ".scan")
@@ -1515,7 +1515,7 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
                 with_misses, from_description);
 }
 
-// PERF-GT7-117 : RYGT_MANIFEST_PRETRANSLATE=1 translates at start, in the background, the
+// PERF-GT7-117 : SHADGT_MANIFEST_PRETRANSLATE=1 translates at start, in the background, the
 // manifest's records whose program the shader store does not have (after a renderer update the
 // store starts empty: SHD-010), from the local code, and stores them as a draw's translation
 // would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
@@ -1690,10 +1690,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
 // a driver update, or a cleared cache). Each compute pipeline is kept once as a recipe, and
 // built again in the background at each start, the largest first (quick for those the driver
 // has).
-// RYGT_WARM_COMPUTE=0: neither.
+// SHADGT_WARM_COMPUTE=0: neither.
 static bool WarmComputeOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_WARM_COMPUTE");
+        const char* env = std::getenv("SHADGT_WARM_COMPUTE");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -2138,9 +2138,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_fp16_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat16),
         .support_fp16_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat16),
         .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
-        // FIX-223 (RYGT_DISCARD_KILL=0 or 1 overrides): AMD ends discarded pixels at once.
+        // FIX-223 (SHADGT_DISCARD_KILL=0 or 1 overrides): AMD ends discarded pixels at once.
         .discard_kills = [&] {
-            const char* env = std::getenv("RYGT_DISCARD_KILL");
+            const char* env = std::getenv("SHADGT_DISCARD_KILL");
             return env && *env ? *env == '1'
                                : instance.GetDriverID() == vk::DriverId::eAmdProprietary;
         }(),
@@ -2178,10 +2178,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             return !instance.IsAmdRx7000();
         }(),
-        // FIX-GT7-138: RYGT_MED3_NAN=0 turns the rule off. Shaders already in the store keep the
-        // rule they were translated with: compare in a store of their own (RYGT_SHADER_STORE_TAG).
+        // FIX-GT7-138: SHADGT_MED3_NAN=0 turns the rule off. Shaders already in the store keep the
+        // rule they were translated with: compare in a store of their own (SHADGT_SHADER_STORE_TAG).
         .med3_nan_rule = [] {
-            const char* env = std::getenv("RYGT_MED3_NAN");
+            const char* env = std::getenv("SHADGT_MED3_NAN");
             return !(env && env[0] == '0');
         }(),
         .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
@@ -2191,14 +2191,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // single-colour triangles (hills at Fuji on an RX 6600 XT). AMD's older compiler keeps
         // that path (AMD-314), so it does GCN's P1/P2 arithmetic by hand, as 217d4011 does for
         // the KHR path. SHADGT_MANUAL_INTERP=0/1 overrides.
-        // DIAG-230 (diagnosis): RYGT_DIAG_NO_MANUAL_INTERP turns off per-vertex interpolation.
+        // DIAG-230 (diagnosis): SHADGT_DIAG_NO_MANUAL_INTERP turns off per-vertex interpolation.
         .needs_manual_interpolation = [&] {
             if (const char* env = std::getenv("SHADGT_MANUAL_INTERP"); env && *env) {
                 return env[0] != '0';
             }
             return (instance.IsFragmentShaderBarycentricSupported() &&
                     instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
-                    !Common::DiagEnv("RYGT_DIAG_NO_MANUAL_INTERP")) ||
+                    !Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) ||
                    (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                     instance.IsAmdLegacyShaderCompiler());
         }(),
@@ -2215,17 +2215,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // Port of xacidr4inx's reflection fix (RyGT 0066): fragment cube samples filter across faces.
     // FIX-GT7-151: an RX 480 drew GT7 right only with the legacy 2D-array sampling path, so GCN
-    // Radeons take it by default. RYGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1 the
+    // Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1 the
     // native one.
     {
-        const char* native_cube_env = std::getenv("RYGT_NATIVE_CUBE");
+        const char* native_cube_env = std::getenv("SHADGT_NATIVE_CUBE");
         const bool native_cube = native_cube_env && *native_cube_env ? native_cube_env[0] != '0'
                                                                      : !instance.IsAmdGcn();
         profile.native_cube_sampling =
             NativeModeRequested() && instance.IsImageCubeArraySupported() && native_cube;
         LOG_INFO(Render_Vulkan, "FIX-GT7-151: native cube sampling {}{}",
                  profile.native_cube_sampling ? "on" : "off",
-                 native_cube_env && *native_cube_env ? " (RYGT_NATIVE_CUBE)"
+                 native_cube_env && *native_cube_env ? " (SHADGT_NATIVE_CUBE)"
                  : instance.IsAmdGcn()              ? " (GCN Radeon)"
                                                     : "");
     }
@@ -2247,11 +2247,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
-        const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
+        const char* verify = std::getenv("SHADGT_MANIFEST_VERIFY");
         if (verify && verify[0] == '1') {
             verify_thread = std::jthread([this](std::stop_token stop) { VerifyManifest(stop); });
         }
-        const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
+        const char* pretranslate = std::getenv("SHADGT_MANIFEST_PRETRANSLATE");
         pretranslate_wanted = pretranslate && pretranslate[0] == '1';
     }
     if (WarmComputeOn()) { // PERF-GT7-037
@@ -2259,7 +2259,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
     }
     static const bool so_cache = [] {
-        const char* env = std::getenv("RYGT_SO_CACHE");
+        const char* env = std::getenv("SHADGT_SO_CACHE");
         return !(env && env[0] == '0');
     }();
     if (CompilePack::CompileOn() && so_cache && instance.IsShaderObjectEnabled()) { // PERF-GT7-108
@@ -2270,8 +2270,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // object sets need them, and its pipeline library recipes are not replayed without them
         // either. With pipelines (the default since FIX-GT7-147) nothing is compiled.
         LOG_WARNING(Render_Vulkan, "PERF-GT7-108: the compile pack needs shader objects (see "
-                                   "SO-001; RYGT_SHADER_OBJECT=1{}): no start-up compile",
-                    so_cache ? "" : "; RYGT_SO_CACHE not 0");
+                                   "SO-001; SHADGT_SHADER_OBJECT=1{}): no start-up compile",
+                    so_cache ? "" : "; SHADGT_SO_CACHE not 0");
     }
     // PERF-032: the shader store: a program's stored translations are read when a draw first
     // uses it, and new translations are stored. -DisablePerf 47 leaves the store closed.
@@ -2289,14 +2289,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // on it and the World Map ran at 13-16 fps. FIX-GT7-053: on again. Without it nothing compiled
     // before was there at the next start: the main menu's buildings were missing for seconds at
     // each one (7300 draws skipped on a launch that had to translate, 177 reading the store).
-    // RYGT_SHADER_STORE=0: translations are made each start.
+    // SHADGT_SHADER_STORE=0: translations are made each start.
     static const bool store_on = [] {
-        const char* env = std::getenv("RYGT_SHADER_STORE");
+        const char* env = std::getenv("SHADGT_SHADER_STORE");
         return !(env && env[0] == '0');
     }();
     if (!store_on) {
         LOG_WARNING(Render_Vulkan, "FIX-GT7-053: shader translations are made each start "
-                                   "(RYGT_SHADER_STORE=0)");
+                                   "(SHADGT_SHADER_STORE=0)");
     }
     if (store_on && store_wanted && Common::PerfFeatureEnabled(47)) {
         if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -2327,8 +2327,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 LOG_WARNING(Render_Vulkan,
                             "PERF-032: shader translations are loaded from the store on first use");
             }
-            // PERF-GT7-019 (RYGT_STORE_READERS=0: read on the GPU threads as before).
-            const char* readers_env = std::getenv("RYGT_STORE_READERS");
+            // PERF-GT7-019 (SHADGT_STORE_READERS=0: read on the GPU threads as before).
+            const char* readers_env = std::getenv("SHADGT_STORE_READERS");
             if (use_stored_shaders && !(readers_env && readers_env[0] == '0')) {
                 store_readers = std::make_unique<StoreReaders>(8, *this);
                 store_stats.since = std::chrono::steady_clock::now();
@@ -2381,20 +2381,20 @@ PipelineCache::~PipelineCache() {
     }
 }
 
-// FIX-165 (RyGT): the driver's pipeline cache file is off unless RYGT_DRIVER_CACHE=1. GT Sport's grew to
+// FIX-165 (RyGT): the driver's pipeline cache file is off unless SHADGT_DRIVER_CACHE=1. GT Sport's grew to
 // 3.7 GB: it was loaded whole at start, and each save (every 30 s while new pipelines were made)
 // held the driver for 1.4-4.3 s and then wrote for 11 s. Lance's Lago Maggiore races dropped to
 // 10 fps and back again and again, and once the menus froze for a minute. The driver keeps its
 // own shader cache, and races ran no slower without the file (2026-10-16). With
-// RYGT_DRIVER_CACHE=1 the file is loaded, and saved only when the game ends.
-// PERF-164: on again by default (RYGT_DRIVER_CACHE=0 turns it off). GT7's file is about 180 MB,
+// SHADGT_DRIVER_CACHE=1 the file is loaded, and saved only when the game ends.
+// PERF-164: on again by default (SHADGT_DRIVER_CACHE=0 turns it off). GT7's file is about 180 MB,
 // read in 68 ms and written in 0.5 s off the GPU thread, and it is saved during play (GT7 never
 // reaches the exit-time save): each session adds the pipelines of the cars and tracks it met.
 // PERF-167: the driver cache file's size limit, from the launcher's Graphics page
-// (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 2 GB by default.
+// (SHARED_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 2 GB by default.
 static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
-        const char* env = std::getenv("RYGT_DRIVER_CACHE_MAX_MB");
+        const char* env = std::getenv("SHARED_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
             return u64{2} << 30; // FIX-GT7-049
         }
@@ -2407,7 +2407,7 @@ static u64 DriverCacheMaxBytes() {
 static bool DriverCacheFileEnabled() {
 #ifdef RYTY_GPU
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_DRIVER_CACHE");
+        const char* env = std::getenv("SHADGT_DRIVER_CACHE");
         return !(env && env[0] == '0') && DriverCacheMaxBytes() != 0;
     }();
     return enabled && EmulatorSettings.IsPipelineCacheEnabled();
@@ -2426,7 +2426,7 @@ void PipelineCache::CreateDriverCache() {
         std::error_code ec;
         if (std::filesystem::exists(unused, ec)) {
             LOG_WARNING(Render_Vulkan,
-                        "FIX-165: the driver pipeline cache file is not used (RYGT_DRIVER_CACHE=1 "
+                        "FIX-165: the driver pipeline cache file is not used (SHADGT_DRIVER_CACHE=1 "
                         "turns it on); {} ({} MB) can be deleted",
                         unused.string(), std::filesystem::file_size(unused, ec) >> 20);
         }
@@ -2500,9 +2500,9 @@ bool PipelineCache::DriverCacheOutgrown(vk::Device device, vk::PipelineCache cac
     // be saved again: the file stayed as it was and each new car or track was built again every
     // session (FIX-GT7-023), while every save still copied the whole cache out to refuse it. Its
     // size is now asked first, the file goes, and the next launch starts a new cache, as with a file
-    // over the limit (FIX-GT7-049). RYGT_DRIVER_CACHE_RESTART=0: as before.
+    // over the limit (FIX-GT7-049). SHADGT_DRIVER_CACHE_RESTART=0: as before.
     static const bool restart = [] {
-        const char* env = std::getenv("RYGT_DRIVER_CACHE_RESTART");
+        const char* env = std::getenv("SHADGT_DRIVER_CACHE_RESTART");
         return !(env && env[0] == '0');
     }();
     size_t size = 0;
@@ -2848,9 +2848,9 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, Buil
     };
     // PERF-171: tessellated pipelines (GT7's cars) are built before the other read-ahead
     // ones, so the cars appear first (after the builds of draws waiting, on screen or gone on
-    // without their pipeline). RYGT_TESS_FIRST=0 keeps them in order.
+    // without their pipeline). SHADGT_TESS_FIRST=0 keeps them in order.
     static const bool tess_first = [] {
-        const char* env = std::getenv("RYGT_TESS_FIRST");
+        const char* env = std::getenv("SHADGT_TESS_FIRST");
         return !(env && env[0] == '0');
     }();
     const bool tessellated = build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr;
@@ -3050,7 +3050,7 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
 
 bool PipelineCache::RetryReadAhead() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_READ_AHEAD_RETRY");
+        const char* env = std::getenv("SHADGT_READ_AHEAD_RETRY");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -3356,9 +3356,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return nullptr;
     }
     {
-        // DIAG-225 (diagnosis, RYGT_DIAG_AA_MASK=1): draws with no pixel shader while
+        // DIAG-225 (diagnosis, SHADGT_DIAG_AA_MASK=1): draws with no pixel shader while
         // PA_SC_AA_MASK hides pixels (the quad sample mask is applied in the pixel shader only).
-        static const bool diag = Common::DiagEnv("RYGT_DIAG_AA_MASK") != nullptr;
+        static const bool diag = Common::DiagEnv("SHADGT_DIAG_AA_MASK") != nullptr;
         const auto& r = Regs();
         if (diag && !S().infos[u32(SwStage::Fragment)] &&
             (r.reg_array[0xa30e] != ~0u || r.reg_array[0xa30f] != ~0u)) {
@@ -3783,9 +3783,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         // on the compile cores below normal priority and start no more than usual, and this
         // thread runs above normal priority on the other cores. In a GT7 race on a new track two
         // compute pipelines took 1.3-1.6 s each here, beside a catch-up's 8 compiles on every
-        // core and the driver's compiler threads. RYGT_FOREGROUND_COMPILE=0: as before.
+        // core and the driver's compiler threads. SHADGT_FOREGROUND_COMPILE=0: as before.
         static const bool foreground_on = [] {
-            const char* env = std::getenv("RYGT_FOREGROUND_COMPILE");
+            const char* env = std::getenv("SHADGT_FOREGROUND_COMPILE");
             return !(env && env[0] == '0');
         }();
         struct Foreground {
@@ -3829,7 +3829,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             const auto dir = WarmComputeDir();
             const auto file = dir / fmt::format("{:#018x}.bin", pipeline_hash);
             std::error_code ec;
-            // FIX-GT7-150 (RYGT_WARM_COMPUTE_REFRESH=0: as before): a recipe was written once and
+            // FIX-GT7-150 (SHADGT_WARM_COMPUTE_REFRESH=0: as before): a recipe was written once and
             // never again, so once a renderer update changed a program's translation the warm-up
             // went on building the old code at every start while the pipeline of the new code was
             // built here, the game waiting: on a PC whose recipes were five days old, the same 16
@@ -3839,7 +3839,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             // compared with this pipeline's code and written again when different (a recipe the
             // warm-up had not reached yet is the same, and left alone).
             static const bool refresh = [] {
-                const char* env = std::getenv("RYGT_WARM_COMPUTE_REFRESH");
+                const char* env = std::getenv("SHADGT_WARM_COMPUTE_REFRESH");
                 return !(env && env[0] == '0');
             }();
             const bool known = std::filesystem::exists(file, ec);
@@ -4631,7 +4631,7 @@ void PipelineCache::BuildOnScreen() {
 
 void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_COMPILE_CATCH_UP");
+        const char* env = std::getenv("SHADGT_COMPILE_CATCH_UP");
         return !(env && env[0] == '0');
     }();
     if (!enabled || !build_workers) {
@@ -4652,7 +4652,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // In: 3,000 skipped draws a second (100 a frame at 30 fps; a new track's start skipped up to
     // 25,000 a second for two minutes). Out: under 1,000 a second for a second.
     static const bool paced = [] {
-        const char* env = std::getenv("RYGT_CATCH_UP_PACE");
+        const char* env = std::getenv("SHADGT_CATCH_UP_PACE");
         return !(env && env[0] == '0');
     }();
     if (!c.on) {
@@ -4696,16 +4696,16 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // filled in at ~3.5 pipelines a second; on every core at ~7 (the game ~40 fps instead of ~55
     // meanwhile, a half-empty scene either way). PERF-GT7-029's catch-up stopped after a second
     // there: it counts only some skips, and a build a thread waits for on itself narrowed it.
-    // RYGT_COMPILE_BACKLOG=<n>: from n draws (256 by default, off below n / 4), 0 never.
+    // SHADGT_COMPILE_BACKLOG=<n>: from n draws (256 by default, off below n / 4), 0 never.
     static const size_t backlog_enter = [] {
-        const char* env = std::getenv("RYGT_COMPILE_BACKLOG");
+        const char* env = std::getenv("SHADGT_COMPILE_BACKLOG");
         return env && *env ? size_t(std::strtoull(env, nullptr, 10)) : size_t{256};
     }();
     // FIX-GT7-109: never in a race: with compiles on every core the game's and the
     // renderer's threads shared their cores (frames of 60-120 ms, seconds under 30 fps,
     // throttled at 30 ms a frame or not). In play (15 frames a second or more, each over
     // 19 ms: a race, not a 60 fps menu) they stay on their cores, and background compiles
-    // that read g_game_in_play pause. Measured whatever RYGT_COMPILE_BACKLOG says: the play
+    // that read g_game_in_play pause. Measured whatever SHADGT_COMPILE_BACKLOG says: the play
     // state also bounds the one-off waits and the width of the compiles.
     {
         const auto totals = Common::GetGameFrameTotals();
@@ -4737,9 +4737,9 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             // leaving a race goes through one, so the menus after it are out of play again and
             // the start-up compile pack runs there. Menus that are never slow (1,400-1,900 draws
             // on the main menu) never enter it.
-            // RYGT_PLAY_HOLD_DRAWS=<draws a frame> (1000), 0: frame time only, as before.
+            // SHADGT_PLAY_HOLD_DRAWS=<draws a frame> (1000), 0: frame time only, as before.
             static const double hold_draws = [] {
-                const char* env = std::getenv("RYGT_PLAY_HOLD_DRAWS");
+                const char* env = std::getenv("SHADGT_PLAY_HOLD_DRAWS");
                 return env && *env ? std::strtod(env, nullptr) : 1000.0;
             }();
             const bool slow = c.backlog_throttled ? ms > 17.5 : ms > 19.0;
@@ -4787,7 +4787,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // (FIX-GT7-009). In menus too (they run at 60 fps or wait for their pipelines).
     // FIX-GT7-022: past the catch-up's step back, only the read-ahead builds step back: the
     // builds of draws that went on without their pipeline keep the usual width.
-    // RYGT_CATCH_UP_PACE=0: never.
+    // SHADGT_CATCH_UP_PACE=0: never.
     if (!paced) {
         return;
     }
@@ -4980,7 +4980,7 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
     }
     // FIX-GT7-011: FIX-226 changed how float atomic min/max are made without
     // VK_EXT_shader_atomic_float2, and the stored translations kept their version: one made the
-    // other way than RYGT_FLOAT_ATOMIC_EXACT asks is translated again (GT7's occlusion depth
+    // other way than SHADGT_FLOAT_ATOMIC_EXACT asks is translated again (GT7's occlusion depth
     // pyramid came out wrong from the old way).
     if (const auto emulation = FindFloatAtomicEmulation(spv);
         emulation != FloatAtomicEmulation::None &&
@@ -5383,11 +5383,11 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
 // race signal for the GT Sport race policies (FIX-110, FIX-115): a cold Monza race start waited
 // 1.5 s for 211-233 of them, one after another (first frames 500-900 ms). Past the budget the
 // tessellated draw is skipped and comes back once its translation is done (one or two frames);
-// its factor writes are only read by the draw itself. RYGT_HS_WAIT_BUDGET_MS=<ms> (8), 0: waits
+// its factor writes are only read by the draw itself. SHADGT_HS_WAIT_BUDGET_MS=<ms> (8), 0: waits
 // as before.
 static std::chrono::milliseconds HsWaitBudget() {
     static const std::chrono::milliseconds budget = [] {
-        const char* env = std::getenv("RYGT_HS_WAIT_BUDGET_MS");
+        const char* env = std::getenv("SHADGT_HS_WAIT_BUDGET_MS");
         return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 8};
     }();
     return budget;
@@ -5501,12 +5501,12 @@ static bool CopyFetchShader(std::span<u32, Shader::ShaderParams::NumShaderUserDa
 // its key when the job was harvested, by when the game had written that memory again. GT7's map
 // markers got code made from an empty V# (every attribute 0) under the key of real ones
 // (R, G, B, A), so every car's triangle landed on one point; the translation store then kept it for
-// every later start. RYGT_PIN_FETCH_SHARPS=0: as before.
+// every later start. SHADGT_PIN_FETCH_SHARPS=0: as before.
 static std::vector<Shader::Info::PinnedFetchSharp> PinFetchSharps(
     HwStage hw_stage, SwStage sw_stage, std::span<const u32> code,
     std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data, u64 hash) {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_PIN_FETCH_SHARPS");
+        const char* env = std::getenv("SHADGT_PIN_FETCH_SHARPS");
         return !(env && env[0] == '0');
     }();
     const auto base = Shader::FetchShaderSgprBase(code);
@@ -6068,14 +6068,14 @@ PipelineCache::Result PipelineCache::GetProgramForJob(HwStage hw_stage,
 }
 
 namespace {
-// PERF-GT7-058 (RYGT_SPEC_FAST=0 off, =2 makes the specialization too and logs a packed match
+// PERF-GT7-058 (SHADGT_SPEC_FAST=0 off, =2 makes the specialization too and logs a packed match
 // it doesn't confirm): R7's last permutation is confirmed from the
 // packed inputs it last matched with. GT7's race decode made ~2.2 million specializations per
 // 10 s this way, ~1 us each with their runtime info copied and compared: ~18% of
 // its thread, with only the buffers' addresses changing from one frame to the next.
 int SpecFastMode() {
     static const int mode = [] {
-        const char* env = std::getenv("RYGT_SPEC_FAST");
+        const char* env = std::getenv("SHADGT_SPEC_FAST");
         return env && *env ? std::clamp(env[0] - '0', 0, 2) : 1;
     }();
     return mode;
@@ -6208,7 +6208,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         }
         // NEO-GT7-007: PS4 Pro programs with SDWA compares or selections, stored before they
         // were translated (only Pro code has SDWA, so the base mode never looks). Like the fixes
-        // above, only for a store other builds may have filled (RYGT_KEEP_SHADER_CACHE=1, builds
+        // above, only for a store other builds may have filled (SHADGT_KEEP_SHADER_CACHE=1, builds
         // without a commit): a player's store is cleared by SHD-010 at each new renderer.
         static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0;
         if (neo) {
@@ -6218,10 +6218,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             }
         }
     }
-    // NEO-GT7-008 (diagnosis, RYGT_NEO_CENSUS=1): the PS4 Pro encodings each program uses, at
+    // NEO-GT7-008 (diagnosis, SHADGT_NEO_CENSUS=1): the PS4 Pro encodings each program uses, at
     // its first use; DPP and the MIMG G16/A16/D16 bits are not translated yet.
     static const bool neo_census = [] {
-        const char* env = std::getenv("RYGT_NEO_CENSUS");
+        const char* env = std::getenv("SHADGT_NEO_CENSUS");
         return Libraries::Kernel::sceKernelIsNeoMode() != 0 && env && env[0] == '1';
     }();
     if (neo_census && first_use) {
@@ -6288,10 +6288,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     static const bool memo_enabled = Common::PerfFeatureEnabled(56);
     // FIX-GT7-045: a read-ahead state searches on its own. Found by the shared search, a permutation
     // that also matched the draw being processed took its place when its key was made again, and
-    // "Read-ahead changed the current pipeline key" ended the game. RYGT_READ_AHEAD_OWN_MATCH=0: as
+    // "Read-ahead changed the current pipeline key" ended the game. SHADGT_READ_AHEAD_OWN_MATCH=0: as
     // before.
     static const bool own_match = [] {
-        const char* env = std::getenv("RYGT_READ_AHEAD_OWN_MATCH");
+        const char* env = std::getenv("SHADGT_READ_AHEAD_OWN_MATCH");
         return !(env && env[0] == '0');
     }();
     const bool ahead = own_match && regs_override != nullptr;

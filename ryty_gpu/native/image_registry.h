@@ -131,7 +131,7 @@ public:
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
     std::atomic<u64> written_frame_before{0};
-    /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with RYGT_DIAG=1).
+    /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with SHARED_DIAG=1).
     std::atomic<u64> sampled_frame{0};
     std::atomic<bool> kept{false};
     std::atomic<bool> reused{false};
@@ -163,7 +163,7 @@ private:
     std::vector<std::pair<ImageViewKey, std::unique_ptr<Rhi::ImageView>>> views;
 };
 
-/// FIX-153 (diagnosis): RYGT_NATIVE_WATCH_TEXTURE=<hex address>[,<hex address>...]: whether
+/// FIX-153 (diagnosis): SHADGT_NATIVE_WATCH_TEXTURE=<hex address>[,<hex address>...]: whether
 /// [begin, end) holds one of them; what happens there (writes, unmaps, invalidations, uploads)
 /// is logged.
 bool WatchedTexture(VAddr begin, VAddr end);
@@ -448,7 +448,7 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
 /// mips or layers); mip -1: it isn't.
 SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo& whole);
 
-/// FIX-197: RYGT_NATIVE_TARGET_PARTS=0 turns target-of-targets links off (diagnosis).
+/// FIX-197: SHADGT_NATIVE_TARGET_PARTS=0 turns target-of-targets links off (diagnosis).
 bool TargetPartsOn();
 
 } // namespace Native

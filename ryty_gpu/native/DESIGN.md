@@ -65,7 +65,7 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
 ```
 
 - **Hooks (NAT-001/002, done).** Entry hooks with trampolines; counting stubs that touch no
-  registers. RYGT_NATIVE_HOOKS=1.
+  registers. SHADGT_NATIVE_HOOKS=1.
 - **JobRecorder.** One per job/command buffer. Mirrors the registers the Gnm functions set
   (reusing AmdGpu::Liverpool::Regs layouts), the bound shaders and user data. On a draw it builds
   a pipeline key and resolves resources, then records backend commands. No PM4 is decoded.
@@ -88,7 +88,7 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
 
 ## Milestones
 
-1. **N1 Hook check** (built, not run yet): race run with RYGT_NATIVE_HOOKS=1, game draws =
+1. **N1 Hook check** (built, not run yet): race run with SHADGT_NATIVE_HOOKS=1, game draws =
    renderer draws.
 2. **N2 Backend interface + Vulkan** (done, NAT-010..012): rhi.h, rhi_vulkan.cpp. Self test
    outside the game (RytyNativeRhiSelfTest, loaded from Python): pictures, four threads
@@ -131,7 +131,7 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
    the same draw packet, with the cost per draw. **N4.1** native mode for whole frames, boot
    screen and menus first. **N4.2** races, screenshots compared with the current renderer.
 
-   N4.0 so far (RYGT_NATIVE_PIPELINES=1 with shadow mode):
+   N4.0 so far (SHADGT_NATIVE_PIPELINES=1 with shadow mode):
    - NAT-030: job threads look each draw's pipeline up in shadGT's cache
      (PipelineCache::LookupBuiltPipeline: only pipelines already built; nothing translated,
      loaded, built or waited for) and the command processor compares with its own selection.

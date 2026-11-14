@@ -98,7 +98,7 @@ public:
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
-    /// PERF-111: with SHADGT_FPS_LOCK a game's submit-and-flip returns once the frames it
+    /// PERF-111: with SHARED_FPS_LOCK a game's submit-and-flip returns once the frames it
     /// submitted before are on screen, so it runs one frame ahead of the screen instead of as
     /// many as it has display buffers for (GT7 queued three: ~100 ms more input lag).
     void NoteEopFlipRequested();

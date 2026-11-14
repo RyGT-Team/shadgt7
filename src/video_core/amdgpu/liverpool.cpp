@@ -393,7 +393,7 @@ void Liverpool::StartDrawPipe() {
 #endif
     });
     // PERF-GT7-008: the native renderer's next list is begun while the recorder waits for work
-    // (in mode B only; RYGT_NATIVE_REUSE=0 or A/B mode A: as before).
+    // (in mode B only; SHADGT_NATIVE_REUSE=0 or A/B mode A: as before).
     if (rasterizer) {
         draw_pipe->SetIdleHook([this] { rasterizer->OnRecorderIdle(); });
     }
@@ -786,9 +786,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // arguments, in GPU memory, don't change it). In GT7's pause menu a fifth of the draws are
     // indirect, and the recorder selected each one itself under the lookup lock. Only the
     // pipeline: the draw's reads are neither hashed, captured nor staged ahead, as before.
-    // RYGT_INDIRECT_AHEAD=0: as before.
+    // SHADGT_INDIRECT_AHEAD=0: as before.
     static const bool indirect_ahead = [] {
-        const char* env = std::getenv("RYGT_INDIRECT_AHEAD");
+        const char* env = std::getenv("SHADGT_INDIRECT_AHEAD");
         return !(env && env[0] == '0');
     }();
     bool indirect_selected = false;
@@ -1001,10 +1001,10 @@ void Liverpool::PipeReadAhead() {
 // PERF-GT7-046: a queue's wait for a label no queued work writes stopped the command thread until
 // the recorder had finished all it was given, ~4 ms a frame on GT7's pre-race screens, and nothing
 // else decoded meanwhile. The queue now yields until the recorder has run dry, and only then asks
-// for it. RYGT_NATIVE_WAIT_NO_DRAIN=0: the wait drains the recorder at once.
+// for it. SHADGT_NATIVE_WAIT_NO_DRAIN=0: the wait drains the recorder at once.
 bool Liverpool::WaitsYieldToRecorder() const {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WAIT_NO_DRAIN");
+        const char* env = std::getenv("SHADGT_NATIVE_WAIT_NO_DRAIN");
         return !(env && env[0] == '0');
     }();
     return enabled && draw_pipe;
@@ -1705,7 +1705,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ProcessCommands();
 
         static const u32 yield_packets = [] {
-            const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
+            const char* env = std::getenv("SHADGT_GFX_YIELD_PACKETS");
             return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u;
         }();
         if (yield_packets != 0 && ++gfx_packets_since_yield >= yield_packets) {

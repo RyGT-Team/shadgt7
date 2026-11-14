@@ -56,7 +56,7 @@ void InstallGameLog(); // ryty_game_log.cpp
 
 void Ryty::RytyLibraryInitialize() {
     InitializeCommon("shadgt_np.log");
-    InstallGameLog(); // GTS-009, with RYGT_GAME_LOG=1
+    InstallGameLog(); // GTS-009, with SHARED_GAME_LOG=1
     LoginRytyUsers(); // before NpManager::RegisterLib starts NpHandler
     Core::Loader::SymbolsResolver resolver;
     using namespace Libraries::Np;

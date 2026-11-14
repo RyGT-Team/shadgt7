@@ -33,11 +33,11 @@ static constexpr u32 ShaderBinaryVersionQuadSampleMask = 34u;
 // fragment interface and interpolation; read only while that option is on.
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 35u;
 // 29/30/31 (FIX-227/228): hull shaders, whose unnormalized samples at an explicit LOD are normalized
-// by that mip's dimensions. Other stages keep their versions. RYGT_UNNORMALIZED_MIP=0: hull
+// by that mip's dimensions. Other stages keep their versions. SHADGT_UNNORMALIZED_MIP=0: hull
 // shaders as before too.
 static u32 ShaderBinaryVersionStep(Shader::SwStage stage) {
     static const u32 step = [] {
-        const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+        const char* env = std::getenv("SHADGT_UNNORMALIZED_MIP");
         return env && env[0] == '0' ? 0u : 6u;
     }();
     return stage == Shader::SwStage::TessellationControl ? step : 0u;
