@@ -148,6 +148,10 @@ static bool TranslateJobsDiag() {
 // start from the capture, replaying the reads, and compares the SPIR-V.
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): one manifest folder for every GPU (it was one per
+// <vendor>-<device>). A record names the GPU that recorded it (format 3); records of the older
+// per-GPU folders take it from the folder's name when they are merged in (MergeManifestFolders).
+static u32 g_manifest_vendor{}, g_manifest_device{}; // this GPU
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_MANIFEST_RECORD");
@@ -160,6 +164,8 @@ static_assert(std::is_trivially_copyable_v<Shader::Backend::Bindings>);
 static_assert(std::is_trivially_copyable_v<Shader::Info::PinnedFetchSharp>);
 
 struct ManifestRecord {
+    u32 origin_vendor{}; ///< FEAT-GT7-188: the GPU that recorded it (0: unknown)
+    u32 origin_device{};
     u32 hw_stage{};
     u32 sw_stage{};
     u64 hash{};
@@ -226,10 +232,10 @@ static std::vector<u32> ReadWords(const std::filesystem::path& file) {
     return words;
 }
 
-static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> code,
-                                std::span<const u32> fetch) {
+// The record file alone (FEAT-GT7-188: MergeManifestFolders writes records without their code).
+static bool WriteManifestRecordFile(const ManifestRecord& r) {
     std::vector<u8> out(ManifestMagic, ManifestMagic + sizeof(ManifestMagic));
-    PutPod(out, u32{2});
+    PutPod(out, u32{3});
     PutPod(out, r.hw_stage);
     PutPod(out, r.sw_stage);
     PutPod(out, r.hash);
@@ -258,9 +264,12 @@ static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> co
     PutPod(out, r.instance_offset_sgpr);
     PutPod(out, u32(r.attributes.size()));
     for (const auto& attribute : r.attributes) PutPod(out, attribute);
+    PutPod(out, r.origin_vendor); // format 3 (FEAT-GT7-188)
+    PutPod(out, r.origin_device);
     const auto file = g_manifest_dir / fmt::format("{:016x}-{:016x}.rec", r.hash, r.spv_xxh);
     std::error_code ec;
-    if (!std::filesystem::exists(file, ec)) {
+    bool written = std::filesystem::exists(file, ec);
+    if (!written) {
         std::filesystem::create_directories(file.parent_path(), ec);
         auto temporary = file;
         temporary += fmt::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
@@ -269,8 +278,20 @@ static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> co
             std::fclose(f);
             if (ok) std::filesystem::rename(temporary, file, ec);
             if (!ok || ec) std::filesystem::remove(temporary, ec);
+            written = ok && !ec;
         }
     }
+    return written;
+}
+
+static void WriteManifestRecord(const ManifestRecord& record, std::span<const u32> code,
+                                std::span<const u32> fetch) {
+    ManifestRecord r = record;
+    if (r.origin_vendor == 0) { // recorded here (FEAT-GT7-188)
+        r.origin_vendor = g_manifest_vendor;
+        r.origin_device = g_manifest_device;
+    }
+    WriteManifestRecordFile(r);
     // The local capture: the game's code, for this PC only.
     WriteWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh), code);
     if (!fetch.empty()) {
@@ -295,7 +316,7 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
     }
     size_t at = 8;
     u32 version = 0, pins = 0, spans = 0, bytes = 0;
-    if (!GetPod(in, at, version) || (version != 1 && version != 2) ||
+    if (!GetPod(in, at, version) || version < 1 || version > 3 ||
         !GetPod(in, at, r.hw_stage) ||
         !GetPod(in, at, r.sw_stage) || !GetPod(in, at, r.hash) || !GetPod(in, at, r.code_xxh) ||
         !GetPod(in, at, r.code_words) || !GetPod(in, at, r.spv_xxh) ||
@@ -333,6 +354,9 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
     r.attributes.resize(count);
     for (auto& attribute : r.attributes) {
         if (!GetPod(in, at, attribute)) return false;
+    }
+    if (version >= 3 && (!GetPod(in, at, r.origin_vendor) || !GetPod(in, at, r.origin_device))) {
+        return false; // FEAT-GT7-188
     }
     return at == in.size();
 }
@@ -1513,6 +1537,10 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
             ++failed;
             continue;
         }
+        // FEAT-GT7-188: another GPU's SPIR-V hash can't match one made here.
+        if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) {
+            continue;
+        }
         ++records;
         spv_hashes.insert(r.spv_xxh);
         auto code = ReadWords(code_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
@@ -1598,6 +1626,77 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
 // store starts empty: SHD-010), from the local code, and stores them as a draw's translation
 // would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
 // their translations. A record is stored only when every guest read replays as recorded.
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): the per-GPU folders (<vendor>-<device>) of older
+// manifests, merged into the one folder: each record rewritten there with the folder's GPU as its
+// origin. A folder whose records were all merged is renamed <vendor>-<device>.merged, so nothing
+// is deleted. Only record files are written, never the code capture.
+static void MergeManifestFolders() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<fs::path> folders;
+    for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+        const auto name = entry.path().filename().string();
+        unsigned vendor = 0, device = 0;
+        char rest = 0;
+        if (entry.is_directory() && name.size() == 9 &&
+            std::sscanf(name.c_str(), "%4x-%4x%c", &vendor, &device, &rest) == 2) {
+            folders.push_back(entry.path());
+        }
+    }
+    for (const auto& folder : folders) {
+        unsigned vendor = 0, device = 0;
+        std::sscanf(folder.filename().string().c_str(), "%4x-%4x", &vendor, &device);
+        u64 merged = 0, failed = 0;
+        for (const auto& entry : fs::directory_iterator(folder, ec)) {
+            if (entry.path().extension() != ".rec") {
+                continue;
+            }
+            ManifestRecord r;
+            if (!ReadManifestRecord(entry.path(), r)) {
+                ++failed;
+                continue;
+            }
+            if (r.origin_vendor == 0) {
+                r.origin_vendor = vendor;
+                r.origin_device = device;
+            }
+            if (WriteManifestRecordFile(r)) {
+                ++merged;
+            } else {
+                ++failed;
+            }
+        }
+        if (failed == 0) {
+            auto renamed = folder;
+            renamed += ".merged";
+            fs::rename(folder, renamed, ec);
+        }
+        LOG_WARNING(Render_Vulkan, "FEAT-GT7-188: manifest folder {} merged: {} records, {} not merged{}",
+                    folder.filename().string(), merged, failed, failed ? " (folder kept)" : "");
+    }
+}
+
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): a record another GPU made carries that GPU's
+// device-dependent runtime fields; a draw here builds them from this GPU's profile, so as made they
+// never match (in GT Sport, a Radeon 610M with an RTX 4070's records: 372 of 800 translations in
+// game differed only in vertex_order_check). Made this GPU's for the common case; a draw outside it
+// translates as before (a miss, never wrong: the translation is always made here, with this
+// profile).
+static void NormalizeForeignRecord(ManifestRecord& r, const Shader::Profile& profile) {
+    if (Shader::HwStage(r.hw_stage) != Shader::HwStage::Fragment) {
+        return;
+    }
+    auto& fs = r.runtime_info.hw.fs;
+    // AMD-307: on wherever the profile checks the vertex order, unless the draw is tessellation
+    // emulated or its exports reach location 30 (neither recorded; both rare).
+    fs.vertex_order_check = profile.vertex_order_check;
+    // Clip distances are emulated only where the profile needs it (NVIDIA). Where it does, a
+    // record without them stays as it is: whether the draw had clip distances isn't recorded.
+    if (!profile.needs_clip_distance_emulation) {
+        fs.clip_distance_emulation = false;
+    }
+}
+
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
     SCOPE_EXIT {
@@ -1614,6 +1713,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         if (entry.path().extension() == ".rec") files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
+    // FEAT-GT7-188: the folder holds every GPU's records; another GPU's are made this GPU's
+    // (NormalizeForeignRecord). RYGT_MANIFEST_FOREIGN=0: this GPU's records only.
+    const char* foreign_env = std::getenv("RYGT_MANIFEST_FOREIGN");
+    const bool use_foreign = !(foreign_env && foreign_env[0] == '0');
     g_pretranslate_total = files.size(); // FEAT-GT7-187
     g_pretranslate_done = 0;
     g_pretranslate_active = !files.empty();
@@ -1623,7 +1726,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
-    std::atomic<u32> in_use{0};
+    std::atomic<u32> in_use{0}, foreign{0};
     std::mutex mutex;
     struct Stored {
         u32 next_idx = 0;
@@ -1644,6 +1747,13 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
                 ++failed; // geometry shaders: see the recording
                 continue;
+            }
+            if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) {
+                if (!use_foreign) {
+                    continue; // FEAT-GT7-188
+                }
+                NormalizeForeignRecord(r, profile);
+                ++foreign;
             }
             {
                 std::scoped_lock lk{mutex};
@@ -1770,11 +1880,11 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
                 "for programs already stored or in use, {} duplicates, {} with reads not replayed "
                 "as recorded (not stored), {} without local code, {} failed; {} programs in use "
-                "left alone",
+                "left alone; {} records from other GPUs (FEAT-GT7-188)",
                 files.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
-                no_code.load(), failed.load(), in_use.load());
+                no_code.load(), failed.load(), in_use.load(), foreign.load());
 }
 
 // PERF-GT7-037: GT7 uses the same few compute pipelines in every race, some of which take the
@@ -2337,9 +2447,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // PERF-GT7-111 : the manifest and capture folders, and the start-up verification.
         const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
         const auto serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-        const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
-        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
+        // FEAT-GT7-188: one folder for every GPU's records; older per-GPU folders merged into it.
+        g_manifest_vendor = instance.GetVendorID();
+        g_manifest_device = instance.GetDeviceID();
+        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        const char* verify_on = std::getenv("RYGT_MANIFEST_VERIFY");
+        const char* pretranslate_on = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
+        if (ManifestRecordOn() || (verify_on && verify_on[0] == '1') ||
+            (pretranslate_on && pretranslate_on[0] == '1')) {
+            try {
+                MergeManifestFolders(); // FEAT-GT7-188, before the threads that read the folder
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render_Vulkan, "FEAT-GT7-188: manifest merge stopped: {}", e.what());
+            }
+        }
         const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
         if (verify && verify[0] == '1') {
             verify_thread = std::jthread([this](std::stop_token stop) { VerifyManifest(stop); });
@@ -6302,6 +6424,115 @@ std::optional<PipelineCache::TessLocation> PipelineCache::KnownTessLocation(u64 
     return std::nullopt;
 }
 
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): with recording on, a draw's first use of a stored
+// translation records it too. A record was written only when a translation was made, so
+// translations stored before recording began never got one (in GT Sport 665 of an RTX 4070's
+// 10,670 stored programs; a Radeon replaying its manifest then translated 421 of them in game).
+// The frontend runs once under this draw's state for its guest reads, on copies of the code and
+// the fetch shader as QueueTranslation makes them; its result is dropped. Lookup lock held. The
+// SPIR-V hash is the stored binary's, so verification compares against it.
+void PipelineCache::RecordStoredUse(HwStage hw_stage, SwStage sw_stage,
+                                    const Shader::ShaderParams& params,
+                                    const Shader::RuntimeInfo& runtime_info,
+                                    const Shader::Backend::Bindings& start, size_t perm_idx) {
+    if (!ManifestRecordOn() || g_manifest_dir.empty() || regs_override || t_lookup_only ||
+        sw_stage == SwStage::Geometry) {
+        return;
+    }
+    static std::unordered_set<u64> looked_at;
+    if (!looked_at.insert(HashCombine(params.hash, u64{perm_idx})).second) {
+        return;
+    }
+    std::vector<u32> stored_spv;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                                       fmt::format("{:#018x}_{}", params.hash, perm_idx),
+                                       stored_spv);
+    if (stored_spv.empty()) {
+        return;
+    }
+    const u64 spv_xxh = XXH3_64bits(stored_spv.data(), stored_spv.size() * sizeof(u32));
+    std::error_code ec;
+    if (std::filesystem::exists(
+            g_manifest_dir / fmt::format("{:016x}-{:016x}.rec", params.hash, spv_xxh), ec)) {
+        return; // recorded already
+    }
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    std::ranges::copy(params.user_data, user_data.begin());
+    std::vector<u32> code(params.code.size());
+#ifdef RYTY_GPU
+    if (!Core::RytyMemory::GuardedCopy(code.data(), params.code.data(), params.code.size_bytes())) {
+        return;
+    }
+#else
+    std::ranges::copy(params.code, code.begin());
+#endif
+    std::vector<u32> fetch_copy;
+    if ((hw_stage == HwStage::Vertex || hw_stage == HwStage::Export ||
+         hw_stage == HwStage::Local) &&
+        !CopyFetchShader(user_data, code, fetch_copy)) {
+        return;
+    }
+    const Shader::ShaderParams owned{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = code,
+        .hash = params.hash,
+    };
+    Shader::Info info{hw_stage, sw_stage, owned};
+    if (!fetch_copy.empty()) {
+        info.pinned_fetch_sharps = PinFetchSharps(hw_stage, sw_stage, code, user_data, params.hash);
+    }
+    auto compiled_runtime = runtime_info;
+    Shader::Pools pools;
+    Common::GuestReadLog read_log;
+    Common::t_guest_read_log = &read_log;
+    try {
+        Common::RecoverableScope recoverable;
+        [[maybe_unused]] const auto program =
+            Shader::TranslateProgram(code, pools, info, compiled_runtime, profile);
+        // The reads of its specialization too, as a recording worker logs them.
+        [[maybe_unused]] const Shader::StageSpecialization spec{info, runtime_info, profile, start};
+    } catch (const Common::RecoverableFailure&) {
+        Common::t_guest_read_log = nullptr;
+        return;
+    }
+    Common::t_guest_read_log = nullptr;
+    ManifestRecord rec;
+    rec.hw_stage = u32(hw_stage);
+    rec.sw_stage = u32(sw_stage);
+    rec.hash = params.hash;
+    rec.code_words = u32(code.size());
+    rec.code_xxh = XXH3_64bits(code.data(), code.size() * sizeof(u32));
+    rec.spv_xxh = spv_xxh;
+    rec.runtime_info = runtime_info;
+    rec.user_data = user_data;
+    if (!fetch_copy.empty()) {
+        if (const auto base = Shader::FetchShaderSgprBase(code)) {
+            rec.fetch_base = *base;
+        }
+        rec.fetch_words = u32(fetch_copy.size());
+        rec.fetch_xxh = XXH3_64bits(fetch_copy.data(), fetch_copy.size() * 4);
+    }
+    rec.start = start;
+    if (info.has_fetch_shader) {
+        Shader::Gcn::FetchShaderData fetch;
+        rec.has_fetch_data = true;
+        rec.fetch_ok = Shader::Gcn::ParseFetchShader(info, fetch);
+        rec.fetch_size = fetch.size;
+        rec.vertex_offset_sgpr = fetch.vertex_offset_sgpr;
+        rec.instance_offset_sgpr = fetch.instance_offset_sgpr;
+        rec.attributes.assign(fetch.attributes.begin(), fetch.attributes.end());
+    }
+    rec.pinned = info.pinned_fetch_sharps;
+    rec.spans = std::move(read_log.spans);
+    rec.bytes = std::move(read_log.bytes);
+    WriteManifestRecord(rec, code, fetch_copy);
+    static u64 recorded = 0;
+    if (++recorded <= 3 || recorded % 100 == 0) {
+        LOG_INFO(Render_Vulkan, "FEAT-GT7-188: {} stored translations recorded on first use",
+                 recorded);
+    }
+}
+
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
@@ -7208,6 +7439,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                 memo.valid = false;
                 continue;
             }
+            // FEAT-GT7-188: binding is still the stage's start here (bindings are added below).
+            RecordStoredUse(hw_stage, sw_stage, params, runtime_info, binding, perm_idx);
         }
         if (memo_stage && !memo_usable) {
             memo.valid = true;

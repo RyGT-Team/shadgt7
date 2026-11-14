@@ -74,6 +74,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_FOREGROUND_COMPILE|flag|Shader compiling|on|0 = off|A compute pipeline the GPU waits for builds above normal priority while other compiles stay throttled (PERF-GT7-032).",
     "RYGTSW1|RYGT_GPL|flag|Shader compiling|on|0 = off|Uses shared pipeline libraries with fast linking for tessellated pipelines (PERF-GT7-040 port); 0 turns them off.",
     "RYGTSW1|RYGT_KEPT_SHADOW_MAPS|flag|Shader compiling|on|0 = off|Draws into a track's whole-circuit shadow map wait for their pipeline and the map stays in video memory while unused (512 MB at most), so a first visit keeps far shadows (FIX-GT7-153).",
+    "RYGTSW1|RYGT_MANIFEST_FOREIGN|flag|Shader compiling|on|0 = this GPU's records only|Pre-translation also uses the manifest records other GPUs made, adjusted for this GPU (FEAT-GT7-188).",
     "RYGTSW1|RYGT_MANIFEST_PRETRANSLATE|flag|Shader compiling|off|1 = on (needs the shader store)|At start, pre-translates shaders listed in the recorded manifest on a background thread (PERF-GT7-117).",
     "RYGTSW1|RYGT_MANIFEST_RECORD|flag|Shader compiling|off|1 = on|Writes a manifest record (and a local capture of the code) for each translated shader, for later pre-translation (PERF-GT7-111).",
     "RYGTSW1|RYGT_NATIVE_ONE_OFF_FRAMES|int|Shader compiling|64|frames; 4 = old behaviour|A picture drawn within this many frames counts as redrawn regularly, so its draw may skip during compiles (PERF-165).",

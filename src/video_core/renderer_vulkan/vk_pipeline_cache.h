@@ -699,6 +699,11 @@ private:
                               Program& program, const Shader::ShaderParams& params,
                               const Shader::RuntimeInfo& runtime_info,
                               const Shader::Backend::Bindings& binding, bool insert);
+    /// FEAT-GT7-188: records a stored translation on a draw's first use (record mode).
+    void RecordStoredUse(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& start, size_t perm_idx);
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
