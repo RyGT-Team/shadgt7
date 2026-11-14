@@ -157,6 +157,30 @@ InterfaceConstants FindInterfaceWhite(std::span<const u32> code) {
 }
 } // namespace
 
+namespace {
+std::mutex identity_mutex;
+std::unordered_map<VkShaderModule, u64> module_identity; // FIX-GT7-186
+u64 next_identity = 1;
+} // namespace
+
+u64 ModuleIdentity(vk::ShaderModule module) {
+    std::scoped_lock lock{identity_mutex};
+    const auto it = module_identity.find(static_cast<VkShaderModule>(module));
+    return it != module_identity.end()
+               ? it->second
+               : (u64(reinterpret_cast<uintptr_t>(static_cast<VkShaderModule>(module))) |
+                  (u64{1} << 63));
+}
+
+void ForgetModule(vk::ShaderModule module) {
+    {
+        std::scoped_lock lock{identity_mutex};
+        module_identity.erase(static_cast<VkShaderModule>(module));
+    }
+    std::scoped_lock lock{code_mutex};
+    module_code.erase(static_cast<VkShaderModule>(module));
+}
+
 std::vector<u32> ModuleCode(vk::ShaderModule module) {
     std::scoped_lock lock{code_mutex};
     const auto it = module_code.find(static_cast<VkShaderModule>(module));
@@ -187,9 +211,15 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, bool k
     auto [module_result, module] = device.createShaderModule(shader_info);
     ASSERT_MSG(module_result == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}",
                vk::to_string(module_result));
+    {
+        std::scoped_lock lock{identity_mutex}; // FIX-GT7-186
+        module_identity[static_cast<VkShaderModule>(module)] = next_identity++;
+    }
+    std::scoped_lock lock{code_mutex};
     if (keep_code) {
-        std::scoped_lock lock{code_mutex};
         module_code[static_cast<VkShaderModule>(module)].assign(code.begin(), code.end());
+    } else {
+        module_code.erase(static_cast<VkShaderModule>(module)); // FIX-GT7-186: a reused handle
     }
     return module;
 }

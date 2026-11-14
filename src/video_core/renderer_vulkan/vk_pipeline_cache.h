@@ -522,6 +522,26 @@ private:
     std::atomic<u64> prewarm_read{};
     std::atomic<u64> prewarm_total{};
     std::atomic<bool> prewarm_reader_done{};
+    /// FIX-GT7-186 (from shadGT FIX-GTS-468): stored pipelines the workers finished building. The
+    /// command thread takes them out of pending_builds (AdoptPrewarmed), where every precompiled
+    /// pipeline no draw used stayed for the whole session.
+    std::mutex prewarm_finished_mutex;
+    std::vector<std::weak_ptr<PipelineBuild>> prewarm_finished;
+    std::atomic<bool> prewarm_finished_any{};
+    /// FIX-GT7-186: kept stored pipelines (the first RYGT_PRECOMPILE_KEEP) no draw has used yet.
+    /// The first draw that uses one stores its key again, as a draw taking it from pending_builds
+    /// does (PERF-038).
+    tsl::robin_map<GraphicsPipelineKey, GraphicsPipeline::SerializationSupport> prewarm_unclaimed;
+    u64 prewarm_adopted{};
+    u64 prewarm_dropped{};
+    void AdoptPrewarmed();
+    /// FIX-GT7-186: the shader modules the precompile made (program hash, permutation). Once it is
+    /// done, the ones no live pipeline uses go back to being stored (loaded again on first use).
+    std::vector<std::pair<u64, size_t>> prewarm_loaded;
+    /// FIX-GT7-186: programs the precompile listed (a normal start lists only the ones its draws
+    /// use). Dropped with the modules when nothing uses them; a draw lists them again.
+    std::vector<u64> prewarm_programs;
+    void ReleasePrewarmModules();
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);

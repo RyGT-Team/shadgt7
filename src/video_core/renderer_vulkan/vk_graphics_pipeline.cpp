@@ -1238,7 +1238,7 @@ GraphicsPipeline::GraphicsPipeline(
         }
         for (const auto& stage_info : pre_raster_stages) {
             pre_raster_key.Add(stage_info.stage);
-            pre_raster_key.Add(static_cast<VkShaderModule>(stage_info.module));
+            pre_raster_key.Add(ModuleIdentity(stage_info.module)); // FIX-GT7-186
         }
         pre_raster_key.Add(tessellation_state.patchControlPoints);
         pre_raster_key.Add(
@@ -1257,7 +1257,7 @@ GraphicsPipeline::GraphicsPipeline(
         // SHD-002: the fragment stage's set only.
         fragment_key.Add(set_layout_hashes[Shader::Backend::StageSet(u32(Shader::SwStage::Fragment))]);
         for (const auto& stage_info : fragment_stages) {
-            fragment_key.Add(static_cast<VkShaderModule>(stage_info.module));
+            fragment_key.Add(ModuleIdentity(stage_info.module)); // FIX-GT7-186
         }
         // SHD-004: a fragment shader library doesn't depend on the attachments: of
         // VkPipelineRenderingCreateInfo only the view mask is part of its state (formats are
