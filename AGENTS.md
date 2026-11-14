@@ -15,8 +15,9 @@ From FEAT-GT7-175 on, an environment switch is named after where it takes effect
 - **A switch that starts being read on the other side too** is renamed to `SHARED_` in every
   repository (renderer, runtime, launcher, docs), and added to `SHARED` in the renderer's
   `tools/switch_prefix.py`.
-- **The rename is a hard one**: the old names are not read any more. The launcher moves settings
-  saved under an old name to the new one (`SwitchWalker.MigratePrefixes`), so players keep them.
+- **The rename is a hard one**: the old names are not read any more. At start the launchers list
+  switches saved under an old name in their obsolete-settings question and rename them on Yes
+  (`SwitchWalker.FindRenames`), so players keep their settings.
 - **A branch from before the rename** brings old names back on merge. Run the tool there after
   merging; a second run changes nothing:
 
@@ -48,10 +49,10 @@ Fields, separated by `|` (only the description may contain `|`):
 |---|---|
 | `RYGTSW1` | Format tag; always this. |
 | name | The exact variable name. |
-| kind | `flag` (0/1 or presence), `int`, `hex`, `float` or `string`. Picks the launcher's editor and validation. |
+| kind | `flag` (0/1 or presence), `int`, `hex`, `float`, `string` or `choice`. Picks the launcher's editor and validation. Use `choice` (FEAT-GT7-176) when the switch takes only a fixed set of values: the launcher shows a dropdown instead of a text box, where anything else would be ignored. |
 | group | One of: `Shader objects & caches`, `Shader compiling`, `Native recorder & sync`, `Memory & VRAM`, `Tessellation`, `Frame pacing & present`, `Rendering workarounds`, `AMD`, `NVIDIA`, `Runtime`, `Diagnostics & tracing` (hidden until the user asks; use it for logs, traces, dumps and stats). |
 | default | What happens when the variable is not set (`off`, `on`, `300`, ...). |
-| values | What the accepted values mean; say "Diagnostics builds only", "Debug builds only" or "any value turns it on" when true. |
+| values | What the accepted values mean; say "Diagnostics builds only", "Debug builds only" or "any value turns it on" when true. For a `choice`, only the values, separated by `; `: `value` or `value = meaning`, and `A..B` for every whole number from A to B (e.g. `0 = off; 1 = log; 2 = per frame`, `1..8`); put any other note in the description. |
 | description | One plain sentence, about 150 characters at most, for a user deciding whether to set it. Say if it slows the game or writes large logs. |
 
 **Switches the ryGT7 runtime reads** (`core/` in rygt7: libkernel, libc, libScePad, libSceNet,
