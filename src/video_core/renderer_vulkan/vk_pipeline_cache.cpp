@@ -1672,11 +1672,6 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
                 with_misses, from_description);
 }
 
-// PERF-GT7-117 : RYGT_MANIFEST_PRETRANSLATE=1 translates at start, in the background, the
-// manifest's records whose program the shader store does not have (after a renderer update the
-// store starts empty: SHD-010), from the local code, and stores them as a draw's translation
-// would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
-// their translations. A record is stored only when every guest read replays as recorded.
 // FEAT-GT7-188 (from shadGT FEAT-GTS-470): the per-GPU folders (<vendor>-<device>) of older
 // manifests, merged into the one folder: each record rewritten there with the folder's GPU as its
 // origin. A folder whose records were all merged is renamed <vendor>-<device>.merged, so nothing
@@ -1748,6 +1743,11 @@ static void NormalizeForeignRecord(ManifestRecord& r, const Shader::Profile& pro
     }
 }
 
+// PERF-GT7-117 : RYGT_MANIFEST_PRETRANSLATE (on unless =0, FEAT-GT7-191) translates at start, the
+// manifest's records whose program the shader store does not have (after a renderer update the
+// store starts empty: SHD-010), from the local code, and stores them as a draw's translation
+// would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
+// their translations. A record is stored only when every guest read replays as recorded.
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
     SCOPE_EXIT {
@@ -2531,10 +2531,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
         g_programs_dir = cache_dir / fmt::format("{}-programs", serial); // FEAT-GT7-188
+        // FEAT-GT7-191 (from shadGT FEAT-GTS-478): pre-translation is on unless
+        // RYGT_MANIFEST_PRETRANSLATE=0: the manifest's records the shader store lacks (this PC's
+        // own after a renderer update, or a shipped manifest) are translated on the splash screen.
+        const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
+        pretranslate_wanted = !(pretranslate && pretranslate[0] == '0');
         const char* verify_on = std::getenv("RYGT_MANIFEST_VERIFY");
-        const char* pretranslate_on = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
-        if (ManifestRecordOn() || (verify_on && verify_on[0] == '1') ||
-            (pretranslate_on && pretranslate_on[0] == '1')) {
+        if (ManifestRecordOn() || (verify_on && verify_on[0] == '1') || pretranslate_wanted) {
             try {
                 MergeManifestFolders(); // FEAT-GT7-188, before the threads that read the folder
             } catch (const std::exception& e) {
@@ -2545,8 +2548,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         if (verify && verify[0] == '1') {
             verify_thread = std::jthread([this](std::stop_token stop) { VerifyManifest(stop); });
         }
-        const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
-        pretranslate_wanted = pretranslate && pretranslate[0] == '1';
     }
     if (WarmComputeOn()) { // PERF-GT7-037
         warm_compute_thread =
