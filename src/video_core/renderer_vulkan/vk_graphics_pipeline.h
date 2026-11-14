@@ -96,7 +96,8 @@ public:
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
-                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata);
+                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
+                     bool preloading = false);
     ~GraphicsPipeline();
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
@@ -167,7 +168,7 @@ public:
                          u32 step_rate_1, const Shader::Info& vs_info) const;
 
 private:
-    void BuildDescSetLayout();
+    void BuildDescSetLayout(bool preloading);
 
 public:
     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so

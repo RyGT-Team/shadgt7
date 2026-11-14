@@ -107,8 +107,8 @@ bool IsPaused();
 /// Marks the calling thread as the GPU command thread, whose compile waits hold the clocks.
 void MarkGpuCommandThread();
 
-/// Holds the guest clocks from any thread until ReleaseHold (PERF-103 compile slow motion).
-/// No-op when FIX-044 is off.
+/// Holds the guest clocks from any thread until ReleaseHold (PERF-103 compile slow motion, and
+/// FEAT-GT7-185's shader precompile on the splash screen). No-op when FIX-044 is off.
 void TakeHold();
 void ReleaseHold();
 

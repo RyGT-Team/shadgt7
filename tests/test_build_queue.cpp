@@ -203,3 +203,93 @@ TEST(BuildQueue, MaxRunningNarrows) {
     second.join();
     EXPECT_TRUE(got.load());
 }
+
+// FEAT-GT7-185 (from shadGT PERF-038): background jobs (stored pipelines) run after the others,
+// on at most max_background workers, and not while paused.
+TEST(BuildQueue, BackgroundRunsLast) {
+    BuildQueue queue{4, 1};
+    std::vector<std::string> order;
+    queue.Push([&] { order.push_back("background"); }, BuildQueue::Kind::Background);
+    queue.Push([&] { order.push_back("normal"); }, BuildQueue::Kind::Normal);
+    queue.Push([&] { order.push_back("urgent"); }, BuildQueue::Kind::Urgent);
+    std::stop_source stop;
+    for (int i = 0; i < 3; ++i) {
+        BuildQueue::Job job;
+        bool background = false;
+        ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
+        job();
+        if (background) {
+            queue.FinishedBackground();
+        } else {
+            queue.Finished();
+        }
+    }
+    EXPECT_EQ(order, (std::vector<std::string>{"urgent", "normal", "background"}));
+    EXPECT_EQ(queue.Pending(), 0u);
+}
+
+TEST(BuildQueue, BackgroundJobsAreCapped) {
+    BuildQueue queue{4, 1};
+    for (int i = 0; i < 3; ++i) {
+        queue.Push([] {}, BuildQueue::Kind::Background);
+    }
+    std::stop_source stop;
+    BuildQueue::Job job;
+    bool background = false;
+    ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
+    EXPECT_TRUE(background);
+    std::atomic<bool> got{};
+    std::thread second{[&] {
+        BuildQueue::Job next;
+        bool next_background = false;
+        if (queue.Pop(next, next_background, stop.get_token())) {
+            EXPECT_TRUE(next_background);
+            got = true;
+            queue.FinishedBackground();
+        }
+    }};
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(got.load()) << "only one background job runs at a time";
+    queue.FinishedBackground();
+    second.join();
+    EXPECT_TRUE(got.load());
+    EXPECT_EQ(queue.BackgroundQueued(), 1u);
+}
+
+TEST(BuildQueue, BoostWidensBackground) {
+    BuildQueue queue{4, 1, 3};
+    for (int i = 0; i < 3; ++i) {
+        queue.Push([] {}, BuildQueue::Kind::Background);
+    }
+    queue.SetBoost(true);
+    std::stop_source stop;
+    for (int i = 0; i < 3; ++i) {
+        BuildQueue::Job job;
+        bool background = false;
+        ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
+        EXPECT_TRUE(background);
+    }
+    EXPECT_EQ(queue.BackgroundQueued(), 0u);
+    for (int i = 0; i < 3; ++i) {
+        queue.FinishedBackground();
+    }
+}
+
+TEST(BuildQueue, PauseHoldsBackgroundButNotNormalJobs) {
+    BuildQueue queue{4, 1};
+    queue.Push([] {}, BuildQueue::Kind::Background);
+    const auto start = BuildQueue::Clock::now();
+    queue.PauseBackground(start + 100ms);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    std::stop_source stop;
+    BuildQueue::Job job;
+    bool background = true;
+    ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
+    EXPECT_FALSE(background);
+    queue.Finished();
+    EXPECT_LT(BuildQueue::Clock::now() - start, 50ms);
+    ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
+    EXPECT_TRUE(background);
+    EXPECT_GE(BuildQueue::Clock::now() - start, 100ms) << "background waited out the pause";
+    queue.FinishedBackground();
+}
