@@ -76,5 +76,71 @@ int main() {
     stopping = false;
     put(0xb4, 0.0f);
     Check(!Decode(raw.data(), decoded), "invalid radii rejected");
-    std::cout << "PASS: telemetry decoding, lock/spin/TCS, gating, expiry, DualSense report\n";
+    // FEAT-GT7-179: resistance that follows the car.
+    Check(BrakeFirmness(0, 0) < BrakeFirmness(30, 0) && BrakeFirmness(30, 0) < BrakeFirmness(30, 10),
+          "brake firms up when moving and more when slowing hard");
+    Check(BrakeFirmness(30, 20) == BrakeFirmness(30, 10), "brake firmness tops out at about 1 g");
+    auto first_zone = [](const Effect& effect) {
+        const unsigned zones = effect[1] | (unsigned{effect[2]} << 8);
+        for (unsigned i = 0; i < 10; ++i) if (zones & (1u << i)) return i;
+        return 10u;
+    };
+    const auto idle = DynamicResistance(true, 100, BrakeFirmness(0, 0));
+    const auto hard = DynamicResistance(true, 100, BrakeFirmness(30, 10));
+    Check(idle[0] == 0x21 && hard[0] == 0x21, "dynamic resistance is a feedback effect");
+    Check(first_zone(hard) + 3 <= first_zone(idle), "hard braking engages much earlier in the pull");
+    Check(DynamicResistance(true, 0, 1)[0] == 5, "zero slider releases the dynamic brake");
+    Sample revs;
+    revs.rpm_limit = 8000;
+    const auto now = Clock::now();
+    revs.rpm = 2000;
+    const float low = ThrottleFirmness(revs, false, now);
+    revs.rpm = 7000;
+    Check(ThrottleFirmness(revs, false, now) > low + 0.5f, "accelerator stiffens clearly with the revs");
+    Check(first_zone(DynamicResistance(false, 100, ThrottleFirmness(revs, false, now))) <
+          first_zone(DynamicResistance(false, 100, low)), "high revs engage the accelerator earlier");
+    Check(ThrottleFirmness(revs, true, now) == 0, "accelerator lets go during a gear change");
+    revs.rpm = 8000;
+    revs.throttle = 255;
+    bool pulses = false;
+    const float first = ThrottleFirmness(revs, false, now);
+    for (int ms = 0; ms < 200; ms += 10)
+        pulses |= ThrottleFirmness(revs, false, now + std::chrono::milliseconds(ms)) != first;
+    Check(pulses, "accelerator pulses on the rev limiter");
+    // FEAT-GT7-179: each trigger slider.
+    {
+        Sample driving;
+        driving.flags = 1;
+        driving.speed = 30;
+        driving.radius.fill(0.3f);
+        driving.omega.fill(-100);
+        driving.omega[0] = -50; // a locked front-left wheel
+        driving.brake = 255;
+        Input::Feel::Settings settings;
+        Check(Compute(driving, 0, false, now, settings).left[0] == 0x26, "lock vibrates the brake trigger");
+        settings.lock = 0;
+        Check(Compute(driving, 0, false, now, settings).left[0] == 0x21, "lock at 0: resistance instead of vibration");
+        settings.brake = 0;
+        Check(Compute(driving, 0, false, now, settings).left[0] == 5, "brake at 0 releases the brake trigger");
+        Check(Compute(driving, 0, false, now, settings).right[0] == 0x21, "accelerator keeps its resistance");
+        settings = {};
+        settings.throttle = 0;
+        driving.omega.fill(-100);
+        Check(Compute(driving, 0, false, now, settings).right[0] == 5, "throttle at 0 releases the accelerator");
+        settings = {};
+        settings.dynamic = 0;
+        Check(WithDynamic(BrakeFirmness(0, 0), 0) == WithDynamic(BrakeFirmness(30, 10), 0), "dynamic at 0 holds one firmness");
+        Check(WithDynamic(0.2f, 200) < WithDynamic(0.2f, 100) && WithDynamic(0.8f, 200) > WithDynamic(0.8f, 100),
+              "dynamic above 100 exaggerates the changes");
+        settings = {};
+        settings.trigger = 0;
+        Check(Compute(driving, 0, false, now, settings).left[0] == 5 && Compute(driving, 0, false, now, settings).right[0] == 5,
+              "trigger strength 0 releases both");
+        driving.omega[2] = -150; // wheelspin
+        settings = {};
+        settings.spin = 0;
+        Check(Compute(driving, 0, false, now, settings).right[0] == 0x21, "spin at 0: resistance instead of vibration");
+    }
+    const auto light = Vibration(20);
+    Check(((light[3] >> 3) & 7) >= 3, "light lock or slip is still a firm vibration");    std::cout << "PASS: telemetry decoding, lock/spin/TCS, gating, expiry, DualSense report, dynamic resistance\n";
 }

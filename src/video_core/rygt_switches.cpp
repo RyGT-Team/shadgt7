@@ -290,6 +290,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NEO_PIXEL_RATE|flag|NVIDIA|on in the PS4 Pro mode|0 = off, as before|In the PS4 Pro mode, a draw with more depth samples than colour samples runs its pixel shader per pixel on NVIDIA, which avoids a GPU loss (NEO-GT7-005).",
     // Runtime
     "RYGTSW1|RYGT_ADAPTIVE_TRIGGERS|flag|Runtime|on while the launcher's trigger strength slider is above 0%|0 = off; 1 = on even with the slider at 0%|GT7 adaptive trigger effects from telemetry, scaled by the launcher's trigger strength slider; 0 turns them off, 1 forces them on at 0%.",
+    "RYGTSW1|RYGT_HAPTICS_LOG|flag|Diagnostics & tracing|off|1 = on|Logs what the telemetry haptics see (suspension bumps, acceleration, slip, engine) twice a second while driving, to stderr. For tuning only.",
     "RYGTSW1|RYGT_ADAPTIVE_TRIGGERS_REPLAY|flag|Runtime|off|1 = on|Adaptive trigger effects also run in replays and demos, to check them without driving. For testing.",
     "RYGTSW1|RYGT_ARCADE_MEMORY|flag|Runtime|on|0 = off; GT7 only|GT7 Arcade remembers the last course, weather and car across launches (FIX-GT7-060). 0 turns it off.",
     "RYGTSW1|RYGT_DECALS|flag|Runtime|on|0 = off|GT Sport feature (GTS-006): copies SVGs from the decals folder to temp0\\decals; the script patch that lists them targets GT Sport, not GT7.",
