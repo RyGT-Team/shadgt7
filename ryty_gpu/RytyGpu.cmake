@@ -29,6 +29,7 @@ set(RYTY_COMMON_SOURCES
     ryty_gpu/ryty_library.cpp
     ryty_gpu/ryty_core_shims.cpp
     ryty_gpu/ryty_stubs.cpp
+    ryty_gpu/ryty_app0.cpp
     src/core/file_format/npbind.cpp
 )
 # shadGT's Discord presence is not part of the Ryty build.
@@ -105,6 +106,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/imgui/renderer/texture_manager.cpp
         # FIX-GT7-100: the compile notice shown while the game shows no new frame.
         src/imgui/compile_notice_layer.cpp
+        # FEAT-GT7-186: the trophy pop-up; libSceNpAuth.prx calls its RytyTrophyToast export.
+        src/imgui/trophy_toast_layer.cpp
         src/sdl_window.cpp
         ${INPUT}
         src/core/debug_state.cpp
@@ -235,6 +238,7 @@ endforeach()
 ryty_add_library(ryty_np libSceNpAuth
     EXPORT_SOURCES ${RYTY_NP_EXPORT_SOURCES}
     SOURCES ${RYTY_NP_SOURCES} ${SHADNET} ryty_gpu/ryty_np_entry.cpp ryty_gpu/ryty_np_shims.cpp ryty_gpu/ryty_np_p2p.cpp ryty_gpu/ryty_game_log.cpp
+            ryty_gpu/ryty_trophy.cpp src/core/file_format/trp.cpp # FEAT-GT7-185
             ryty_gpu/ryty_hle_stubs.cpp src/core/libraries/network/net_upnp.cpp
             src/core/libraries/network/net_util.cpp
 )

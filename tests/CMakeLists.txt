@@ -648,3 +648,9 @@ foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS LINK_L
     endif()
 endforeach()
 add_test(NAME wave64_guard_regression COMMAND shadgt_wave64_guard_regression)
+
+# FIX-GT7-175: /app0 folder stack for sce_sys files.
+add_executable(shadps4_ryty_app0_test test_ryty_app0.cpp ${CMAKE_SOURCE_DIR}/ryty_gpu/ryty_app0.cpp)
+target_include_directories(shadps4_ryty_app0_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(shadps4_ryty_app0_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_ryty_app0_test)

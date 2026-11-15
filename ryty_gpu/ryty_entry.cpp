@@ -36,6 +36,7 @@
 #include "core/signals.h"
 #include "core/loader/symbols_resolver.h"
 #include "input/controller.h"
+#include "ryty_gpu/ryty_app0.h"
 #include "ryty_gpu/ryty_framegen.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "ryty_gpu/ryty_input_bridge.h"
@@ -82,8 +83,10 @@ void RunWindowThread() {
                                       EmulatorSettings.GetWindowHeight(), controllers,
                                       "ryGT7 - Gran Turismo 7");
     // Use the installed game's icon rather than embedding game artwork in the renderer.
-    const auto icon_path = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
-                           "app0" / "sce_sys" / "icon0.png";
+    // FIX-GT7-175: through the /app0 folder stack, as the game's files are no longer linked there.
+    const auto icon_path =
+        Ryty::App0File(Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path(),
+                       std::filesystem::path("sce_sys") / "icon0.png");
     Common::FS::IOFile icon_file{icon_path, Common::FS::FileAccessMode::Read};
     std::vector<u8> icon;
     if (icon_file.IsOpen()) {
@@ -559,8 +562,9 @@ void Ryty::RytyLibraryInitialize() {
         // has one; GT Sport's when there is none), so GT7 shows as GT7.
         std::string title = "Gran Turismo Sport";
         std::string serial = "CUSA03220";
-        const auto sfo = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
-                         "app0" / "sce_sys" / "param.sfo";
+        const auto sfo =
+            Ryty::App0File(Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path(),
+                           std::filesystem::path("sce_sys") / "param.sfo"); // FIX-GT7-175
         std::error_code error;
         if (PSF psf; std::filesystem::exists(sfo, error) && psf.Open(sfo)) {
             if (const auto name = psf.GetString("TITLE")) {
