@@ -1271,6 +1271,11 @@ set(INPUT src/input/controller.cpp
           src/input/input_handler.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
+          src/input/dualsense_audio.h
+          src/input/feel_settings.h
+          src/input/telemetry_haptics.h
+          src/input/telemetry_haptics_output.cpp
+          src/input/telemetry_haptics_output.h
 )
 
 set(EMULATOR src/emulator.cpp

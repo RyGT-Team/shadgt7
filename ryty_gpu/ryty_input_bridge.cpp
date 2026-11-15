@@ -231,23 +231,33 @@ std::uint8_t ClampAxis(s32 value) {
     return static_cast<std::uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
 }
 
-unsigned TriggerStrength() {
-    // The launcher writes per-game Input settings. Read at most once per second,
-    // so the slider can be adjusted while driving without restarting the game.
+// FEAT-GT7-179: the launcher's HD rumble & adaptive trigger settings (Input.trigger_strength and the
+// other Input::Feel keys), each 0-200 with 100 when missing. Read at most once per second, so the
+// sliders can be adjusted while driving without restarting the game; the telemetry haptics read
+// them through Input::Feel::Get().
+Input::Feel::Settings FeelSettings() {
     static auto next = std::chrono::steady_clock::time_point{};
-    static unsigned percent = 100;
+    static Input::Feel::Settings settings;
     const auto now = std::chrono::steady_clock::now();
-    if (now < next) return percent;
+    if (now < next) return settings;
     next = now + std::chrono::seconds(1);
     const auto config = nlohmann::json::parse(ReadGameConfig(), nullptr, false);
-    if (config.is_discarded() || !config.is_object()) return percent;
+    if (config.is_discarded() || !config.is_object()) return settings;
+    Input::Feel::Settings read;
     const auto input = config.find("Input");
-    if (input == config.end() || !input->is_object()) return percent = 100;
-    const auto value = input->find("trigger_strength");
-    if (value == input->end() || !value->is_number_integer()) return percent = 100;
-    // Clamp using a wide type before conversion, including hand-edited JSON.
-    if (value->is_number_unsigned()) return percent = static_cast<unsigned>(std::min(value->get<std::uint64_t>(), std::uint64_t{200}));
-    return percent = static_cast<unsigned>(std::clamp(value->get<std::int64_t>(), std::int64_t{0}, std::int64_t{200}));
+    if (input != config.end() && input->is_object()) {
+        for (const auto& key : Input::Feel::Keys) {
+            const auto value = input->find(key.name);
+            if (value == input->end() || !value->is_number_integer()) continue;
+            // Clamp using a wide type before conversion, including hand-edited JSON.
+            read.*key.field = value->is_number_unsigned()
+                                  ? static_cast<unsigned>(std::min(value->get<std::uint64_t>(), std::uint64_t{200}))
+                                  : Input::Feel::Clamp(value->get<std::int64_t>());
+        }
+    }
+    settings = read;
+    Input::Feel::Set(settings);
+    return settings;
 }
 
 void ForwardInput() {
@@ -360,9 +370,11 @@ void ForwardInput() {
                 const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
                 return env && env[0] == '1';
             }();
-            const unsigned slider = TriggerStrength();
+            auto feel = FeelSettings();
+            const unsigned slider = feel.trigger;
             const unsigned strength = forced && slider == 0 ? 100 : slider;
-            const auto feedback = slot == 0 ? Input::TriggerFeedback::CurrentOutput(strength)
+            feel.trigger = strength;
+            const auto feedback = slot == 0 ? Input::TriggerFeedback::CurrentOutput(feel)
                                            : Input::TriggerFeedback::Output{};
             u8 left_rumble = feedback.left_rumble, right_rumble = feedback.right_rumble;
             auto left = feedback.left, right = feedback.right;

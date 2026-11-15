@@ -246,3 +246,13 @@ target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
 foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
     target_sources(${target} PRIVATE ryty_gpu/ryty_hle_overlay_stub.cpp)
 endforeach()
+
+# FEAT-GT7-179: ryty-feel-test, the launcher's Test buttons for HD rumble and the adaptive triggers
+# (shipped in tools\). It plays one effect through the same headers the renderer uses.
+add_executable(ryty_feel_test ryty_gpu/tools/feel_test.cpp)
+set_target_properties(ryty_feel_test PROPERTIES OUTPUT_NAME ryty-feel-test)
+target_include_directories(ryty_feel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(ryty_feel_test PRIVATE SDL3::SDL3)
+if (MSVC)
+    target_link_libraries(ryty_feel_test PRIVATE clang_rt.builtins-x86_64.lib)
+endif()
