@@ -24,6 +24,10 @@ namespace Vulkan {
 /// FIX-GT7-030: this thread builds a pipeline a draw is waiting for: it does not wait for another
 /// build's shared libraries.
 inline thread_local bool g_pipeline_build_urgent = false;
+/// FEAT-GT7-188 (from shadGT FEAT-GTS-470): this thread builds a precompile pipeline only for its
+/// stage libraries (into the driver cache): no link, so the pipeline has no handle and is never
+/// drawn with.
+inline thread_local bool g_pipeline_libraries_only = false;
 
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;
@@ -96,7 +100,8 @@ public:
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
-                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata);
+                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
+                     bool preloading = false);
     ~GraphicsPipeline();
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
@@ -167,12 +172,17 @@ public:
                          u32 step_rate_1, const Shader::Info& vs_info) const;
 
 private:
-    void BuildDescSetLayout();
+    void BuildDescSetLayout(bool preloading);
+    bool link_skipped{}; ///< FEAT-GT7-188
 
 public:
     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
     /// they never take cores from pipelines a draw is waiting for.
     static void NotePipelineMiss();
+    /// FEAT-GT7-188: built with g_pipeline_libraries_only: no linked pipeline.
+    bool LinkSkipped() const noexcept {
+        return link_skipped;
+    }
 
     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
     /// cached infos once it is used.

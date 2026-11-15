@@ -10,6 +10,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <map>
 #include <mutex>
 #include <set>
 #include <ranges>
@@ -46,8 +47,11 @@
 #include "video_core/renderer_vulkan/compile_pack.h"
 #include "video_core/renderer_vulkan/compile_pack_pipeline.h"
 #include "video_core/renderer_vulkan/shader_object_cache.h"
+#include "video_core/renderer_vulkan/bounded_read_cache.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/ordered_parallel_read.h"
+#include "video_core/renderer_vulkan/pipeline_retention_budget.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -56,7 +60,11 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "common/scope_exit.h"
 #include "ryty_gpu/ryty_diag.h"
+#ifdef _WIN32
+#include <windows.h> // FIX-GT7-186: GlobalMemoryStatusEx
+#endif
 
 namespace Shader::Optimization {
 extern thread_local std::span<const u32> g_diag_compiling_code;
@@ -136,14 +144,25 @@ static bool TranslateJobsDiag() {
 // PERF-GT7-111 : the precompile manifest. A record per translation made on a worker:
 // its inputs and the guest reads it made (descriptors, the SRT walker's output: values, no code),
 // and its SPIR-V's hash. The code and the fetch shader go to a local capture, never into a record.
-// RYGT_MANIFEST_RECORD=1 writes them; RYGT_MANIFEST_VERIFY=1 translates every record again at
-// start from the capture, replaying the reads, and compares the SPIR-V.
+// RYGT_MANIFEST_RECORD (on unless =0, FEAT-GT7-188) writes them; RYGT_MANIFEST_VERIFY=1 translates
+// every record again at start from the capture, replaying the reads, and compares the SPIR-V.
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): one manifest folder for every GPU (it was one per
+// <vendor>-<device>). A record names the GPU that recorded it (format 3); records of the older
+// per-GPU folders take it from the folder's name when they are merged in (MergeManifestFolders).
+static u32 g_manifest_vendor{}, g_manifest_device{}; // this GPU
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): <serial>-programs, programs a launcher copied out of this
+// PC's game files (<hash>.bin, from the first instruction through the 32-byte footer).
+static std::filesystem::path g_programs_dir;
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): on by default (RYGT_MANIFEST_RECORD=0 turns it off):
+// every translation and every stored one a draw first uses gets a record, so the manifest covers
+// what was played and a pre-translation after a renderer or driver update, here or on another
+// GPU, misses less.
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_MANIFEST_RECORD");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     return on;
 }
@@ -152,6 +171,8 @@ static_assert(std::is_trivially_copyable_v<Shader::Backend::Bindings>);
 static_assert(std::is_trivially_copyable_v<Shader::Info::PinnedFetchSharp>);
 
 struct ManifestRecord {
+    u32 origin_vendor{}; ///< FEAT-GT7-188: the GPU that recorded it (0: unknown)
+    u32 origin_device{};
     u32 hw_stage{};
     u32 sw_stage{};
     u64 hash{};
@@ -218,10 +239,10 @@ static std::vector<u32> ReadWords(const std::filesystem::path& file) {
     return words;
 }
 
-static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> code,
-                                std::span<const u32> fetch) {
+// The record file alone (FEAT-GT7-188: MergeManifestFolders writes records without their code).
+static bool WriteManifestRecordFile(const ManifestRecord& r) {
     std::vector<u8> out(ManifestMagic, ManifestMagic + sizeof(ManifestMagic));
-    PutPod(out, u32{2});
+    PutPod(out, u32{3});
     PutPod(out, r.hw_stage);
     PutPod(out, r.sw_stage);
     PutPod(out, r.hash);
@@ -250,9 +271,12 @@ static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> co
     PutPod(out, r.instance_offset_sgpr);
     PutPod(out, u32(r.attributes.size()));
     for (const auto& attribute : r.attributes) PutPod(out, attribute);
+    PutPod(out, r.origin_vendor); // format 3 (FEAT-GT7-188)
+    PutPod(out, r.origin_device);
     const auto file = g_manifest_dir / fmt::format("{:016x}-{:016x}.rec", r.hash, r.spv_xxh);
     std::error_code ec;
-    if (!std::filesystem::exists(file, ec)) {
+    bool written = std::filesystem::exists(file, ec);
+    if (!written) {
         std::filesystem::create_directories(file.parent_path(), ec);
         auto temporary = file;
         temporary += fmt::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
@@ -261,8 +285,40 @@ static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> co
             std::fclose(f);
             if (ok) std::filesystem::rename(temporary, file, ec);
             if (!ok || ec) std::filesystem::remove(temporary, ec);
+            written = ok && !ec;
         }
     }
+    return written;
+}
+
+// A record's code: from the local capture (`dir`) or, when it doesn't have it (a manifest from
+// elsewhere: records carry no code), from the program copied out of this PC's game files, cut to
+// the record's length and taken only when its hash is the record's (FEAT-GT7-188).
+static std::vector<u32> ReadRecordCode(const std::filesystem::path& dir, u64 hash, u64 code_xxh,
+                                       u32 code_words) {
+    auto code = ReadWords(dir / fmt::format("{:016x}-{:016x}.code", hash, code_xxh));
+    if (code.size() == code_words || g_programs_dir.empty()) {
+        return code;
+    }
+    auto program = ReadWords(g_programs_dir / fmt::format("{:016x}.bin", hash));
+    if (program.size() < code_words) {
+        return code;
+    }
+    program.resize(code_words);
+    if (XXH3_64bits(program.data(), program.size() * sizeof(u32)) != code_xxh) {
+        return code;
+    }
+    return program;
+}
+
+static void WriteManifestRecord(const ManifestRecord& record, std::span<const u32> code,
+                                std::span<const u32> fetch) {
+    ManifestRecord r = record;
+    if (r.origin_vendor == 0) { // recorded here (FEAT-GT7-188)
+        r.origin_vendor = g_manifest_vendor;
+        r.origin_device = g_manifest_device;
+    }
+    WriteManifestRecordFile(r);
     // The local capture: the game's code, for this PC only.
     WriteWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh), code);
     if (!fetch.empty()) {
@@ -287,7 +343,7 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
     }
     size_t at = 8;
     u32 version = 0, pins = 0, spans = 0, bytes = 0;
-    if (!GetPod(in, at, version) || (version != 1 && version != 2) ||
+    if (!GetPod(in, at, version) || version < 1 || version > 3 ||
         !GetPod(in, at, r.hw_stage) ||
         !GetPod(in, at, r.sw_stage) || !GetPod(in, at, r.hash) || !GetPod(in, at, r.code_xxh) ||
         !GetPod(in, at, r.code_words) || !GetPod(in, at, r.spv_xxh) ||
@@ -325,6 +381,9 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
     r.attributes.resize(count);
     for (auto& attribute : r.attributes) {
         if (!GetPod(in, at, attribute)) return false;
+    }
+    if (version >= 3 && (!GetPod(in, at, r.origin_vendor) || !GetPod(in, at, r.origin_device))) {
+        return false; // FEAT-GT7-188
     }
     return at == in.size();
 }
@@ -705,6 +764,33 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
 #endif
 
+// FEAT-GT7-185 (from shadGT PERF-098): precompile progress.
+static std::atomic<u64> g_precompile_total{};
+static std::atomic<u64> g_precompile_done{};
+
+// FEAT-GT7-185 (from shadGT PERF-102): while the precompile runs at start, the game waits on the splash screen (its clocks
+// held, so it sees no time pass), as if the splash screen were frozen until it is done.
+static std::atomic<bool> g_precompile_hold{};
+
+bool PrecompileHoldsGame() {
+    return g_precompile_hold.load(std::memory_order_relaxed);
+}
+
+// FEAT-GT7-188: when the hold was taken, for the splash's length in the log.
+static std::atomic<s64> g_precompile_hold_since_ms{};
+
+static void ReleasePrecompileHold() {
+    if (g_precompile_hold.exchange(false)) {
+        Common::GuestClock::ReleaseHold();
+        const s64 since = g_precompile_hold_since_ms.load();
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done after {:.1f} s; the game continues",
+                    since ? double(now - since) / 1000.0 : 0.0);
+    }
+}
+
 // PERF-103: compile slow motion. While draws are skipped because their pipeline is still being
 // built, the guest clocks run at a quarter speed: held 3 ms of every 4 (no vblank passes while
 // held, so the game's frame rate drops with it), so a long compile looks like slow motion.
@@ -761,17 +847,47 @@ static void SlowMotionThread(std::stop_token stop) {
     }
 }
 
+// FEAT-GT7-187 (from shadGT FEAT-GTS-469): the manifest pre-translation's progress, for its bar
+// (ryty_entry.cpp).
+static std::atomic<u64> g_pretranslate_total{};
+static std::atomic<u64> g_pretranslate_done{};
+static std::atomic<bool> g_pretranslate_active{};
+// FEAT-GT7-187: from the thread's start to its end (including its first wait), so the splash
+// precompile can wait for it and build what it translated.
+static std::atomic<bool> g_pretranslate_pending{};
+
+PrecompileProgress GetPretranslateProgress() {
+    const u64 total = g_pretranslate_total.load(std::memory_order_relaxed);
+    const u64 done = std::min(total, g_pretranslate_done.load(std::memory_order_relaxed));
+    return {total, done, g_pretranslate_active.load(std::memory_order_relaxed)};
+}
+
+PrecompileProgress GetPrecompileProgress() {
+    const u64 total = g_precompile_total.load(std::memory_order_relaxed);
+    const u64 done = std::min(total, g_precompile_done.load(std::memory_order_relaxed));
+    return {total, done, total != 0 && done < total};
+}
+
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
+// FEAT-GT7-185 (from shadGT PERF-038): stored pipelines are built in the background on a few of
+// them, at low priority.
 class PipelineCache::PipelineBuildWorkers {
 public:
-    PipelineBuildWorkers() : queue{CompileConcurrency()} {
+    PipelineBuildWorkers()
+        : queue{CompileConcurrency(), std::max(1u, NumWorkers() / 4), AllCores()} {
         // Concurrent driver pipeline compilations stay bounded (the queue's limit): large bursts
         // can overwhelm the driver while the game and its pipeline linker use the GPU.
+        // FEAT-GT7-188 (from shadGT FEAT-GTS-470): on the splash screen (the queue's boost) the
+        // game is held, so the precompile builds on every worker, as shadGT's does (there 16
+        // startup workers took a Radeon 610M from 8.2 to 15.1 pipelines a second).
         for (u32 i = 0; i < AllCores(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
     }
     ~PipelineBuildWorkers() {
+        if (boost_wide) {
+            Common::SetCompileCoresWide(false); // FEAT-GT7-188
+        }
         for (auto& thread : threads) {
             thread.request_stop();
         }
@@ -780,6 +896,26 @@ public:
 
     void Push(std::function<void()>&& job, BuildQueue::Kind kind) {
         queue.Push(std::move(job), kind);
+    }
+    void PushBackground(std::function<void()>&& job) {
+        queue.Push(std::move(job), BuildQueue::Kind::Background);
+    }
+    void PauseBackground(BuildQueue::Clock::time_point until) {
+        queue.PauseBackground(until);
+    }
+    void SetBoost(bool on) {
+        queue.SetBoost(on);
+        // FEAT-GT7-188 (from shadGT FEAT-GTS-470): while the splash precompile runs the game is
+        // held, so compiles use every core. PERF-GT7-024 keeps them on the compile cores for play
+        // (3 of 8 on a Ryzen 7 7745HX in shadGT, where 16 startup workers then shared 6 logical
+        // processors at half the CPU). Counted as SetCompileCoresWide's other callers.
+        if (on != boost_wide) {
+            boost_wide = on;
+            Common::SetCompileCoresWide(on);
+        }
+    }
+    size_t BackgroundQueued() {
+        return queue.BackgroundQueued();
     }
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
@@ -903,6 +1039,7 @@ private:
     bool backlog = false; ///< FIX-GT7-106
     bool in_play = false; ///< FIX-GT7-109
     u32 pace = 64; ///< PERF-GT7-034: no limit
+    bool boost_wide = false; ///< FEAT-GT7-188: SetBoost widened the compile cores
 
     static u32 AllCores() {
         return std::max(std::thread::hardware_concurrency(), NumWorkers());
@@ -936,9 +1073,13 @@ private:
         static const bool backlog_cores = Common::PerfFeatureEnabled(160);
         while (true) {
             BuildQueue::Job job;
-            if (!queue.Pop(job, stop)) {
+            bool background = false;
+            if (!queue.Pop(job, background, stop)) {
                 return;
             }
+            // PERF-102: while the game waits on the splash screen for the precompile, every core
+            // builds (and at normal priority); afterwards only the efficiency cores.
+            const bool boosted = queue.Boosted();
             if (backlog_cores) {
                 const size_t pending = queue.Pending();
                 if (pending >= 16) {
@@ -951,8 +1092,11 @@ private:
             // (in a race, compiles on every core slowed the game and the recorder by ~40%);
             // every core only while a draw waits for its pipeline.
             // FIX-GT7-109: never in a race, on hybrid CPUs (PERF-160's backlog) too.
-            const bool want_all = !g_game_in_play.load(std::memory_order_relaxed) &&
-                                  ((backlog && Common::HybridCpu()) || Common::CompileCoresWide());
+            // FEAT-GT7-185: every core while the splash screen's precompile is boosted.
+            const bool want_all =
+                boosted ||
+                (!g_game_in_play.load(std::memory_order_relaxed) &&
+                 ((backlog && Common::HybridCpu()) || Common::CompileCoresWide()));
             if (want_all != all_cores) {
                 all_cores = want_all;
                 if (all_cores) {
@@ -963,14 +1107,19 @@ private:
             }
             // PERF-GT7-032: below normal during a catch-up too, and while a thread builds a
             // pipeline the GPU waits for (from the next job: one takes up to a second).
-            const bool want_low = backlog || Common::CompileThreadsLow();
+            // FEAT-GT7-185: background builds too, except on the splash screen (boosted).
+            const bool want_low = !boosted && (background || backlog || Common::CompileThreadsLow());
             if (want_low != low_priority) {
                 low_priority = want_low;
                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
                                                               : Common::ThreadPriority::Normal);
             }
             job();
-            queue.Finished();
+            if (background) {
+                queue.FinishedBackground();
+            } else {
+                queue.Finished();
+            }
         }
     }
 
@@ -994,6 +1143,10 @@ struct PipelineCache::PipelineBuild {
     std::shared_future<void> done;
     std::chrono::steady_clock::time_point queued;
     bool urgent{};
+    // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
+    bool preloading{};
+    // FEAT-GT7-188: a precompile build of only the stage libraries (PrecompileLibrariesOnly).
+    bool libraries_only{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
     // Whoever sets this first builds the pipeline: a worker, or the command thread when a
@@ -1435,9 +1588,13 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
             ++failed;
             continue;
         }
+        // FEAT-GT7-188: another GPU's SPIR-V hash can't match one made here.
+        if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) {
+            continue;
+        }
         ++records;
         spv_hashes.insert(r.spv_xxh);
-        auto code = ReadWords(code_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+        auto code = ReadRecordCode(code_dir, r.hash, r.code_xxh, r.code_words); // FEAT-GT7-188
         std::vector<u32> fetch;
         Shader::Gcn::FetchOverride fetch_override;
         if (r.has_fetch_data) {
@@ -1515,13 +1672,87 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
                 with_misses, from_description);
 }
 
-// PERF-GT7-117 : RYGT_MANIFEST_PRETRANSLATE=1 translates at start, in the background, the
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): the per-GPU folders (<vendor>-<device>) of older
+// manifests, merged into the one folder: each record rewritten there with the folder's GPU as its
+// origin. A folder whose records were all merged is renamed <vendor>-<device>.merged, so nothing
+// is deleted. Only record files are written, never the code capture.
+static void MergeManifestFolders() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<fs::path> folders;
+    for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+        const auto name = entry.path().filename().string();
+        unsigned vendor = 0, device = 0;
+        char rest = 0;
+        if (entry.is_directory() && name.size() == 9 &&
+            std::sscanf(name.c_str(), "%4x-%4x%c", &vendor, &device, &rest) == 2) {
+            folders.push_back(entry.path());
+        }
+    }
+    for (const auto& folder : folders) {
+        unsigned vendor = 0, device = 0;
+        std::sscanf(folder.filename().string().c_str(), "%4x-%4x", &vendor, &device);
+        u64 merged = 0, failed = 0;
+        for (const auto& entry : fs::directory_iterator(folder, ec)) {
+            if (entry.path().extension() != ".rec") {
+                continue;
+            }
+            ManifestRecord r;
+            if (!ReadManifestRecord(entry.path(), r)) {
+                ++failed;
+                continue;
+            }
+            if (r.origin_vendor == 0) {
+                r.origin_vendor = vendor;
+                r.origin_device = device;
+            }
+            if (WriteManifestRecordFile(r)) {
+                ++merged;
+            } else {
+                ++failed;
+            }
+        }
+        if (failed == 0) {
+            auto renamed = folder;
+            renamed += ".merged";
+            fs::rename(folder, renamed, ec);
+        }
+        LOG_WARNING(Render_Vulkan, "FEAT-GT7-188: manifest folder {} merged: {} records, {} not merged{}",
+                    folder.filename().string(), merged, failed, failed ? " (folder kept)" : "");
+    }
+}
+
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): a record another GPU made carries that GPU's
+// device-dependent runtime fields; a draw here builds them from this GPU's profile, so as made they
+// never match (in GT Sport, a Radeon 610M with an RTX 4070's records: 372 of 800 translations in
+// game differed only in vertex_order_check). Made this GPU's for the common case; a draw outside it
+// translates as before (a miss, never wrong: the translation is always made here, with this
+// profile).
+static void NormalizeForeignRecord(ManifestRecord& r, const Shader::Profile& profile) {
+    if (Shader::HwStage(r.hw_stage) != Shader::HwStage::Fragment) {
+        return;
+    }
+    auto& fs = r.runtime_info.hw.fs;
+    // AMD-307: on wherever the profile checks the vertex order, unless the draw is tessellation
+    // emulated or its exports reach location 30 (neither recorded; both rare).
+    fs.vertex_order_check = profile.vertex_order_check;
+    // Clip distances are emulated only where the profile needs it (NVIDIA). Where it does, a
+    // record without them stays as it is: whether the draw had clip distances isn't recorded.
+    if (!profile.needs_clip_distance_emulation) {
+        fs.clip_distance_emulation = false;
+    }
+}
+
+// PERF-GT7-117 : RYGT_MANIFEST_PRETRANSLATE (on unless =0, FEAT-GT7-191) translates at start, the
 // manifest's records whose program the shader store does not have (after a renderer update the
 // store starts empty: SHD-010), from the local code, and stores them as a draw's translation
 // would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
 // their translations. A record is stored only when every guest read replays as recorded.
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
+    SCOPE_EXIT {
+        g_pretranslate_pending = false; // FEAT-GT7-187
+    };
     SleepUnlessStopped(stop, std::chrono::seconds{2});
     if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
@@ -1533,25 +1764,56 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         if (entry.path().extension() == ".rec") files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
+    // FEAT-GT7-188: the folder holds every GPU's records; another GPU's are made this GPU's
+    // (NormalizeForeignRecord). RYGT_MANIFEST_FOREIGN=0: this GPU's records only.
+    const char* foreign_env = std::getenv("RYGT_MANIFEST_FOREIGN");
+    const bool use_foreign = !(foreign_env && foreign_env[0] == '0');
+    g_pretranslate_total = files.size(); // FEAT-GT7-187
+    g_pretranslate_done = 0;
+    g_pretranslate_active = !files.empty();
+    SCOPE_EXIT {
+        g_pretranslate_active = false;
+    };
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
-    std::atomic<u32> in_use{0};
+    std::atomic<u32> in_use{0}, foreign{0};
     std::mutex mutex;
     struct Stored {
         u32 next_idx = 0;
         std::vector<Shader::StageSpecialization> specs;
+        std::vector<size_t> perms; // FEAT-GT7-188: the permutation each spec was stored at
     };
+    // FEAT-GT7-188 (from shadGT FEAT-GTS-470): which local permutation each record became
+    // (program, the record's SPIR-V hash, permutation), for other GPUs' pipeline recipes.
+    std::vector<std::array<u64, 3>> recipe_perms;
     std::unordered_map<u64, Stored> programs;
+    // FEAT-GT7-187: while the splash precompile holds the game for it, every logical processor
+    // translates at normal priority; during play up to 4 low-priority threads, as before.
+    const bool held = PrecompileHoldsGame();
     const auto work = [&] {
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Common::SetCurrentThreadPriority(held ? Common::ThreadPriority::Normal
+                                              : Common::ThreadPriority::Low);
+        // FEAT-GT7-188: and on every core (without a set of its own a thread runs on the process
+        // default, the game's cores only when a core owner is set, PERF-GT7-048).
+        if (held) {
+            Common::AllowAllCores();
+        }
         Shader::Pools pools;
         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
+            ++g_pretranslate_done; // FEAT-GT7-187: counted as taken up
             ManifestRecord r;
             if (!ReadManifestRecord(files[i], r) ||
                 Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
                 ++failed; // geometry shaders: see the recording
                 continue;
+            }
+            if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) {
+                if (!use_foreign) {
+                    continue; // FEAT-GT7-188
+                }
+                NormalizeForeignRecord(r, profile);
+                ++foreign;
             }
             {
                 std::scoped_lock lk{mutex};
@@ -1566,7 +1828,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                     continue;
                 }
             }
-            auto code = ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+            auto code = ReadRecordCode(g_capture_dir, r.hash, r.code_xxh, r.code_words); // FEAT-GT7-188
             if (code.size() != r.code_words) {
                 ++no_code;
                 continue;
@@ -1637,7 +1899,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 ++in_use; // the game took the program up meanwhile: left alone from here
                 continue;
             }
-            if (std::ranges::find(program.specs, *spec) != program.specs.end()) {
+            if (const auto same = std::ranges::find(program.specs, *spec);
+                same != program.specs.end()) {
+                recipe_perms.push_back(
+                    {r.hash, r.spv_xxh, program.perms[size_t(same - program.specs.begin())]});
                 ++duplicate;
                 continue;
             }
@@ -1662,10 +1927,13 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                                perm_idx);
             RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
             program.specs.push_back(std::move(*spec));
+            program.perms.push_back(perm_idx);
+            recipe_perms.push_back({r.hash, r.spv_xxh, perm_idx});
             ++stored;
         }
     };
-    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    const u32 count = held ? std::max(1u, std::thread::hardware_concurrency())
+                           : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
     std::vector<std::thread> threads;
     for (u32 t = 0; t < count; ++t) {
         threads.emplace_back(work);
@@ -1673,15 +1941,28 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     for (auto& thread : threads) {
         thread.join();
     }
+    if (!recipe_perms.empty()) {
+        // FEAT-GT7-188: appended; a later start finds these programs stored and skips them. The
+        // store's clear (SHD-010) removes it with the translations it names.
+        const auto path = Storage::DataBase::Instance().StorePath() / "recipe-perms.txt";
+        if (std::FILE* f = std::fopen(path.string().c_str(), "ab")) {
+            for (const auto& [pgm, spv_xxh, perm] : recipe_perms) {
+                std::fprintf(f, "%016llx %016llx %llu\n", static_cast<unsigned long long>(pgm),
+                             static_cast<unsigned long long>(spv_xxh),
+                             static_cast<unsigned long long>(perm));
+            }
+            std::fclose(f);
+        }
+    }
     LOG_WARNING(Render_Vulkan,
                 "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
                 "for programs already stored or in use, {} duplicates, {} with reads not replayed "
                 "as recorded (not stored), {} without local code, {} failed; {} programs in use "
-                "left alone",
+                "left alone; {} records from other GPUs (FEAT-GT7-188)",
                 files.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
-                no_code.load(), failed.load(), in_use.load());
+                no_code.load(), failed.load(), in_use.load(), foreign.load());
 }
 
 // PERF-GT7-037: GT7 uses the same few compute pipelines in every race, some of which take the
@@ -2244,15 +2525,29 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // PERF-GT7-111 : the manifest and capture folders, and the start-up verification.
         const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
         const auto serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-        const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
-        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
+        // FEAT-GT7-188: one folder for every GPU's records; older per-GPU folders merged into it.
+        g_manifest_vendor = instance.GetVendorID();
+        g_manifest_device = instance.GetDeviceID();
+        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        g_programs_dir = cache_dir / fmt::format("{}-programs", serial); // FEAT-GT7-188
+        // FEAT-GT7-191 (from shadGT FEAT-GTS-478): pre-translation is on unless
+        // RYGT_MANIFEST_PRETRANSLATE=0: the manifest's records the shader store lacks (this PC's
+        // own after a renderer update, or a shipped manifest) are translated on the splash screen.
+        const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
+        pretranslate_wanted = !(pretranslate && pretranslate[0] == '0');
+        const char* verify_on = std::getenv("RYGT_MANIFEST_VERIFY");
+        if (ManifestRecordOn() || (verify_on && verify_on[0] == '1') || pretranslate_wanted) {
+            try {
+                MergeManifestFolders(); // FEAT-GT7-188, before the threads that read the folder
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render_Vulkan, "FEAT-GT7-188: manifest merge stopped: {}", e.what());
+            }
+        }
         const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
         if (verify && verify[0] == '1') {
             verify_thread = std::jthread([this](std::stop_token stop) { VerifyManifest(stop); });
         }
-        const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
-        pretranslate_wanted = pretranslate && pretranslate[0] == '1';
     }
     if (WarmComputeOn()) { // PERF-GT7-037
         warm_compute_thread =
@@ -2306,6 +2601,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             Storage::DataBase::Instance().Open();
             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
             if (pretranslate_wanted && use_stored_shaders) { // PERF-GT7-117
+                g_pretranslate_pending = true; // FEAT-GT7-187, before the precompile starts
                 pretranslate_thread =
                     std::jthread([this](std::stop_token stop) { PretranslateManifest(stop); });
             }
@@ -2333,6 +2629,47 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 store_readers = std::make_unique<StoreReaders>(8, *this);
                 store_stats.since = std::chrono::steady_clock::now();
             }
+            // FEAT-GT7-185 (from shadGT PERF-038/098/102): the splash screen's precompile. The
+            // stored pipelines are built while the splash screen shows (the game waits there for
+            // them), then any left in the background, most recently used first. On with
+            // GPU.precompile_shaders (on by default) unless RYGT_PREWARM says otherwise (0: off,
+            // 1: on). -DisablePerf 52 turns it off.
+            const char* prewarm = std::getenv("RYGT_PREWARM");
+#ifdef RYTY_GPU
+            const bool prewarm_on =
+                prewarm && *prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
+#else
+            const bool prewarm_on = prewarm && prewarm[0] == '1';
+#endif
+            if (use_stored_shaders && prewarm_on && Common::PerfFeatureEnabled(52)) {
+                if (!instance.IsVertexInputDynamicState()) {
+                    LOG_WARNING(Render_Vulkan, "FEAT-GT7-185: the precompile needs dynamic vertex "
+                                               "input; not available here");
+                } else {
+                    prewarm_enabled = true;
+                    prewarm_stats.since = std::chrono::steady_clock::now();
+                    prewarm_reader = std::jthread{[this](std::stop_token stop) {
+                        PrewarmRead(stop);
+                        // FEAT-GT7-189: the recipes, once the game plays (and a while into it).
+                        if (!ManifestRecordOn()) {
+                            return;
+                        }
+                        const auto since = std::chrono::steady_clock::now();
+                        while (!stop.stop_requested() &&
+                               (PrecompileHoldsGame() || std::chrono::steady_clock::now() - since <
+                                                             std::chrono::seconds{30})) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds{250});
+                        }
+                        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+                        try {
+                            ExportPipelineRecipes(stop);
+                        } catch (const std::exception& e) {
+                            LOG_WARNING(Render_Vulkan, "FEAT-GT7-189: recipe export stopped: {}",
+                                        e.what());
+                        }
+                    }};
+                }
+            }
         }
     }
     LoadElseScopeFixed(); // after the store's Open: SHD-010's clear removes them with it
@@ -2359,6 +2696,11 @@ PipelineCache::~PipelineCache() {
     if (compile_pack_thread.joinable()) { // PERF-GT7-108: before the device goes
         compile_pack_thread.request_stop();
         compile_pack_thread.join();
+    }
+    if (prewarm_reader.joinable()) { // FEAT-GT7-185: it reads the store and fills prewarm_records
+        prewarm_reader.request_stop();
+        prewarm_cv.notify_all();
+        prewarm_reader.join();
     }
     if (warm_compute_thread.joinable()) { // PERF-GT7-037: before the caches go
         warm_compute_thread.request_stop();
@@ -2742,14 +3084,62 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
     return build;
 }
 
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470, RYGT_DIAG_PRECOMPILE=1): the splash precompile's
+// throughput, logged every 5 s from IdlePrewarm: are the workers starved (few builds in flight) or
+// blocked (many in flight, each slower), e.g. on a lock in the driver.
+static bool DiagPrecompile() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DIAG_PRECOMPILE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+static std::atomic<u32> g_diag_in_flight{};
+static std::atomic<u64> g_diag_built{}, g_diag_build_us{}, g_diag_installed{}, g_diag_install_us{};
+
 void PipelineCache::FinishBuild(PipelineBuild& build, bool draw_waits) {
     // FIX-044: the GPU thread waiting for (or doing) a pipeline build holds the guest clocks.
     Common::GuestClock::CompilePause hold;
     if (!build.started.exchange(true)) {
+        const bool diag = DiagPrecompile(); // FEAT-GT7-188
+        const auto diag_start = std::chrono::steady_clock::now();
+        if (diag) {
+            ++g_diag_in_flight;
+        }
+        SCOPE_EXIT {
+            if (diag) {
+                --g_diag_in_flight;
+                ++g_diag_built;
+                const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - diag_start)
+                                       .count());
+                g_diag_build_us += us;
+                if (!build.preloading) {
+                    // Built for play, not by the precompile: their cost is what a player sees.
+                    static std::atomic<u64> count{}, total_us{}, max_us{};
+                    total_us += us;
+                    u64 seen = max_us.load();
+                    while (us > seen && !max_us.compare_exchange_weak(seen, us)) {
+                    }
+                    if (const u64 c = ++count; c % 50 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PRECOMPILE-DIAG in game: {} pipelines built, {:.0f} ms "
+                                    "each on average, longest {:.0f} ms",
+                                    c, double(total_us.load()) / 1000.0 / double(c),
+                                    double(max_us.load()) / 1000.0);
+                    }
+                }
+            }
+        };
+        g_pipeline_libraries_only = build.libraries_only; // FEAT-GT7-188
+        SCOPE_EXIT {
+            g_pipeline_libraries_only = false;
+        };
         g_pipeline_build_urgent = draw_waits || build.urgent; // FIX-GT7-030
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
-            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata);
+            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
+            build.preloading);
         g_pipeline_build_urgent = false;
         // The copies were only needed while building; draws use the cached infos.
         build.pipeline->SetStageInfos(build.canonical);
@@ -2936,6 +3326,28 @@ bool PipelineCache::CancelBuild(PipelineBuild& build) {
     }
     build.promise.set_value();
     return true;
+}
+
+void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build) {
+    if (!build_workers) {
+        build_workers = std::make_unique<PipelineBuildWorkers>();
+    }
+    build_workers->PushBackground([this, build] {
+        if (!build->started.load()) {
+            FinishBuild(*build);
+            ++prewarm_built;
+        }
+        if (build->preloading) { // FIX-GT7-186: AdoptPrewarmed takes it from pending_builds
+            try {
+                std::scoped_lock lk{prewarm_finished_mutex};
+                prewarm_finished.push_back(build);
+                prewarm_finished_any.store(true, std::memory_order_release);
+            } catch (const std::bad_alloc&) {
+                // Not adopted: it stays in pending_builds as before FIX-GT7-186.
+            }
+        }
+        ++g_precompile_done; // PERF-098
+    });
 }
 
 void PipelineCache::ReadAheadAtBufferStart() {
@@ -3131,8 +3543,18 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         if (!valid) {
             return !read_ahead_blocked;
         }
-        if (!HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key) ||
-            pending_builds.contains(S().graphics_key)) {
+        if (!HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
+            return true;
+        }
+        if (const auto pending = pending_builds.find(S().graphics_key);
+            pending != pending_builds.end()) {
+            // FEAT-GT7-185 (PERF-038): a stored pipeline still waiting in the background queue is
+            // needed soon; build it now from this draw's state instead.
+            if (pending->second->preloading && CancelBuild(*pending->second)) {
+                pending.value() = StartPipelineBuild(false);
+                ++prewarm_stats.promoted;
+                ++started;
+            }
             return true;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
@@ -3219,6 +3641,10 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             ++blocked_stats.kept;
         }
     }
+    if (started > 0 && build_workers) {
+        // PERF-038: the game needs pipelines; background builds wait.
+        build_workers->PauseBackground(std::chrono::steady_clock::now() + std::chrono::seconds{2});
+    }
     S().draw_indirect_params = params;
     if (restore && evaluated > 0) {
         const bool was_forced = force_legacy;
@@ -3289,6 +3715,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     ReportAsyncPipelines(std::chrono::steady_clock::now());
     UpdateCatchUp(std::chrono::steady_clock::now()); // PERF-GT7-029
     DropStaleReadAheadBuilds(std::chrono::steady_clock::now()); // FIX-GT7-015
+    // FEAT-GT7-185 (PERF-038): then, while no draw waits for pipelines, stored ones go to the
+    // background.
+    InstallPrewarmed();
     S().draw_indirect_params = params;
     ++draws_since_scan;
     // FIX-078: missing translations of this draw's stages are queued together first; then the
@@ -3602,19 +4031,38 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
         auto pending = pending_builds.find(S().graphics_key);
-        if (pending != pending_builds.end() && pending->second->async) {
+        if (pending != pending_builds.end() && pending->second->libraries_only) {
+            // FEAT-GT7-188: a precompile build of the stage libraries only has no pipeline to
+            // draw with: dropped (or left to finish) and this draw builds its own as usual.
+            if (CancelBuild(*pending->second) ||
+                pending->second->done.wait_for(std::chrono::seconds{0}) ==
+                    std::future_status::ready) {
+                pending_builds.erase(pending);
+            }
+            pending = pending_builds.end();
+        }
+        if (pending != pending_builds.end() &&
+            (pending->second->preloading || pending->second->async)) {
             auto stored = pending->second;
-            if (stored->done.wait_for(QuickWait()) == std::future_status::ready) {
-                // PERF-076: built by a worker since an earlier draw skipped; no miss.
+            if (stored->done.wait_for(stored->async ? QuickWait() : std::chrono::microseconds{0}) ==
+                std::future_status::ready) {
+                // PERF-038: built in the background before the draw needed it; no miss.
                 pending_builds.erase(pending);
                 stored->pipeline->SetStageInfos(S().infos);
                 sdata = stored->sdata;
                 it.value() = std::move(stored->pipeline);
-                ++async_stats.installed;
+                ++(stored->async ? async_stats.installed : prewarm_stats.hits);
+                // Stored again, so the next session builds it among the first.
+                if (!S().key_uses_legacy) {
+                    RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
+                }
                 return it->second.get();
             }
-            if (!force_wait && !LegacyWaits() && !WritesMemory(S().infos) &&
-                !NeverSkipped(S().infos) && !MenusWait()) {
+            // FEAT-GT7-185: a stored pipeline still building is waited for, unless draws go on
+            // without their pipelines anyway (PERF-076).
+            if (!force_wait && (stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
+                !LegacyWaits() && !WritesMemory(S().infos) && !NeverSkipped(S().infos) &&
+                !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
@@ -3624,10 +4072,15 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 return nullptr;
             }
             if (CancelBuild(*stored)) {
-                // No worker has started it yet: built now the usual way.
+                // Not started in the background yet: built now the usual way.
                 pending_builds.erase(pending);
                 pending = pending_builds.end();
+                ++prewarm_stats.cancelled;
             }
+        }
+        if (build_workers && CompileMode() != 2) {
+            build_workers->PauseBackground(std::chrono::steady_clock::now() +
+                                           std::chrono::seconds{2});
         }
         ++Common::GetWorkCounters().pipelines_compiled;
         last_pipeline_miss = std::chrono::steady_clock::now();
@@ -3734,7 +4187,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             g_pipeline_build_urgent = false;
         }
 
-        if (S().key_uses_legacy) { // D10
+        if (!S().key_uses_legacy) { // D10: old translations are not in this store
+            RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
+        } else {
             ++legacy_stats.pipelines;
         }
         ++num_new_pipelines;
@@ -3746,6 +4201,18 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                     auto& m = S().modules[stage];
                     module_related_pipelines[m].emplace_back(S().graphics_key);
                 }
+            }
+        }
+    } else if (!prewarm_unclaimed.empty()) {
+        // FIX-GT7-186: a stored pipeline adopted before its first draw; stored again, so the next
+        // session builds it among the first (as the PERF-038 install above does).
+        if (const auto unclaimed = prewarm_unclaimed.find(S().graphics_key);
+            unclaimed != prewarm_unclaimed.end()) {
+            auto sdata = std::move(unclaimed.value());
+            prewarm_unclaimed.erase(unclaimed);
+            if (!S().key_uses_legacy) {
+                RegisterPipelineData(S().graphics_key,
+                                     std::hash<GraphicsPipelineKey>{}(S().graphics_key), sdata);
             }
         }
     }
@@ -4356,7 +4823,8 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
                                                               Storage::DataBase& store) {
     // Each permutation is stored as <perm hash>.meta (key and shader info) and
     // <program hash>_<index>.spv; indices are dense from 0 (PERF-013 numbers runtime ones after
-    // the stored ones), so the listing stops after a run of missing indices.
+    // the stored ones), so the listing stops after a run of missing indices. Only file reads, so
+    // the PERF-038 reader thread can do it too.
     StoredListing listing{.pgm_hash = pgm_hash};
     // DIAG-191 (diagnosis, SHADGT_RETRANSLATE=<hex hash>,...): these programs are translated
     // again (and dumped with GPU.dump_shaders) instead of loaded from the store.
@@ -4502,6 +4970,990 @@ bool PipelineCache::StoredListingReady(u64 pgm_hash, bool may_skip) {
 static bool DrawnOnce(u64 hash) {
     constexpr std::array<u64, 2> OneShot{0x9b9bf2a4, 0x40327433};
     return std::ranges::find(OneShot, hash) != OneShot.end();
+}
+
+// FEAT-GT7-185 (from shadGT PERF-038): one stored pipeline, read and parsed by the reader
+// threads.
+struct PipelineCache::PrewarmRecord {
+    GraphicsPipelineKey key{};
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::array<u64, MaxShaderStages> pgm{};
+    std::array<size_t, MaxShaderStages> perm{};
+    std::array<std::shared_ptr<const std::vector<u32>>, MaxShaderStages> spv{};
+    std::vector<std::shared_ptr<const StoredListing>> listings;
+};
+
+// FEAT-GT7-189 (from shadGT FEAT-GTS-471): the manifest's pipeline recipes. This GPU's stored
+// pipelines, with their shaders named as the records name them (program hash, record SPIR-V hash)
+// instead of by this store's permutations, in <serial>.manifest/pipelines-<vendor>-<device>.rcp.
+// A recipe is a pipeline key file (draw state, vertex inputs, multisampling: no code) and those
+// names; another GPU imports them (ImportPipelineRecipes) once its pre-translation has made the
+// records' translations, which it notes in the store's recipe-perms.txt (FEAT-GT7-188). So the
+// manifest folder alone can be shipped: no other GPU's store is needed. Pipelines with helper
+// shaders made for the host (tessellation, rect and quad lists) are left out.
+//
+// File: "RYGTRCP1", u32 switches length, the store's switches, u32 count, then per recipe
+// MaxShaderStages (u64 program, u64 SPIR-V hash) pairs (0 for none), u32 length, key file bytes.
+// The switches name what makes the stored keys mean the same: the store's name past the serial
+// (its tag, the direct-memory variant), the record version and the key's size. shadgt7 has no
+// store-version.txt (shadGT's per-GPU-family store names), so this stands in for its switches.
+static constexpr char RecipeMagic[8] = {'R', 'Y', 'G', 'T', 'R', 'C', 'P', '1'};
+
+struct PipelineRecipe {
+    std::array<std::pair<u64, u64>, MaxShaderStages> names{};
+    std::vector<u8> pipeline;
+};
+
+static std::string RecipeSwitches(const std::filesystem::path& store) {
+    std::string name = store.filename().string();
+    const auto& serial = Common::ElfInfo::Instance().GameSerial();
+    if (name.starts_with(serial)) {
+        name.erase(0, serial.size());
+    }
+    return fmt::format("store '{}', key v{} {} bytes", name, StoredPipelineKeyVersion(),
+                       sizeof(GraphicsPipelineKey));
+}
+
+static std::vector<u8> ReadFileBytes(const std::filesystem::path& path) {
+    std::vector<u8> bytes;
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        return bytes;
+    }
+    in.seekg(0, std::ios::end);
+    const auto size = std::streamoff(in.tellg());
+    if (size <= 0) {
+        return bytes;
+    }
+    bytes.resize(size_t(size));
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (!in) {
+        bytes.clear();
+    }
+    return bytes;
+}
+
+static std::optional<std::vector<PipelineRecipe>> ReadPipelineRecipes(
+    const std::filesystem::path& file, const std::string& switches) {
+    std::ifstream in{file, std::ios::binary};
+    if (!in) {
+        return std::nullopt;
+    }
+    const auto get = [&](auto& value) {
+        in.read(reinterpret_cast<char*>(&value), sizeof(value));
+        return bool(in);
+    };
+    char magic[8]{};
+    u32 length{};
+    if (!get(magic) || std::memcmp(magic, RecipeMagic, 8) != 0 || !get(length) || length > 4096) {
+        return std::nullopt;
+    }
+    std::string theirs(length, '\0');
+    in.read(theirs.data(), length);
+    u32 count{};
+    if (!in || theirs != switches || !get(count)) {
+        return std::nullopt;
+    }
+    std::vector<PipelineRecipe> recipes;
+    recipes.reserve(std::min<u32>(count, 1u << 20));
+    for (u32 r = 0; r < count; ++r) {
+        PipelineRecipe recipe;
+        for (auto& [pgm, spv] : recipe.names) {
+            if (!get(pgm) || !get(spv)) {
+                return std::nullopt;
+            }
+        }
+        if (!get(length) || length > (1u << 20)) {
+            return std::nullopt;
+        }
+        recipe.pipeline.resize(length);
+        in.read(reinterpret_cast<char*>(recipe.pipeline.data()), length);
+        if (!in) {
+            return std::nullopt;
+        }
+        recipes.push_back(std::move(recipe));
+    }
+    return recipes;
+}
+
+// FEAT-GT7-189: other GPUs' recipe files, made this GPU's stored pipelines so the splash precompile
+// builds them here before any draw needs them: each shader, named by program and record SPIR-V
+// hash, renumbered to this store's permutation (recipe-perms.txt). Once per file, recipe count and
+// mapping size (recipe-imports.txt). RYGT_PIPELINE_RECIPES=0: off.
+void PipelineCache::ImportPipelineRecipes(std::stop_token stop) {
+    if (const char* env = std::getenv("RYGT_PIPELINE_RECIPES"); env && env[0] == '0') {
+        return;
+    }
+    namespace fs = std::filesystem;
+    auto& store = Storage::DataBase::Instance();
+    if (g_manifest_dir.empty() || !store.IsOpened() || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    const fs::path local = store.StorePath();
+    std::error_code ec;
+    std::vector<fs::path> recipe_files;
+    const std::string own_recipes =
+        fmt::format("pipelines-{:04x}-{:04x}.rcp", g_manifest_vendor, g_manifest_device);
+    for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("pipelines-") && entry.path().extension() == ".rcp" &&
+            name != own_recipes) {
+            recipe_files.push_back(entry.path());
+        }
+    }
+    if (recipe_files.empty()) {
+        return;
+    }
+    std::sort(recipe_files.begin(), recipe_files.end());
+    std::unordered_map<u64, size_t> local_perm; // HashCombine(program, record SPIR-V hash)
+    {
+        std::ifstream in{local / "recipe-perms.txt"};
+        std::string line;
+        while (std::getline(in, line)) {
+            unsigned long long pgm{}, spv{}, perm{};
+            if (std::sscanf(line.c_str(), "%llx %llx %llu", &pgm, &spv, &perm) == 3) {
+                local_perm[HashCombine(u64(pgm), u64(spv))] = size_t(perm);
+            }
+        }
+    }
+    if (local_perm.empty()) {
+        return;
+    }
+    const std::string switches = RecipeSwitches(local);
+    const fs::path marker = local / "recipe-imports.txt";
+    const auto marker_bytes = ReadFileBytes(marker);
+    std::string done{marker_bytes.begin(), marker_bytes.end()};
+    enum class Installed { Imported, Present, Unresolved, Failed };
+    // The key's shaders, renumbered to this store's permutations and stored as this GPU's.
+    const auto install = [&](GraphicsPipelineKey& key, GraphicsPipeline::SerializationSupport& sdata,
+                             const std::array<std::pair<u64, u64>, MaxShaderStages>& names) {
+        for (u32 i = 0; i < MaxShaderStages; ++i) {
+            if (key.stage_hashes[i] == 0) {
+                continue;
+            }
+            const auto mapped = local_perm.find(HashCombine(names[i].first, names[i].second));
+            if (names[i].first == 0 || mapped == local_perm.end()) {
+                return Installed::Unresolved;
+            }
+            key.stage_hashes[i] = HashCombine(names[i].first, u64{mapped->second});
+        }
+        const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+        const auto target = local / fmt::format("g_{:#018x}.key", hash);
+        if (fs::exists(target, ec)) {
+            return Installed::Present;
+        }
+        return WriteStoredGraphicsPipeline(target, key, sdata) ? Installed::Imported
+                                                                : Installed::Failed;
+    };
+    for (const auto& file : recipe_files) {
+        if (stop.stop_requested()) {
+            return;
+        }
+        auto recipes = ReadPipelineRecipes(file, switches);
+        if (!recipes) {
+            LOG_WARNING(Render_Vulkan,
+                        "FEAT-GT7-189: {} not read (another format or other switches)",
+                        file.filename().string());
+            continue;
+        }
+        const std::string mark = fmt::format("{} {} {}\n", file.filename().string(),
+                                             recipes->size(), local_perm.size());
+        if (done.find(mark) != std::string::npos) {
+            continue; // imported with this mapping already
+        }
+        u64 imported = 0, present = 0, unresolved = 0, unreadable = 0;
+        for (auto& recipe : *recipes) {
+            GraphicsPipelineKey key{};
+            GraphicsPipeline::SerializationSupport sdata{};
+            if (!LoadStoredGraphicsPipeline(std::move(recipe.pipeline), key, sdata)) {
+                ++unreadable;
+                continue;
+            }
+            switch (install(key, sdata, recipe.names)) {
+            case Installed::Imported:
+                ++imported;
+                break;
+            case Installed::Present:
+                ++present;
+                break;
+            case Installed::Unresolved:
+                ++unresolved;
+                break;
+            case Installed::Failed:
+                break;
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "FEAT-GT7-189: {} recipes from {} made this GPU's: {} imported, {} present "
+                    "already, {} with a shader no record maps here, {} unreadable",
+                    recipes->size(), file.filename().string(), imported, present, unresolved,
+                    unreadable);
+        done += mark;
+        if (std::FILE* f = std::fopen(marker.string().c_str(), "ab")) {
+            std::fwrite(mark.data(), 1, mark.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
+// FEAT-GT7-189: written after the splash precompile, at low priority, when the store's pipeline
+// count or the records changed (recipe-export.txt).
+void PipelineCache::ExportPipelineRecipes(std::stop_token stop) {
+    namespace fs = std::filesystem;
+    auto& store = Storage::DataBase::Instance();
+    if (g_manifest_dir.empty() || !store.IsOpened() || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    const fs::path local = store.StorePath();
+    std::error_code ec;
+    const std::string switches = RecipeSwitches(local);
+    // The records this manifest has: <program>-<SPIR-V hash>.rec.
+    std::unordered_set<u64> records;
+    for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+        unsigned long long pgm{}, spv{};
+        const auto name = entry.path().filename().string();
+        if (entry.path().extension() == ".rec" &&
+            std::sscanf(name.c_str(), "%16llx-%16llx.rec", &pgm, &spv) == 2) {
+            records.insert(HashCombine(u64(pgm), u64(spv)));
+        }
+    }
+    // Permutations pre-translated from other GPUs' records are named by those records.
+    std::unordered_map<u64, u64> record_of_perm; // HashCombine(program, permutation) -> SPIR-V hash
+    {
+        std::ifstream in{local / "recipe-perms.txt"};
+        std::string line;
+        while (std::getline(in, line)) {
+            unsigned long long pgm{}, spv{}, perm{};
+            if (std::sscanf(line.c_str(), "%llx %llx %llu", &pgm, &spv, &perm) == 3 &&
+                records.contains(HashCombine(u64(pgm), u64(spv)))) {
+                record_of_perm[HashCombine(u64(pgm), u64(perm))] = u64(spv);
+            }
+        }
+    }
+    std::vector<std::pair<fs::path, fs::file_time_type>> keys;
+    for (const auto& entry : fs::directory_iterator(local, ec)) {
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("g_") && entry.path().extension() == ".key") {
+            keys.emplace_back(entry.path(), entry.last_write_time(ec));
+        }
+    }
+    const auto target = g_manifest_dir / fmt::format("pipelines-{:04x}-{:04x}.rcp",
+                                                     g_manifest_vendor, g_manifest_device);
+    const fs::path marker = local / "recipe-export.txt";
+    const std::string mark =
+        fmt::format("{} {} {}", keys.size(), records.size(), record_of_perm.size());
+    if (const auto old = ReadFileBytes(marker);
+        std::string{old.begin(), old.end()} == mark && fs::exists(target, ec)) {
+        return;
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    // Oldest first, as the store's files: an import keeps the order (ImportPipelineRecipes), so
+    // the precompile, most recently used first, builds the most recently used ones first.
+    std::ranges::sort(keys, [](const auto& a, const auto& b) { return a.second < b.second; });
+    struct Name {
+        u64 pgm{};
+        u64 spv{};
+        bool ok{};
+    };
+    std::unordered_map<u64, Name> names; // HashCombine(program, permutation)
+    std::vector<u8> out;
+    const auto put = [&out](const auto& value) {
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        out.insert(out.end(), bytes, bytes + sizeof(value));
+    };
+    out.insert(out.end(), RecipeMagic, RecipeMagic + 8);
+    put(u32(switches.size()));
+    out.insert(out.end(), switches.begin(), switches.end());
+    const size_t count_at = out.size();
+    put(u32{0});
+    u32 written = 0, helpers = 0, unnamed = 0;
+    for (const auto& [file, time] : keys) {
+        if (stop.stop_requested()) {
+            return;
+        }
+        const auto blob = ReadFileBytes(file);
+        GraphicsPipelineKey key{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        if (!LoadStoredGraphicsPipeline(std::vector<u8>{blob}, key, sdata)) {
+            continue;
+        }
+        if (!sdata.tcs.empty() || !sdata.tes.empty() || !sdata.fragment.empty()) {
+            ++helpers;
+            continue;
+        }
+        std::array<std::pair<u64, u64>, MaxShaderStages> stage_names{};
+        bool ok = true;
+        for (u32 i = 0; ok && i < MaxShaderStages; ++i) {
+            const u64 stage_hash = key.stage_hashes[i];
+            if (stage_hash == 0) {
+                continue;
+            }
+            auto it = names.find(stage_hash);
+            if (it == names.end()) {
+                Name name{};
+                u64 pgm{};
+                size_t perm{};
+                if (PeekShaderMeta(ReadFileBytes(local / fmt::format("{:#018x}.meta", stage_hash)),
+                                   pgm, perm) &&
+                    HashCombine(pgm, u64{perm}) == stage_hash) {
+                    // Recorded here: the record is named by this store's SPIR-V.
+                    const auto spv =
+                        ReadFileBytes(local / fmt::format("{:#018x}_{}.spv", pgm, perm));
+                    const u64 spv_xxh = spv.empty() ? 0 : XXH3_64bits(spv.data(), spv.size());
+                    if (spv_xxh && records.contains(HashCombine(pgm, spv_xxh))) {
+                        name = {pgm, spv_xxh, true};
+                    } else if (const auto r = record_of_perm.find(stage_hash);
+                               r != record_of_perm.end()) {
+                        name = {pgm, r->second, true};
+                    }
+                }
+                it = names.emplace(stage_hash, name).first;
+            }
+            ok = it->second.ok;
+            stage_names[i] = {it->second.pgm, it->second.spv};
+        }
+        if (!ok) {
+            ++unnamed;
+            continue;
+        }
+        for (const auto& [pgm, spv] : stage_names) {
+            put(pgm);
+            put(spv);
+        }
+        put(u32(blob.size()));
+        out.insert(out.end(), blob.begin(), blob.end());
+        ++written;
+    }
+    std::memcpy(out.data() + count_at, &written, sizeof(written));
+    auto temp = target;
+    temp += ".tmp";
+    {
+        std::ofstream file{temp, std::ios::binary | std::ios::trunc};
+        file.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+        if (!file) {
+            return;
+        }
+    }
+    fs::rename(temp, target, ec);
+    if (ec) {
+        return;
+    }
+    if (std::FILE* f = std::fopen(marker.string().c_str(), "wb")) {
+        std::fwrite(mark.data(), 1, mark.size(), f);
+        std::fclose(f);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "FEAT-GT7-189: {} pipeline recipes written to {} ({} KB) in {:.1f} s; {} with host "
+                "helper shaders, {} with a shader no record names",
+                written, target.filename().string(), out.size() / 1024,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
+                helpers, unnamed);
+}
+
+void PipelineCache::PrewarmRead(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:PrewarmRead");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#ifdef RYTY_GPU
+    // PERF-102: the game waits on the splash screen until the precompile is done.
+    if (!g_precompile_hold.exchange(true)) {
+        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count(); // FEAT-GT7-188
+        Common::GuestClock::TakeHold();
+        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
+    }
+#endif
+    auto& store = Storage::DataBase::Instance();
+    // The profile file is written only when missing (by the removed precompile), so it can be
+    // older than most entries: GT Sport's is from October 6, the store's entries from October 6
+    // to 9. A draw's first use loads the same stored SPIR-V without checking it (PERF-032), so
+    // a background build makes the pipeline that draw would make; differences are only logged.
+    std::vector<u8> stored_profile;
+    if (store.Exists(Storage::BlobType::ShaderProfile, "profile")) {
+        store.Load(Storage::BlobType::ShaderProfile, "profile", stored_profile);
+    }
+    if (!stored_profile.empty()) {
+        std::string differences;
+        const auto* current = reinterpret_cast<const u8*>(&profile);
+        for (size_t i = 0; i < std::min(stored_profile.size(), sizeof(profile)); ++i) {
+            if (stored_profile[i] != current[i]) {
+                differences += fmt::format(" [{}] {:#x}->{:#x}", i, stored_profile[i], current[i]);
+            }
+        }
+        if (!differences.empty() || stored_profile.size() != sizeof(profile)) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-038: the store's profile file ({} bytes) differs from this "
+                        "profile ({} bytes):{}",
+                        stored_profile.size(), sizeof(profile), differences);
+        }
+    }
+    // FEAT-GT7-187 (from shadGT FEAT-GTS-469): with the manifest pre-translation on, its
+    // translations are made first (the game waits on the splash screen for both): a stored pipeline
+    // whose shaders it translates is then built here instead of being skipped for missing SPIR-V.
+    // Translation alone compiles nothing: the driver compiles pipelines, which need a draw's state
+    // (the stored keys).
+    if (g_pretranslate_pending.load()) {
+        LOG_WARNING(Render_Vulkan,
+                    "FEAT-GT7-187: the precompile waits for the manifest pre-translation");
+        while (g_pretranslate_pending.load() && !stop.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+        if (stop.stop_requested()) {
+            return;
+        }
+    }
+    try {
+        ImportPipelineRecipes(stop); // FEAT-GT7-189, after the translations it maps to
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "FEAT-GT7-189: recipe import stopped: {}", e.what());
+    }
+    if (stop.stop_requested()) {
+        return;
+    }
+    auto keys = store.ListBlobs(Storage::BlobType::PipelineKey);
+    std::erase_if(keys, [](const auto& key) { return !key.first.starts_with("g_"); });
+    // Most recently used first: a pipeline's key is stored again each session that uses it.
+    std::ranges::sort(keys, [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (const char* limit = std::getenv("RYGT_PREWARM_LIMIT"); limit && *limit) {
+        keys.resize(std::min<size_t>(keys.size(), std::strtoull(limit, nullptr, 10)));
+    }
+    prewarm_total = keys.size();
+    g_precompile_total = keys.size(); // PERF-098
+    g_precompile_done = 0;
+    LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
+                keys.size());
+    const auto read_start = std::chrono::steady_clock::now();
+    // miniz uses one mutable archive cursor. Independent files can be read in parallel.
+    const unsigned readers = EmulatorSettings.IsPipelineCacheArchived() ? 1u :
+        std::max(1u, std::thread::hardware_concurrency());
+    const size_t window = std::max<size_t>(32, size_t{readers} * 2);
+    LOG_INFO(Render_Vulkan, "PRECOMPILE-READ: {} file readers, {}-record window", readers, window);
+    u64 skipped = 0;
+    // Many pipeline keys reference the same stages. Share immutable reads within
+    // this startup, including concurrent requests, with bounded cache retention.
+    BoundedReadCache<u64, StoredListing> listing_reads{32_MB, 128};
+    BoundedReadCache<u64, std::vector<u32>> binary_reads{32_MB, 256};
+    struct MetaIdentity { bool valid{}; u64 pgm{}; size_t perm{}; };
+    BoundedReadCache<u64, MetaIdentity> meta_reads{128_KB, 2048};
+    const bool complete = OrderedParallelRead(keys.size(), readers, window, stop,
+      [&](size_t index) {
+        const auto& name = keys[index].first;
+        auto record = std::make_unique<PrewarmRecord>();
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable;
+            std::vector<u8> blob;
+            store.Load(Storage::BlobType::PipelineKey, name, blob);
+            valid = LoadStoredGraphicsPipeline(std::move(blob), record->key, record->sdata);
+            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord).
+            valid = valid && record->key.stage_hashes[u32(SwStage::Vertex)] != 0 &&
+                    record->key.stage_hashes[u32(SwStage::Fragment)] != 0;
+            for (u32 stage = 0; valid && stage < MaxShaderStages; ++stage) {
+                const u64 perm_hash = record->key.stage_hashes[stage];
+                if (perm_hash == 0) {
+                    continue;
+                }
+                // Only the program hash and index: the full decode is the GPU thread's
+                // (ApplyStoredListing), as it registers SRT walker code.
+                const auto identity = meta_reads.Get(perm_hash, [&] {
+                    std::vector<u8> blob;
+                    store.Load(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash), blob);
+                    MetaIdentity value;
+                    value.valid = blob.size() >= 24 &&
+                        PeekShaderMeta(std::move(blob), value.pgm, value.perm) &&
+                        HashCombine(value.pgm, value.perm) == perm_hash;
+                    if (!value.valid) throw std::runtime_error("incomplete stored shader identity");
+                    return value;
+                }, [](const auto&) { return sizeof(MetaIdentity); });
+                if (!identity->valid) {
+                    valid = false;
+                    break;
+                }
+                const auto pgm_hash = identity->pgm;
+                const auto perm_idx = identity->perm;
+                record->pgm[stage] = pgm_hash;
+                record->perm[stage] = perm_idx;
+                if (std::ranges::none_of(record->listings, [pgm_hash](const auto& listing) {
+                        return listing->pgm_hash == pgm_hash;
+                    })) {
+                    record->listings.push_back(listing_reads.Get(pgm_hash,
+                        [&] { return ReadStoredListing(pgm_hash); }, [](const auto& listing) {
+                            size_t bytes = sizeof(listing) + listing.entries.capacity() * sizeof(StoredListing::Entry);
+                            for (const auto& entry : listing.entries) bytes += entry.meta.capacity();
+                            return bytes;
+                        }));
+                }
+                record->spv[stage] = binary_reads.Get(perm_hash, [&] {
+                    std::vector<u32> words;
+                    store.Load(Storage::BlobType::ShaderBinary,
+                               fmt::format("{:#018x}_{}", pgm_hash, perm_idx), words);
+                    // A repair write can still be queued. Do not memoize a
+                    // transient missing/partial file for the rest of startup.
+                    if (!IsCompleteSpirv(words)) throw std::runtime_error("incomplete stored SPIR-V");
+                    return words;
+                }, [](const auto& words) { return sizeof(words) + words.capacity() * sizeof(u32); });
+            }
+        } catch (const std::exception&) {
+            // RecoverableFailure, or a corrupt entry (std::bitset rejects bad text).
+            valid = false;
+        }
+        if (!valid) return std::unique_ptr<PrewarmRecord>{};
+        return record;
+      }, [&](size_t, std::unique_ptr<PrewarmRecord> record) {
+        ++prewarm_read;
+        if (!record) { ++skipped; ++g_precompile_done; return; }
+        std::unique_lock lk{prewarm_mutex};
+        prewarm_cv.wait(lk, stop, [this] { return prewarm_records.size() < 32; });
+        if (stop.stop_requested()) return;
+        prewarm_records.push_back(std::move(record));
+        ++prewarm_queued;
+      }, [] {
+        Common::SetCurrentThreadName("shadGT:PrewarmLoad");
+        Common::AllowAllCores();
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+      });
+    if (!complete || stop.stop_requested()) return;
+    LOG_INFO(Render_Vulkan, "PRECOMPILE-READ: {} records prepared in {:.3f} s", keys.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count());
+    LOG_WARNING(Render_Vulkan,
+                "PERF-038: reader done: {} stored pipelines read, {} skipped (other key version, "
+                "missing stages or files)",
+                keys.size(), skipped);
+    prewarm_reader_done = true;
+    if (keys.empty()) {
+        ReleasePrecompileHold(); // nothing stored yet (first start)
+    }
+}
+
+void PipelineCache::IdlePrewarm(bool splash) {
+    if (!prewarm_enabled) {
+        ReleasePrecompileHold();
+        return;
+    }
+    if (DiagPrecompile()) { // FEAT-GT7-188
+        using namespace std::chrono;
+        static auto window = steady_clock::now();
+        static u64 samples = 0, in_flight_sum = 0, built_at = 0, build_us_at = 0, installed_at = 0,
+                   install_us_at = 0;
+        static u32 in_flight_max = 0;
+        const u32 now_in_flight = g_diag_in_flight.load();
+        ++samples;
+        in_flight_sum += now_in_flight;
+        in_flight_max = std::max(in_flight_max, now_in_flight);
+        const auto now = steady_clock::now();
+        if (now - window >= seconds{5}) {
+            const double wall_us = double(duration_cast<microseconds>(now - window).count());
+            const u64 built = g_diag_built.load(), build_us = g_diag_build_us.load();
+            const u64 installed = g_diag_installed.load(), install_us = g_diag_install_us.load();
+            const u64 d_built = built - built_at;
+            LOG_WARNING(Render_Vulkan,
+                        "PRECOMPILE-DIAG: {:.1f} s: {} built ({:.1f}/s), {:.0f} ms each, "
+                        "parallelism {:.1f}; in flight avg {:.1f} max {}; {} installed by the "
+                        "command thread ({:.0f}% of its time), {} waiting to install",
+                        wall_us / 1e6, d_built, d_built / (wall_us / 1e6),
+                        d_built ? double(build_us - build_us_at) / 1000.0 / double(d_built) : 0.0,
+                        double(build_us - build_us_at) / wall_us,
+                        samples ? double(in_flight_sum) / double(samples) : 0.0, in_flight_max,
+                        installed - installed_at,
+                        100.0 * double(install_us - install_us_at) / wall_us,
+                        prewarm_queued.load());
+            window = now;
+            samples = in_flight_sum = 0;
+            in_flight_max = 0;
+            built_at = built;
+            build_us_at = build_us;
+            installed_at = installed;
+            install_us_at = install_us;
+        }
+    }
+    // PERF-102: released once every stored pipeline is built (or after 15 minutes at most).
+    static const auto first_call = std::chrono::steady_clock::now();
+    if (PrecompileHoldsGame() &&
+        ((prewarm_reader_done && !GetPrecompileProgress().active) ||
+         std::chrono::steady_clock::now() - first_call > std::chrono::minutes{15})) {
+        ReleasePrecompileHold();
+    }
+    if (build_workers) {
+        build_workers->SetBoost(splash);
+    } else if (splash) {
+        build_workers = std::make_unique<PipelineBuildWorkers>();
+        build_workers->SetBoost(true);
+    }
+    std::scoped_lock lk{lookup_mutex};
+    InstallPrewarmed(splash);
+}
+
+// FIX-GT7-186 (from shadGT FIX-GTS-468): how many precompiled pipelines no draw used stay built
+// after the precompile (RYGT_PRECOMPILE_KEEP, 1024 by default, -1 all; the most recently used
+// ones, as the precompile builds those first).
+static u64 PrecompileKeep() {
+    static const u64 keep = [] {
+        const char* env = std::getenv("RYGT_PRECOMPILE_KEEP");
+        if (!env || !*env) {
+            return u64{1024};
+        }
+        const long long value = std::strtoll(env, nullptr, 10);
+        return value < 0 ? ~u64{0} : u64(value);
+    }();
+    return keep;
+}
+
+// FIX-GT7-186: free physical memory is short (SystemRamUnderPressure), checked at most every 250 ms.
+static bool PrecompileRamPressure() {
+#ifdef _WIN32
+    static std::chrono::steady_clock::time_point checked{};
+    static bool pressure = false;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - checked >= std::chrono::milliseconds{250}) {
+        checked = now;
+        MEMORYSTATUSEX ram{};
+        ram.dwLength = sizeof(ram);
+        pressure = GlobalMemoryStatusEx(&ram) &&
+                   SystemRamUnderPressure(ram.ullAvailPhys, ram.ullTotalPhys);
+    }
+    return pressure;
+#else
+    return false;
+#endif
+}
+
+// FIX-GT7-186 (from shadGT FIX-GTS-468): the splash-screen precompile builds every stored pipeline
+// into pending_builds, and only a draw moved one out, so the thousands no draw used stayed there
+// for the whole session with their pipelines in RAM and video memory. Finished ones now leave it
+// at once: the first RYGT_PRECOMPILE_KEEP move into graphics_pipelines (a draw that needs one
+// later finds it built), the rest are destroyed. They were never bound and no game job thread
+// sees pending_builds (LookupBuiltPipeline looks in graphics_pipelines only), and the driver's
+// cache keeps what the precompile is for. In shadGT keeping ~15,000 grew the driver's video
+// memory for shader code by ~0.7 GB, which it kept after they were destroyed. shadgt7 has no
+// retention trim (shadGT's TrimUnusedPipelines): its RAM-pressure check stops keeping any here.
+// Command thread, lookup mutex held (InstallPrewarmed's callers).
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470, opt-in, RYGT_PRECOMPILE_LIBRARIES_ONLY=1): past the
+// pipelines the precompile keeps (RYGT_PRECOMPILE_KEEP), compile only their stage libraries and
+// skip the link. In shadGT (Radeon 610M, 3,000 pipelines) the splash went from 414 to 142 s, but
+// play then built 487 pipelines at 871 ms each (longest 4.2 s) against 294 at 221 ms (1.5 s):
+// AMD's driver cache keeps linked pipelines, so a link at the splash makes the game's one cheap.
+// Off by default: hitches in play cost more than a first splash.
+bool PipelineCache::PrecompileLibrariesOnly() const {
+    static const bool asked = [] {
+        const char* env = std::getenv("RYGT_PRECOMPILE_LIBRARIES_ONLY");
+        return env && env[0] == '1';
+    }();
+    static const bool whole = [] {
+        const char* precompile_whole = std::getenv("RYGT_PRECOMPILE_WHOLE_PIPELINES");
+        const char* no_libraries = std::getenv("SHADGT_NO_LIBRARIES");
+        return (precompile_whole && precompile_whole[0] == '1') ||
+               (no_libraries && no_libraries[0] == '1');
+    }();
+    return asked && !whole && instance.IsGraphicsPipelineLibrarySupported();
+}
+
+void PipelineCache::AdoptPrewarmed() {
+    if (!prewarm_finished_any.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<std::weak_ptr<PipelineBuild>> finished;
+    {
+        std::scoped_lock lk{prewarm_finished_mutex};
+        finished.swap(prewarm_finished);
+        prewarm_finished_any.store(false, std::memory_order_relaxed);
+    }
+    size_t adopted = 0;
+    std::vector<std::unique_ptr<GraphicsPipeline>> dropped;
+    const bool ram_pressure = PrecompileRamPressure();
+    for (const auto& weak : finished) {
+        const auto build = weak.lock();
+        if (!build) {
+            continue; // a draw took it already
+        }
+        const auto pending = pending_builds.find(build->key);
+        if (pending == pending_builds.end() || pending->second != build) {
+            continue; // taken, cancelled or replaced by a draw's own build
+        }
+        if (build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            continue; // a draw claimed it unstarted and builds it itself
+        }
+        if (!build->pipeline) {
+            pending_builds.erase(pending); // a draw builds it again the usual way
+            continue;
+        }
+        if (build->libraries_only || ((ram_pressure || prewarm_adopted >= PrecompileKeep()) &&
+                                      !graphics_pipelines.contains(build->key))) {
+            dropped.push_back(std::move(build->pipeline));
+            pending_builds.erase(pending);
+            ++adopted;
+            continue;
+        }
+        const auto [it, is_new] = graphics_pipelines.try_emplace(build->key);
+        if (!is_new && it->second) {
+            pending_builds.erase(pending); // built meanwhile by a draw
+            continue;
+        }
+        it.value() = std::move(build->pipeline);
+        prewarm_unclaimed.insert_or_assign(build->key, build->sdata);
+        ++prewarm_adopted;
+        pending_builds.erase(pending);
+        ++adopted;
+    }
+    prewarm_dropped += dropped.size();
+    // Never bound in a command buffer: destroyed here, waiting for an optimized link still being
+    // made from their libraries (~GraphicsPipeline). Their modules stay until ReleasePrewarmModules.
+    dropped.clear();
+    if (adopted != 0) {
+        static u64 total = 0;
+        total += adopted;
+        if (total / 1000 != (total - adopted) / 1000) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GT7-186: {} stored pipelines built ({} destroyed at once{}), {} pending "
+                     "builds, {} cached",
+                     total, prewarm_dropped, ram_pressure ? ", RAM pressure" : "",
+                     pending_builds.size(), graphics_pipelines.size());
+        }
+    }
+}
+
+// FIX-GT7-186 (from shadGT FIX-GTS-468): the precompile made a shader module for every stage of
+// every stored pipeline (GT Sport: ~1.9 GB of SPIR-V, which the driver copies), where a normal
+// start makes them only for the stages its draws use. Once it is done, a module it made that no
+// live pipeline or pending build uses goes back to the stored state; a draw that matches it loads
+// it from the store again (PERF-032). The shared stage libraries are keyed by ModuleIdentity, not
+// by handle, so a handle the driver reuses never finds a library of a destroyed module. Lookup
+// mutex held.
+void PipelineCache::ReleasePrewarmModules() {
+    std::unordered_set<const Shader::Info*> in_use;
+    const auto add = [&](const auto& pipeline) {
+        if (!pipeline) {
+            return;
+        }
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                in_use.insert(stage);
+            }
+        }
+    };
+    for (const auto& [key, pipeline] : graphics_pipelines) {
+        add(pipeline);
+    }
+    for (const auto& [key, pipeline] : compute_pipelines) {
+        add(pipeline);
+    }
+    for (const auto& [key, build] : pending_builds) {
+        for (const auto* stage : build->canonical) {
+            if (stage) {
+                in_use.insert(stage);
+            }
+        }
+    }
+    for (const auto* stage : S().infos) {
+        if (stage) {
+            in_use.insert(stage);
+        }
+    }
+    std::vector<vk::ShaderModule> doomed;
+    for (const auto& [pgm_hash, perm_idx] : prewarm_loaded) {
+        const auto it = program_cache.find(pgm_hash);
+        if (it == program_cache.end() || !it->second) {
+            continue;
+        }
+        auto& program = *it->second;
+        if (perm_idx >= program.modules.size()) {
+            continue;
+        }
+        auto& permutation = program.modules[perm_idx];
+        if (!permutation.module || permutation.stored || !permutation.info ||
+            in_use.contains(permutation.info.get())) {
+            continue;
+        }
+        doomed.push_back(permutation.module);
+        permutation.module = nullptr;
+        permutation.stored = true;
+        program.match_memo.valid = false;
+        program.ahead_memo.valid = false;
+        program.last_match = program.ahead_last_match = ~size_t{0};
+    }
+    const size_t made = prewarm_loaded.size();
+    prewarm_loaded.clear();
+    prewarm_loaded.shrink_to_fit();
+    // Programs the precompile listed that no draw has used: no module (above), no metadata in
+    // use. A draw that needs one lists it from the store again (GetProgram).
+    size_t dropped_programs = 0;
+    for (const u64 pgm_hash : prewarm_programs) {
+        const auto it = program_cache.find(pgm_hash);
+        if (it == program_cache.end() || !it->second) {
+            continue;
+        }
+        const bool unused = std::ranges::none_of(it->second->modules, [&](const auto& m) {
+            return m.module || (m.info && in_use.contains(m.info.get()));
+        });
+        if (unused) {
+            program_cache.erase(it);
+            ++dropped_programs;
+        }
+    }
+    const size_t listed = prewarm_programs.size();
+    prewarm_programs.clear();
+    prewarm_programs.shrink_to_fit();
+    LOG_INFO(Render_Vulkan,
+             "FIX-GT7-186: released {} of the {} shader modules and {} of the {} programs the "
+             "precompile made ({} stages in use)",
+             doomed.size(), made, dropped_programs, listed, in_use.size());
+    if (doomed.empty()) {
+        return;
+    }
+    for (const auto module : doomed) {
+        ForgetModule(module);
+    }
+    // After the GPU work recorded so far: nothing uses a module once its pipelines exist, but this
+    // keeps the destruction off the command thread's draw path.
+    const vk::Device device = instance.GetDevice();
+    scheduler.DeferOperation([device, doomed = std::move(doomed)] {
+        for (const auto module : doomed) {
+            device.destroyShaderModule(module);
+        }
+    });
+}
+
+void PipelineCache::InstallPrewarmed(bool force) {
+    if (!prewarm_enabled) {
+        return;
+    }
+    AdoptPrewarmed(); // FIX-GT7-186
+    // FIX-GT7-186: once the precompile is done (every record read and installed, the game no
+    // longer held, no stored pipeline still building), its unused modules and programs go.
+    if ((!prewarm_loaded.empty() || !prewarm_programs.empty()) &&
+        prewarm_reader_done.load(std::memory_order_relaxed) && !PrecompileHoldsGame() &&
+        prewarm_queued.load(std::memory_order_relaxed) == 0 &&
+        !prewarm_finished_any.load(std::memory_order_acquire) &&
+        std::ranges::none_of(pending_builds,
+                             [](const auto& entry) { return entry.second->preloading; })) {
+        ReleasePrewarmModules();
+    }
+    using namespace std::chrono_literals;
+    const auto start = std::chrono::steady_clock::now();
+    ReportPrewarm(start);
+    // Not while new pipelines are being needed: the draws come first (PERF-098: unless forced,
+    // while the splash screen shows).
+    if (prewarm_queued.load(std::memory_order_relaxed) == 0 ||
+        (!force && start - last_pipeline_miss < 2s)) {
+        return;
+    }
+    // The members a key is computed in are restored, so the draw sees what it would have.
+    const auto saved_key = S().graphics_key;
+    const auto saved_infos = S().infos;
+    const auto saved_modules = S().modules;
+    const auto saved_runtime_infos = S().runtime_infos;
+    auto* const saved_fetch = S().fetch_shader;
+    const auto budget = start + (force ? 20000us : 300us);
+    do {
+        std::unique_ptr<PrewarmRecord> record;
+        {
+            std::scoped_lock lk{prewarm_mutex};
+            if (prewarm_records.empty()) {
+                break;
+            }
+            record = std::move(prewarm_records.front());
+            prewarm_records.pop_front();
+        }
+        --prewarm_queued;
+        prewarm_cv.notify_one();
+        const auto diag_install = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            if (DiagPrecompile()) { // FEAT-GT7-188
+                ++g_diag_installed;
+                g_diag_install_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - diag_install)
+                                             .count());
+            }
+        };
+        if (InstallPrewarmRecord(*record)) {
+            ++prewarm_stats.installed;
+        } else {
+            ++prewarm_stats.skipped;
+            ++g_precompile_done; // PERF-098
+        }
+    } while (std::chrono::steady_clock::now() < budget);
+    S().graphics_key = saved_key;
+    S().infos = saved_infos;
+    S().modules = saved_modules;
+    S().runtime_infos = saved_runtime_infos;
+    S().fetch_shader = saved_fetch;
+    prewarm_stats.ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
+    for (auto& listing : record.listings) {
+        auto [it, is_new] = program_cache.try_emplace(listing->pgm_hash);
+        if (is_new) {
+            it.value() = std::make_unique<Program>();
+            prewarm_programs.push_back(listing->pgm_hash); // FIX-GT7-186
+            // Installation consumes metadata; make one private copy per program,
+            // rather than mutating bytes still shared with reader threads.
+            ApplyStoredListing(StoredListing{*listing}, *it.value());
+        }
+    }
+    if (graphics_pipelines.contains(record.key) || pending_builds.contains(record.key)) {
+        return false;
+    }
+    const bool tess_emulated = record.key.prim_type == AmdGpu::PrimitiveType::RectList ||
+                               record.key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    S().infos.fill(nullptr);
+    S().modules.fill(nullptr);
+    S().fetch_shader = nullptr;
+    for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+        if (record.pgm[stage] == 0) {
+            continue;
+        }
+        const auto it = program_cache.find(record.pgm[stage]);
+        if (it == program_cache.end() || record.perm[stage] >= it->second->modules.size()) {
+            return false;
+        }
+        auto& permutation = it->second->modules[record.perm[stage]];
+        if (!permutation.info) {
+            return false;
+        }
+        if (permutation.stored) {
+            // The same SPIR-V a draw's first use would load (PERF-032), read on the reader thread.
+            if (!record.spv[stage] || !IsCompleteSpirv(*record.spv[stage])) {
+                return false;
+            }
+            permutation.module = CompileSPV(*record.spv[stage], instance.GetDevice(),
+                                            instance.IsShaderObjectEnabled());
+            permutation.stored = false;
+            prewarm_loaded.emplace_back(record.pgm[stage], record.perm[stage]); // FIX-GT7-186
+        }
+        if (!permutation.module) {
+            return false;
+        }
+        // Tessellation helpers are made from the vertex outputs, which old metadata lacks; a draw
+        // recovers them from the guest code, a background build cannot.
+        if (tess_emulated && stage == u32(SwStage::Vertex) &&
+            !permutation.info->attribute_flags_known) {
+            return false;
+        }
+        // A mip fallback indexed at runtime takes its descriptor count from the draw's T#.
+        if (std::ranges::any_of(permutation.info->images, [](const auto& image) {
+                return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+            })) {
+            return false;
+        }
+        S().infos[stage] = permutation.info.get();
+        S().modules[stage] = permutation.module;
+        // The runtime info a draw passes is the one the permutation was specialized with.
+        S().runtime_infos[stage] = permutation.spec.runtime_info;
+        if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
+            S().fetch_shader = &fetch;
+        }
+    }
+    S().graphics_key = record.key;
+    auto build = MakePipelineBuild();
+    build->preloading = true;
+    // FEAT-GT7-188: past the pipelines the precompile keeps, only the stage libraries (opt-in).
+    build->libraries_only = PrecompileLibrariesOnly() && ++prewarm_installed > PrecompileKeep();
+    build->sdata = record.sdata;
+    pending_builds.emplace(record.key, build);
+    QueueBackgroundBuild(build);
+    return true;
 }
 
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
@@ -4939,6 +6391,30 @@ void PipelineCache::ReportAsyncPipelines(std::chrono::steady_clock::time_point n
     }
     async_stats = {};
     async_stats.since = now;
+}
+
+void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
+    auto& stats = prewarm_stats;
+    if (now - stats.since < std::chrono::seconds{2}) {
+        return;
+    }
+    const u64 built = prewarm_built.load();
+    if (stats.installed + stats.hits + stats.cancelled + stats.promoted != 0 ||
+        built != stats.built_before) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-038 background builds in {:.1f} s: {} queued ({} skipped, {:.1f} ms on "
+                    "this thread), {} built ({} in all), {} used by draws without waiting, {} "
+                    "built for a draw instead, {} moved ahead by the read-ahead; {} waiting; "
+                    "reader {}/{}{}",
+                    std::chrono::duration<double>(now - stats.since).count(), stats.installed,
+                    stats.skipped, stats.ms, built - stats.built_before, built, stats.hits,
+                    stats.cancelled, stats.promoted,
+                    build_workers ? build_workers->BackgroundQueued() : 0, prewarm_read.load(),
+                    prewarm_total.load(), prewarm_reader_done.load() ? " (done)" : "");
+    }
+    stats = {};
+    stats.built_before = built;
+    stats.since = now;
 }
 
 vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) {
@@ -5547,6 +7023,132 @@ std::optional<PipelineCache::TessLocation> PipelineCache::KnownTessLocation(u64 
         }
     }
     return std::nullopt;
+}
+
+// FEAT-GT7-188 (from shadGT FEAT-GTS-470): with recording on, a draw's first use of a stored
+// translation records it too. A record was written only when a translation was made, so
+// translations stored before recording began never got one (in GT Sport 665 of an RTX 4070's
+// 10,670 stored programs; a Radeon replaying its manifest then translated 421 of them in game).
+// The frontend runs once under this draw's state for its guest reads, on copies of the code and
+// the fetch shader as QueueTranslation makes them; its result is dropped. Lookup lock held. The
+// SPIR-V hash is the stored binary's, so verification compares against it.
+void PipelineCache::RecordStoredUse(HwStage hw_stage, SwStage sw_stage,
+                                    const Shader::ShaderParams& params,
+                                    const Shader::RuntimeInfo& runtime_info,
+                                    const Shader::Backend::Bindings& start, size_t perm_idx) {
+    if (!ManifestRecordOn() || g_manifest_dir.empty() || regs_override || t_lookup_only ||
+        sw_stage == SwStage::Geometry) {
+        return;
+    }
+    // FEAT-GT7-188: with recording on by default, play pays for it: at most ~2 ms of these per
+    // 16 ms on the command thread. A shader over the budget is recorded at a later use (this one or
+    // the next session's), so nothing is lost, only spread out.
+    using namespace std::chrono;
+    static steady_clock::time_point window{};
+    static microseconds spent{};
+    const auto now = steady_clock::now();
+    if (now - window > milliseconds{16}) {
+        window = now;
+        spent = microseconds{0};
+    }
+    if (spent >= milliseconds{2}) {
+        return;
+    }
+    SCOPE_EXIT {
+        spent += duration_cast<microseconds>(steady_clock::now() - now);
+    };
+    static std::unordered_set<u64> looked_at;
+    if (!looked_at.insert(HashCombine(params.hash, u64{perm_idx})).second) {
+        return;
+    }
+    std::vector<u32> stored_spv;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                                       fmt::format("{:#018x}_{}", params.hash, perm_idx),
+                                       stored_spv);
+    if (stored_spv.empty()) {
+        return;
+    }
+    const u64 spv_xxh = XXH3_64bits(stored_spv.data(), stored_spv.size() * sizeof(u32));
+    std::error_code ec;
+    if (std::filesystem::exists(
+            g_manifest_dir / fmt::format("{:016x}-{:016x}.rec", params.hash, spv_xxh), ec)) {
+        return; // recorded already
+    }
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    std::ranges::copy(params.user_data, user_data.begin());
+    std::vector<u32> code(params.code.size());
+#ifdef RYTY_GPU
+    if (!Core::RytyMemory::GuardedCopy(code.data(), params.code.data(), params.code.size_bytes())) {
+        return;
+    }
+#else
+    std::ranges::copy(params.code, code.begin());
+#endif
+    std::vector<u32> fetch_copy;
+    if ((hw_stage == HwStage::Vertex || hw_stage == HwStage::Export ||
+         hw_stage == HwStage::Local) &&
+        !CopyFetchShader(user_data, code, fetch_copy)) {
+        return;
+    }
+    const Shader::ShaderParams owned{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+        .code = code,
+        .hash = params.hash,
+    };
+    Shader::Info info{hw_stage, sw_stage, owned};
+    if (!fetch_copy.empty()) {
+        info.pinned_fetch_sharps = PinFetchSharps(hw_stage, sw_stage, code, user_data, params.hash);
+    }
+    auto compiled_runtime = runtime_info;
+    Shader::Pools pools;
+    Common::GuestReadLog read_log;
+    Common::t_guest_read_log = &read_log;
+    try {
+        Common::RecoverableScope recoverable;
+        [[maybe_unused]] const auto program =
+            Shader::TranslateProgram(code, pools, info, compiled_runtime, profile);
+        // The reads of its specialization too, as a recording worker logs them.
+        [[maybe_unused]] const Shader::StageSpecialization spec{info, runtime_info, profile, start};
+    } catch (const Common::RecoverableFailure&) {
+        Common::t_guest_read_log = nullptr;
+        return;
+    }
+    Common::t_guest_read_log = nullptr;
+    ManifestRecord rec;
+    rec.hw_stage = u32(hw_stage);
+    rec.sw_stage = u32(sw_stage);
+    rec.hash = params.hash;
+    rec.code_words = u32(code.size());
+    rec.code_xxh = XXH3_64bits(code.data(), code.size() * sizeof(u32));
+    rec.spv_xxh = spv_xxh;
+    rec.runtime_info = runtime_info;
+    rec.user_data = user_data;
+    if (!fetch_copy.empty()) {
+        if (const auto base = Shader::FetchShaderSgprBase(code)) {
+            rec.fetch_base = *base;
+        }
+        rec.fetch_words = u32(fetch_copy.size());
+        rec.fetch_xxh = XXH3_64bits(fetch_copy.data(), fetch_copy.size() * 4);
+    }
+    rec.start = start;
+    if (info.has_fetch_shader) {
+        Shader::Gcn::FetchShaderData fetch;
+        rec.has_fetch_data = true;
+        rec.fetch_ok = Shader::Gcn::ParseFetchShader(info, fetch);
+        rec.fetch_size = fetch.size;
+        rec.vertex_offset_sgpr = fetch.vertex_offset_sgpr;
+        rec.instance_offset_sgpr = fetch.instance_offset_sgpr;
+        rec.attributes.assign(fetch.attributes.begin(), fetch.attributes.end());
+    }
+    rec.pinned = info.pinned_fetch_sharps;
+    rec.spans = std::move(read_log.spans);
+    rec.bytes = std::move(read_log.bytes);
+    WriteManifestRecord(rec, code, fetch_copy);
+    static u64 recorded = 0;
+    if (++recorded <= 3 || recorded % 100 == 0) {
+        LOG_INFO(Render_Vulkan, "FEAT-GT7-188: {} stored translations recorded on first use",
+                 recorded);
+    }
 }
 
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
@@ -6284,6 +7886,16 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     std::optional<Common::PhaseTimer> match_timer{std::in_place, Common::Phase::ProgramMatch};
     // Diagnostic for runaway permutations: why each existing permutation was rejected.
     std::string mismatch_reasons;
+    // FEAT-GT7-188 (from shadGT FEAT-GTS-470 phase 1, RYGT_DIAG_SPEC_MISS=1): why stored
+    // permutations (from this GPU's play or pre-translated from a manifest) were rejected, counted
+    // when a draw needs a new one.
+    static const bool diag_spec_miss = [] {
+        const char* env = std::getenv("RYGT_DIAG_SPEC_MISS");
+        return env && env[0] == '1';
+    }();
+    std::vector<const char*> spec_miss_reasons;
+    // Why a permutation was not compared at all (no reason recorded for it).
+    u32 diag_with_info = 0, diag_memo = 0;
     // PERF-044: replay the last search when its inputs are the same. -DisablePerf 56.
     static const bool memo_enabled = Common::PerfFeatureEnabled(56);
     // FIX-GT7-045: a read-ahead state searches on its own. Found by the shared search, a permutation
@@ -6385,6 +7997,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             continue;
         }
         auto& info = *permutation.info;
+        ++diag_with_info; // FEAT-GT7-188
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
@@ -6406,11 +8019,20 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         bool matches;
         if (memo_usable) {
             matches = perm_idx == memo.perm;
+            ++diag_memo; // FEAT-GT7-188
         } else {
             std::optional<Common::PhaseTimer> spec_timer{std::in_place, Common::Phase::SelSpec};
             const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
             spec_timer.reset();
             matches = permutation.spec == spec;
+            if (!matches && diag_spec_miss) { // FEAT-GT7-188
+                u32 index{};
+                const char* reason = permutation.spec.FirstDifference(spec, index);
+                reason = reason ? reason : "none";
+                if (std::ranges::find(spec_miss_reasons, reason) == spec_miss_reasons.end()) {
+                    spec_miss_reasons.push_back(reason);
+                }
+            }
             if (!matches && program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};
                 const char* reason = permutation.spec.FirstDifference(spec, index);
@@ -6435,6 +8057,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                 memo.valid = false;
                 continue;
             }
+            // FEAT-GT7-188: binding is still the stage's start here (bindings are added below).
+            RecordStoredUse(hw_stage, sw_stage, params, runtime_info, binding, perm_idx);
         }
         if (memo_stage && !memo_usable) {
             memo.valid = true;
@@ -6459,6 +8083,50 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
     match_timer.reset();
+    if (diag_spec_miss && !regs_override) {
+        // FEAT-GT7-188 (FEAT-GTS-470 phase 1): a draw needs a translation no stored permutation
+        // gives, counted per stage and reason, once per program and set of reasons (the async
+        // path asks again every draw until its translation is ready).
+        static std::map<std::string, u64> reasons;
+        static std::unordered_set<u64> seen;
+        static u64 misses = 0, without_any = 0;
+        u64 seen_key = params.hash;
+        for (const char* reason : spec_miss_reasons) {
+            seen_key = HashCombine(seen_key, XXH3_64bits(reason, std::strlen(reason)));
+        }
+        if (seen.insert(seen_key).second) {
+            ++misses;
+            if (spec_miss_reasons.empty()) {
+                ++without_any;
+                // Which: no permutation with metadata, or decided by the memo.
+                const char* why = diag_with_info == 0 ? "no permutation"
+                                  : diag_memo != 0    ? "memo"
+                                                      : "other";
+                ++reasons[fmt::format("{}/none: {}", hw_stage, why)];
+                static u32 listed = 0;
+                if (++listed <= 1000) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FEAT-GT7-188 nothing to compare: {} {:016x} {} (permutations {}, "
+                                "with metadata {})",
+                                hw_stage, params.hash, why, program->modules.size(),
+                                diag_with_info);
+                }
+            }
+            for (const char* reason : spec_miss_reasons) {
+                ++reasons[fmt::format("{}/{}", hw_stage, reason)];
+            }
+            if (misses <= 20 || misses % 100 == 0) {
+                std::string summary;
+                for (const auto& [name, count] : reasons) {
+                    summary += fmt::format(" {}={}", name, count);
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "FEAT-GT7-188: {} new translations, {} with no stored permutation to "
+                            "compare; rejected because:{}",
+                            misses, without_any, summary);
+            }
+        }
+    }
     if (AsyncTranslation()) {
         // FIX-078: a translation the workers made for these inputs.
         const bool read_ahead = regs_override != nullptr;
@@ -6672,6 +8340,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             if (std::holds_alternative<GraphicsPipelineKey>(key)) {
                 auto& graphics_key = std::get<GraphicsPipelineKey>(key);
                 graphics_pipelines.erase(graphics_key);
+                prewarm_unclaimed.erase(graphics_key); // FIX-GT7-186
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
                 compute_pipelines.erase(compute_key);

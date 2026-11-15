@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 
@@ -59,6 +60,11 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // it is asked for they are translated again, once.
 static constexpr u32 ShaderMetaVersion = 19u;
 static constexpr u32 ShaderMetaVersionNoExplicitLod = 18u;
+// 9: rect/quad-list helper shaders built from complete attribute info (FIX-012).
+// 10: quad-list helper control shaders without the local index array (FIX-013).
+// 11 (FEAT-GT7-185): pipeline records are written again after PERF-104 removed them. The key is
+// stored as raw bytes and its layout changed meanwhile, so version 10 records are not read.
+static constexpr u32 PipelineKeyVersion = 11u;
 } // namespace Serialization
 
 namespace {
@@ -103,6 +109,119 @@ void SetNativeCubeCacheEnabled(bool enabled) {
 } // namespace Vulkan
 
 namespace Vulkan {
+
+void RegisterPipelineData(const ComputePipelineKey& key,
+                          ComputePipeline::SerializationSupport& sdata) {
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+
+    Serialization::Archive ar{};
+    Serialization::Writer pldata{ar};
+
+    pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(u32{1}); // compute
+
+    key.Serialize(ar);
+    sdata.Serialize(ar);
+
+    Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
+                                       fmt::format("c_{:#018x}", key.value), ar.TakeOff());
+}
+
+void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
+                          GraphicsPipeline::SerializationSupport& sdata) {
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+
+    Serialization::Archive ar{};
+    Serialization::Writer pldata{ar};
+
+    pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(u32{0}); // graphics
+
+    key.Serialize(ar);
+    sdata.Serialize(ar);
+
+    Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
+                                       fmt::format("g_{:#018x}", hash), ar.TakeOff());
+}
+
+bool WriteStoredGraphicsPipeline(const std::filesystem::path& file, const GraphicsPipelineKey& key,
+                                 GraphicsPipeline::SerializationSupport& sdata) {
+    Serialization::Archive ar{};
+    Serialization::Writer pldata{ar};
+    pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(u32{0}); // graphics
+    key.Serialize(ar);
+    sdata.Serialize(ar);
+    const auto bytes = ar.TakeOff();
+    auto temp = file;
+    temp += ".tmp";
+    {
+        std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) {
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, file, ec);
+    return !ec;
+}
+
+u32 StoredPipelineKeyVersion() {
+    return Serialization::PipelineKeyVersion;
+}
+
+bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
+    // The layout LoadShaderMeta reads: versions, permutation hash and index, the
+    // specialization, then the shader info, which starts with InfoPersistent.
+    Serialization::Archive ar{std::move(blob)};
+    Serialization::Reader meta{ar};
+    u32 meta_version{};
+    meta.Read(meta_version);
+    // The versions LoadShaderMeta reads; the binary version is checked there, when the
+    // program's stored permutations are listed (an entry it refuses is not built).
+    if (meta_version != Serialization::ShaderMetaVersion &&
+        !(meta_version == Serialization::ShaderMetaVersionNoExplicitLod &&
+          !Vulkan::RytyUpscale::TemporalWanted())) {
+        return false;
+    }
+    u32 binary_version{};
+    meta.Read(binary_version);
+    u64 perm_hash{};
+    meta.Read(perm_hash);
+    meta.Read(perm_idx);
+    Shader::StageSpecialization spec{};
+    spec.Deserialize(ar);
+    alignas(Shader::InfoPersistent) std::array<u8, sizeof(Shader::InfoPersistent)> persistent;
+    meta.Read(persistent.data(), persistent.size());
+    pgm_hash = reinterpret_cast<const Shader::InfoPersistent*>(persistent.data())->pgm_hash;
+    return true;
+}
+
+bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
+                                GraphicsPipeline::SerializationSupport& sdata) {
+    if (blob.size() < 2 * sizeof(u32) + sizeof(GraphicsPipelineKey)) {
+        return false;
+    }
+    Serialization::Archive ar{std::move(blob)};
+    Serialization::Reader pldata{ar};
+    u32 version{};
+    pldata.Read(version);
+    if (version != Serialization::PipelineKeyVersion) {
+        return false;
+    }
+    u32 is_compute{};
+    pldata.Read(is_compute);
+    if (is_compute != 0) {
+        return false;
+    }
+    key.Deserialize(ar);
+    return sdata.Deserialize(ar);
+}
 
 namespace {
 // SHD-006 census: how many new translations one made before any draw, from a program's code and

@@ -422,7 +422,7 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
-    SerializationSupport& sdata)
+    SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
@@ -436,9 +436,13 @@ GraphicsPipeline::GraphicsPipeline(
     }
     std::ranges::copy(infos, stages.begin());
     std::ranges::copy(infos, canonical_stages.begin());
-    BuildDescSetLayout();
+    // PERF-038: `preloading` builds a stored pipeline in the background. Its shader infos carry no
+    // user data and there are no guest buffers to read: vertex inputs and the tessellation
+    // helpers come from the stored serialization data; the runtime infos are the ones stored
+    // with each stage's specialization, so the pipeline is the one a draw would build.
+    BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
-    BuildWatch watch{debug_str, "pipeline build"};
+    BuildWatch watch{debug_str, preloading ? "stored pipeline build" : "pipeline build"};
     const bool tessellated = stages[u32(Shader::SwStage::TessellationControl)] != nullptr;
     HeavyBuildGate gate{tessellated};
 
@@ -490,7 +494,7 @@ GraphicsPipeline::GraphicsPipeline(
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
 
     VertexInputs<AmdGpu::Buffer> guest_buffers;
-    if (!instance.IsVertexInputDynamicState()) {
+    if (!preloading && !instance.IsVertexInputDynamicState()) {
         const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
         GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
                         guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
@@ -1037,6 +1041,10 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto create_start = std::chrono::steady_clock::now();
+    // FEAT-GT7-185 (from shadGT PERF-038): a stored pipeline built at start uses the same shared
+    // stage libraries and fast link as a draw's: a whole-pipeline build recompiles both stages for
+    // every target and blend permutation, and leaves nothing in the stage library cache for the
+    // runtime permutations that come later. RYGT_PRECOMPILE_WHOLE_PIPELINES=1 builds them whole.
     // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
     // summary their library compiles (with link-time optimization info kept) took the process
     // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
@@ -1057,7 +1065,12 @@ GraphicsPipeline::GraphicsPipeline(
         const char* env = std::getenv("SHADGT_NO_LIBRARIES");
         return env && env[0] == '1';
     }();
-    if (!no_libraries && instance.IsGraphicsPipelineLibrarySupported() &&
+    static const bool whole_prewarm = [] {
+        const char* env = std::getenv("RYGT_PRECOMPILE_WHOLE_PIPELINES");
+        return env && env[0] == '1';
+    }();
+    if (!(preloading && whole_prewarm) && !no_libraries &&
+        instance.IsGraphicsPipelineLibrarySupported() &&
         !(tessellated && whole_tessellated)) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a
@@ -1225,7 +1238,7 @@ GraphicsPipeline::GraphicsPipeline(
         }
         for (const auto& stage_info : pre_raster_stages) {
             pre_raster_key.Add(stage_info.stage);
-            pre_raster_key.Add(static_cast<VkShaderModule>(stage_info.module));
+            pre_raster_key.Add(ModuleIdentity(stage_info.module)); // FIX-GT7-186
         }
         pre_raster_key.Add(tessellation_state.patchControlPoints);
         pre_raster_key.Add(
@@ -1244,7 +1257,7 @@ GraphicsPipeline::GraphicsPipeline(
         // SHD-002: the fragment stage's set only.
         fragment_key.Add(set_layout_hashes[Shader::Backend::StageSet(u32(Shader::SwStage::Fragment))]);
         for (const auto& stage_info : fragment_stages) {
-            fragment_key.Add(static_cast<VkShaderModule>(stage_info.module));
+            fragment_key.Add(ModuleIdentity(stage_info.module)); // FIX-GT7-186
         }
         // SHD-004: a fragment shader library doesn't depend on the attachments: of
         // VkPipelineRenderingCreateInfo only the view mask is part of its state (formats are
@@ -1320,6 +1333,12 @@ GraphicsPipeline::GraphicsPipeline(
         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
         library_link->owned_libraries[1] = vk::UniquePipeline{library_handles[3], device};
         const auto libraries_done = std::chrono::steady_clock::now();
+        if (g_pipeline_libraries_only) {
+            // FEAT-GT7-188: the stage libraries are in the driver cache now; the link, AMD's
+            // costly part, is left to the draw that needs this pipeline, if one ever does.
+            link_skipped = true;
+            return;
+        }
 
         const vk::PipelineLibraryCreateInfoKHR link_libraries = {
             .libraryCount = static_cast<u32>(library_handles.size()),
@@ -1336,17 +1355,21 @@ GraphicsPipeline::GraphicsPipeline(
                    vk::to_string(link_result));
         pipeline = std::move(linked);
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-        LOG_WARNING(
-            Render_Vulkan,
-            "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-            "link {:.1f} ms; PERF-GT7-041 shared waits {}",
-            debug_str,
-            std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
-            pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                      libraries_done)
-                .count(),
-            library_cache.shared_waits.load());
+        const double library_ms =
+            std::chrono::duration<double, std::milli>(libraries_done - create_start).count();
+        // FEAT-GT7-185: the start-up precompile logs only its slow ones (thousands are built).
+        if (!preloading || library_ms >= 20.0) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+                "link {:.1f} ms; PERF-GT7-041 shared waits {}",
+                debug_str, library_ms,
+                pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          libraries_done)
+                    .count(),
+                library_cache.shared_waits.load());
+        }
 
         if (!lto_relink) {
             return; // SHD-001: the fast-linked pipeline is the one drawn with
@@ -1395,16 +1418,20 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     std::optional<BuildWatch> whole_watch;
-    whole_watch.emplace(debug_str, "whole pipeline compile");
+    if (!preloading) {
+        whole_watch.emplace(debug_str, "whole pipeline compile");
+    }
     auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
         return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     }); // FIX-GT7-101
     whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
-    LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                          create_start)
-                    .count());
+    if (!preloading) {
+        LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              create_start)
+                        .count());
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -1919,7 +1946,7 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
     const Shader::Info& vs_info) const;
 
-void GraphicsPipeline::BuildDescSetLayout() {
+void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     // SHD-002: one set per stage, its bindings numbered from 0.
     std::array<boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32>,
                Shader::Backend::MaxDescriptorSets>
@@ -1946,7 +1973,9 @@ void GraphicsPipeline::BuildDescSetLayout() {
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
-            [[maybe_unused]] const auto sharp = buffer.GetSharp(*stage);
+            if (!preloading) {
+                [[maybe_unused]] const auto sharp = buffer.GetSharp(*stage);
+            }
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,

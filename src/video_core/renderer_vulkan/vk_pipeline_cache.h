@@ -82,6 +82,19 @@ struct DrawIndirectParams {
     bool is_indirect{};
 };
 
+/// FEAT-GT7-185 (from shadGT PERF-098): progress of building the stored pipelines (the precompile
+/// shown over the splash).
+struct PrecompileProgress {
+    u64 total;   ///< stored pipelines found
+    u64 done;    ///< built, already present or unusable
+    bool active; ///< still going
+};
+PrecompileProgress GetPrecompileProgress();
+/// FEAT-GT7-187 (from shadGT FEAT-GTS-469): progress of the manifest pre-translation
+/// (PERF-GT7-117): records taken up of the manifest's records.
+PrecompileProgress GetPretranslateProgress();
+/// PERF-102: the game waits on the splash screen for the precompile.
+bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
 bool CompileSlowMotion();
 /// FIX-104: pipeline creations in progress.
@@ -214,6 +227,10 @@ public:
 
     /// FIX-GT7-023: see SaveDriverCacheAtExit.
     int SaveDriverCacheNow();
+    /// FEAT-GT7-185 (from shadGT PERF-098): on the command thread while it has no commands: takes
+    /// prepared stored pipelines and queues their builds (all of them as fast as the workers go
+    /// while the splash screen shows).
+    void IdlePrewarm(bool splash);
 
 private:
     bool RefreshGraphicsKey();
@@ -263,6 +280,20 @@ private:
     /// PERF-GT7-029: while many draws are skipped for their builds, compiles use every core, 8 at
     /// a time; back on the compile cores once few are. RYGT_COMPILE_CATCH_UP=0 turns it off.
     void UpdateCatchUp(std::chrono::steady_clock::time_point now);
+    /// FEAT-GT7-185 (from shadGT PERF-038): queues a stored pipeline's build behind all other
+    /// builds.
+    void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
+    /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread
+    /// prepared and queues their background builds.
+    void InstallPrewarmed(bool force = false);
+    struct PrewarmRecord;
+    bool InstallPrewarmRecord(PrewarmRecord& record);
+    void PrewarmRead(std::stop_token stop);
+    /// FEAT-GT7-189 (from shadGT FEAT-GTS-471): this GPU's stored pipelines as the manifest's
+    /// recipe file, and other GPUs' recipe files made this GPU's stored pipelines (see the .cpp).
+    void ExportPipelineRecipes(std::stop_token stop);
+    void ImportPipelineRecipes(std::stop_token stop);
+    void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which
     /// FinishBuild then does on this thread.
@@ -331,8 +362,8 @@ private:
     /// are stored.
     bool use_stored_shaders{};
     void ListStoredPermutations(u64 pgm_hash, Program& program);
-    /// A program's stored permutations as read from the store, and their insertion into the
-    /// program.
+    /// PERF-038: a program's stored permutations as read from the store (any thread), and their
+    /// insertion into the program (this thread).
     struct StoredListing {
         u64 pgm_hash{};
         struct Entry {
@@ -487,6 +518,39 @@ private:
         std::chrono::steady_clock::time_point since{};
     } queued_state_stats;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
+    // FEAT-GT7-185 (from shadGT PERF-038): stored pipelines built on the splash screen and in the
+    // background (GPU.precompile_shaders, RYGT_PREWARM).
+    bool prewarm_enabled{};
+    std::mutex prewarm_mutex;
+    std::condition_variable_any prewarm_cv;
+    std::deque<std::unique_ptr<PrewarmRecord>> prewarm_records;
+    std::atomic<size_t> prewarm_queued{};
+    std::atomic<u64> prewarm_built{};
+    std::atomic<u64> prewarm_read{};
+    std::atomic<u64> prewarm_total{};
+    std::atomic<bool> prewarm_reader_done{};
+    /// FIX-GT7-186 (from shadGT FIX-GTS-468): stored pipelines the workers finished building. The
+    /// command thread takes them out of pending_builds (AdoptPrewarmed), where every precompiled
+    /// pipeline no draw used stayed for the whole session.
+    std::mutex prewarm_finished_mutex;
+    std::vector<std::weak_ptr<PipelineBuild>> prewarm_finished;
+    std::atomic<bool> prewarm_finished_any{};
+    /// FIX-GT7-186: kept stored pipelines (the first RYGT_PRECOMPILE_KEEP) no draw has used yet.
+    /// The first draw that uses one stores its key again, as a draw taking it from pending_builds
+    /// does (PERF-038).
+    tsl::robin_map<GraphicsPipelineKey, GraphicsPipeline::SerializationSupport> prewarm_unclaimed;
+    u64 prewarm_adopted{};
+    u64 prewarm_installed{}; ///< FEAT-GT7-188: precompile builds queued, in install order
+    bool PrecompileLibrariesOnly() const;
+    u64 prewarm_dropped{};
+    void AdoptPrewarmed();
+    /// FIX-GT7-186: the shader modules the precompile made (program hash, permutation). Once it is
+    /// done, the ones no live pipeline uses go back to being stored (loaded again on first use).
+    std::vector<std::pair<u64, size_t>> prewarm_loaded;
+    /// FIX-GT7-186: programs the precompile listed (a normal start lists only the ones its draws
+    /// use). Dropped with the modules when nothing uses them; a draw lists them again.
+    std::vector<u64> prewarm_programs;
+    void ReleasePrewarmModules();
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
@@ -507,6 +571,17 @@ private:
     bool HullWaitBudgeted(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
     bool translation_skipped{};
+    struct PrewarmStats {
+        u64 installed{};
+        u64 skipped{};
+        u64 hits{};
+        u64 cancelled{};
+        u64 promoted{};
+        u64 built_before{};
+        double ms{};
+        std::chrono::steady_clock::time_point since{};
+    } prewarm_stats;
+    std::jthread prewarm_reader;
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
     bool force_wait = false; ///< FIX-198
     bool wait_for_shaders = false;                ///< PERF-GT7-020
@@ -630,6 +705,11 @@ private:
                               Program& program, const Shader::ShaderParams& params,
                               const Shader::RuntimeInfo& runtime_info,
                               const Shader::Backend::Bindings& binding, bool insert);
+    /// FEAT-GT7-188: records a stored translation on a draw's first use (record mode).
+    void RecordStoredUse(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& start, size_t perm_idx);
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
