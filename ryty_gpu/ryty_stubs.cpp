@@ -18,6 +18,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/native_clock.h"
+#include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
@@ -38,6 +39,7 @@
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
 #include "imgui/shadnet_notifications_layer.h"
+#include "ryty_gpu/ryty_app0.h"
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
 
@@ -64,10 +66,15 @@ Emulator::Emulator() : memory{}, controllers{}, linker{} {
     game_info.sdk_ver = 0x05050001;
     game_info.game_folder = std::filesystem::current_path() / "app0";
 
-    const auto sce_sys = game_info.game_folder / "sce_sys";
+    // FIX-GT7-175: sce_sys is read through the /app0 folder stack (ryGT7\app0, then the update and
+    // base game folders), as the game itself sees it.
+    const auto root = std::filesystem::current_path();
+    const auto sce_sys_file = [&root](const char* name) {
+        return Ryty::App0File(root, std::filesystem::path("sce_sys") / name);
+    };
 
     // The splash screen the console shows while the game starts (Show Splash setting).
-    if (std::ifstream splash{sce_sys / "pic1.png", std::ios::binary}) {
+    if (std::ifstream splash{sce_sys_file("pic1.png"), std::ios::binary}) {
         game_info.splash_data.assign(std::istreambuf_iterator<char>{splash},
                                      std::istreambuf_iterator<char>{});
     }
@@ -75,12 +82,17 @@ Emulator::Emulator() : memory{}, controllers{}, linker{} {
     // NpTrophy registers a context only for a service label listed here (trophyNN.trp to the
     // NNth communication ID in npbind.dat), as shadGT's loader fills it.
     NPBindFile npbind;
-    if (npbind.Load((sce_sys / "npbind.dat").string())) {
+    const auto npbind_path = sce_sys_file("npbind.dat");
+    std::vector<u8> npbind_data;
+    if (std::ifstream file{npbind_path, std::ios::binary}) {
+        npbind_data.assign(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
+    }
+    if (!npbind_data.empty() && npbind.Load(npbind_data)) {
         const auto np_comm_ids = npbind.GetNpCommIds();
         game_info.SetNpCommIds(np_comm_ids);
-        std::error_code error;
-        for (const auto& entry : std::filesystem::directory_iterator(sce_sys / "trophy", error)) {
-            auto name = entry.path().filename().string();
+        for (const auto& path :
+             Ryty::App0ListFiles(root, std::filesystem::path("sce_sys") / "trophy")) {
+            auto name = path.filename().string();
             std::transform(name.begin(), name.end(), name.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (!name.starts_with("trophy") || !name.ends_with(".trp")) {
@@ -91,6 +103,12 @@ Emulator::Emulator() : memory{}, controllers{}, linker{} {
                 game_info.trophy_index_map[index] = np_comm_ids[index];
             }
         }
+        LOG_INFO(Loader, "FIX-GT7-175: {} ({} communication IDs, {} trophy sets)",
+                 Common::FS::PathToUTF8String(npbind_path), np_comm_ids.size(),
+                 game_info.trophy_index_map.size());
+    } else {
+        LOG_WARNING(Loader, "FIX-GT7-175: no npbind.dat in the /app0 folders ({}); trophies off",
+                    Common::FS::PathToUTF8String(npbind_path));
     }
 }
 Emulator::~Emulator() = default;

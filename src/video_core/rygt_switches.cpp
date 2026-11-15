@@ -472,6 +472,12 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_WATCH_SHADERS_ALL|flag|Diagnostics & tracing|off|any value turns it on; with SHADGT_WATCH_SHADERS; Diagnostics builds only (Common::DiagEnv: Debug/RelWithDebInfo, or -DSHADGT_DIAGNOSTICS=ON)|With SHADGT_WATCH_SHADERS, logs every bind of the watched shaders instead of a sample. Diagnosis only; very large logs.",
     "RYGTSW1|SHADGT_WATCH_TESS|int|Diagnostics & tracing|0 (off)|milliseconds; Diagnostics builds only (Common::DiagEnv: Debug/RelWithDebInfo, or -DSHADGT_DIAGNOSTICS=ON)|Watches who writes tessellation constants for this many ms after they are decoded (DIAG-067). Diagnosis only.",
     "RYGTSW1|SHADGT_WATCH_WRITE|string|Diagnostics & tracing|unset|<hex address>:<seconds>:<ms>[;...]; x<offset> = execute breakpoint, r<address> = reads too; Diagnostics builds only (Common::DiagEnv: Debug/RelWithDebInfo, or -DSHADGT_DIAGNOSTICS=ON)|Logs writes to a guest address (thread, code address, value) for ms milliseconds, seconds after start (DIAG-075). Diagnosis only.",
+    // FIX-GT7-175
+    "RYGTSW1|RYGT_SCE_SYS_LAYERS|flag|Runtime|on|0 = off (only ryGT7\\app0\\sce_sys); read at start (std::getenv)|The game's sce_sys files (npbind.dat, trophy files, icon0.png, param.sfo, pic1.png) are read through the same folders the game sees as /app0: ryGT7\\app0, then the update folder, then the base game folder (FIX-GT7-175). 0 restores the old ryGT7\\app0-only lookup, which finds no trophies when Set up did not link the game's files there.",
+    // FEAT-GT7-186
+    "RYGTSW1|RYGT_TROPHY_TOAST|flag|Trophies|on|0 = off|Shows the PS5-style trophy pop-up (top right, with the grade's sound) when a trophy unlocks; 0 hides it (unlocks are still logged and saved).",
+    "RYGTSW1|RYGT_TROPHY_TOAST_TEST|string|Trophies|off|1 = a Gold demo; B, S, G or P = a demo of that grade|Shows one demo trophy pop-up 5 s after the game starts, to check its look and sound without unlocking anything.",
+    "RYGTSW1|RYGT_TROPHY_PROGRESS_SD|flag|Trophies|on|0 = old place|Keeps trophy progress next to the saves in _sd\\trophies_progress (copied once from user\\home\\<1000+slot>\\trophy, which stays as a backup); 0 uses the old user\\home place.",
 };
 
 RYGT_SWITCH_EXPORT const std::size_t RyGT_SwitchDescriptionCount = std::size(RyGT_SwitchDescriptions);
