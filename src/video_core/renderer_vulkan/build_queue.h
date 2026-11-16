@@ -108,6 +108,12 @@ public:
         return jobs.size() + screen.size() + soon.size() + tessellated.size();
     }
 
+    /// PERF-GT7-160: jobs running now.
+    u32 Running() {
+        std::scoped_lock lk{mutex};
+        return running;
+    }
+
     /// Wakes the workers waiting for jobs, so they can see a stop request.
     void NotifyAll() {
         cv.notify_all();
