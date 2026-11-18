@@ -129,6 +129,9 @@ public:
                    desc.post_op_tsharp_dw3_off == existing.post_op_tsharp_dw3_off &&
                    desc.is_depth == existing.is_depth && desc.is_cube == existing.is_cube;
         })};
+        // FIX-GT7-182: one binding serves every read of this S#; one read at an explicit level is
+        // enough to keep the game's bias on it.
+        sampler_resources[index].explicit_lod |= desc.explicit_lod;
         return index;
     }
 
@@ -377,6 +380,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
                 lod_prod.IsEmpty() ? UNKNOWN_LOCATION : SharpLocationFromSource(lod_prod.Inst()),
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
             .is_cube = image.GetViewType(image_res.is_array) == AmdGpu::ImageType::Cube, // FIX-215
+            .explicit_lod = bool(inst_info.has_lod), // FIX-GT7-182: _L opcodes, not _LZ
         });
         inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
     } else {

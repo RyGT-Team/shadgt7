@@ -279,6 +279,9 @@ struct SamplerResource {
     SharpLocation post_op_tsharp_dw3_off{};
     bool is_depth{};
     bool is_cube{}; ///< FIX-215: sampled with a cube image (read as a 2D array of its faces)
+    /// FIX-GT7-182: some instruction reads with this sampler at an explicit level (IMAGE_SAMPLE_L
+    /// and its variants). A level the shader chose must not get the DLSS texture bias.
+    bool explicit_lod{};
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};

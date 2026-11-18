@@ -33,6 +33,11 @@ target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
 gtest_discover_tests(shadps4_depth_attachment_test)
 
+add_executable(shadps4_kept_shadow_map_test test_kept_shadow_map.cpp)
+target_include_directories(shadps4_kept_shadow_map_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_kept_shadow_map_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_kept_shadow_map_test)
+
 add_executable(shadps4_color_clear_test test_color_clear.cpp test_color_blend.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
@@ -197,6 +202,17 @@ target_include_directories(shadps4_fps_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_compile_features(shadps4_fps_lock_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fps_lock_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fps_lock_test)
+
+if(WIN32)
+    # FIX-GT7-184: whether a guest range holds any committed page (VirtualQuery).
+    add_executable(shadgt_committed_pages_test test_committed_pages.cpp)
+    target_include_directories(shadgt_committed_pages_test PRIVATE ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(shadgt_committed_pages_test PRIVATE cxx_std_23)
+    target_compile_definitions(shadgt_committed_pages_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(shadgt_committed_pages_test PRIVATE GTest::gtest_main)
+    gtest_discover_tests(shadgt_committed_pages_test)
+endif()
 
 add_executable(shadgt_gt7_preset_options_test test_gt7_preset_options.cpp)
 target_include_directories(shadgt_gt7_preset_options_test PRIVATE ${CMAKE_SOURCE_DIR})

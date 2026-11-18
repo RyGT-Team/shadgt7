@@ -14,6 +14,8 @@
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/ryty_upscale.h"
+#include "video_core/host_shaders/dlss_motion_comp.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image.h"
 
 // Streamline's headers (MIT, ryty_gpu/streamline). Its functions are loaded from
@@ -44,6 +46,415 @@ using PFunGetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
 using PFunGetNewFrameToken = sl::Result (*)(sl::FrameToken*&, const uint32_t*);
 using PFunEvaluateFeature = sl::Result (*)(sl::Feature, const sl::FrameToken&,
                                            const sl::BaseStructure**, uint32_t, sl::CommandBuffer*);
+
+// DLSS-GT7-001: GT7's motion vectors hold the frame's own jitter (measured on 2026-11-12: in
+// still menu scenes every pixel carries the same vector, the un-resolved picture's shift against
+// the history, to 0.03 pixel). Handed as they are, DLSS read its history a quarter of a pixel
+// off in a still scene and the picture trembled. A compute pass (dlss_motion.comp) writes them
+// again with the jitter taken out, into a picture of this file's own.
+// RYGT_DLSS_TEMPORAL_MOTION=0: the game's vectors as they are.
+struct MotionFix {
+    vk::Extent2D size{};
+    VideoCore::UniqueImage image;
+    vk::UniqueImageView view;
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+    bool failed = false;
+    u64 frames = 0;
+    /// The pictures DLSS got, kept by the pass in menu frames: this frame's and the one before.
+    std::array<VideoCore::UniqueImage, 2> pictures;
+    std::array<vk::UniqueImageView, 2> picture_views;
+    u32 next_picture = 0;       ///< the one this frame's goes into
+    bool have_previous = false; ///< the other holds the frame before's
+    /// The interface's own shift per 16x16 tile (dlss_motion.comp, stage 1).
+    VideoCore::UniqueImage tiles;
+    vk::UniqueImageView tiles_view;
+    vk::Extent2D tiles_size{};
+    /// The interface's shift in the last masked frame (the jitter, when it is drawn shifted).
+    std::array<float, 2> last_ui_shift{};
+};
+MotionFix g_motion_fix;
+
+bool MotionFixOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DLSS_TEMPORAL_MOTION");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+/// Records the pass into cmdbuf; false when the game's vectors must be used as they are. input:
+/// the colour DLSS gets (shader read-only layout), compared with t.ui_scene_view when there is one.
+bool FixMotion(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
+               const RytyUpscale::TemporalInputs& t, vk::ImageView input) {
+    MotionFix& fix = g_motion_fix;
+    if (fix.failed || !MotionFixOn() || t.mvec_scale[0] == 0.0f || t.mvec_scale[1] == 0.0f) {
+        return false;
+    }
+    if (!fix.pipeline) {
+        const std::array<vk::DescriptorSetLayoutBinding, 7> bindings{{
+            {.binding = 0,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 2,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 3,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 4,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 5,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 6,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        }};
+        auto [set_result, set_layout] =
+            device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+                .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+                .bindingCount = static_cast<u32>(bindings.size()),
+                .pBindings = bindings.data(),
+            });
+        if (set_result != vk::Result::eSuccess) {
+            fix.failed = true;
+            return false;
+        }
+        fix.set_layout = std::move(set_layout);
+        const vk::PushConstantRange range{
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .offset = 0,
+            .size = 10 * sizeof(float),
+        };
+        auto [layout_result, layout] =
+            device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+                .setLayoutCount = 1,
+                .pSetLayouts = &fix.set_layout.get(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &range,
+            });
+        if (layout_result != vk::Result::eSuccess) {
+            fix.failed = true;
+            return false;
+        }
+        fix.layout = std::move(layout);
+        const vk::ShaderModule module = CompileSPV(DLSS_MOTION_COMP, device);
+        if (!module) {
+            fix.failed = true;
+            return false;
+        }
+        auto [pipeline_result, pipeline] =
+            device.createComputePipelineUnique({}, vk::ComputePipelineCreateInfo{
+                                                       .stage{
+                                                           .stage = vk::ShaderStageFlagBits::eCompute,
+                                                           .module = module,
+                                                           .pName = "main",
+                                                       },
+                                                       .layout = fix.layout.get(),
+                                                   });
+        device.destroyShaderModule(module);
+        if (pipeline_result != vk::Result::eSuccess) {
+            fix.failed = true;
+            LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the motion pass could not be built; the "
+                                     "game's motion vectors are used as they are");
+            return false;
+        }
+        fix.pipeline = std::move(pipeline);
+    }
+    bool fresh_pictures = false;
+    if (fix.size != t.size || !fix.view) {
+        fix.view.reset();
+        fix.image.Destroy();
+        fix.image = VideoCore::UniqueImage(device, allocator);
+        fix.image.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR16G16Sfloat,
+            .extent{.width = t.size.width, .height = t.size.height, .depth = 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        auto [view_result, view] = device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = fix.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR16G16Sfloat,
+            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                              .levelCount = 1,
+                              .layerCount = 1},
+        });
+        if (view_result != vk::Result::eSuccess) {
+            fix.failed = true;
+            return false;
+        }
+        fix.view = std::move(view);
+        // The pictures DLSS got (8 bits a channel are enough to match them).
+        for (u32 i = 0; i < 2; ++i) {
+            fix.picture_views[i].reset();
+            fix.pictures[i].Destroy();
+            fix.pictures[i] = VideoCore::UniqueImage(device, allocator);
+            fix.pictures[i].Create(vk::ImageCreateInfo{
+                .imageType = vk::ImageType::e2D,
+                .format = vk::Format::eR8G8B8A8Unorm,
+                .extent{.width = t.size.width, .height = t.size.height, .depth = 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+                .initialLayout = vk::ImageLayout::eUndefined,
+            });
+            auto [picture_result, picture_view] =
+                device.createImageViewUnique(vk::ImageViewCreateInfo{
+                    .image = fix.pictures[i],
+                    .viewType = vk::ImageViewType::e2D,
+                    .format = vk::Format::eR8G8B8A8Unorm,
+                    .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                      .levelCount = 1,
+                                      .layerCount = 1},
+                });
+            if (picture_result != vk::Result::eSuccess) {
+                fix.failed = true;
+                return false;
+            }
+            fix.picture_views[i] = std::move(picture_view);
+        }
+        // The tiles' shifts: a 16x16 tile a texel.
+        fix.tiles_view.reset();
+        fix.tiles.Destroy();
+        fix.tiles = VideoCore::UniqueImage(device, allocator);
+        fix.tiles_size = vk::Extent2D{(t.size.width + 15) / 16, (t.size.height + 15) / 16};
+        fix.tiles.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR16G16B16A16Sfloat,
+            .extent{.width = fix.tiles_size.width, .height = fix.tiles_size.height, .depth = 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eStorage,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        auto [tiles_result, tiles_view] = device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = fix.tiles,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR16G16B16A16Sfloat,
+            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                              .levelCount = 1,
+                              .layerCount = 1},
+        });
+        if (tiles_result != vk::Result::eSuccess) {
+            fix.failed = true;
+            return false;
+        }
+        fix.tiles_view = std::move(tiles_view);
+        fix.have_previous = false;
+        fix.next_picture = 0;
+        fresh_pictures = true;
+        fix.size = t.size;
+    }
+    constexpr vk::ImageSubresourceRange range = {
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .levelCount = 1,
+        .layerCount = 1,
+    };
+    // Every pixel is written: what the picture held is dropped. The game's own picture is read
+    // after whatever wrote it.
+    const vk::ImageMemoryBarrier2 to_write{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = fix.image,
+        .subresourceRange = range,
+    };
+    const vk::MemoryBarrier2 written{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        // (the kept pictures and the tiles are written again as storage images)
+        .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead |
+                         vk::AccessFlagBits2::eShaderStorageRead |
+                         vk::AccessFlagBits2::eShaderStorageWrite,
+    };
+    // The kept pictures stay in the general layout once made (the frame before's picture is read
+    // after the barrier above, this frame's written after it: it names every command before).
+    std::array<vk::ImageMemoryBarrier2, 4> image_barriers{to_write, to_write, to_write, to_write};
+    u32 image_barrier_count = 1;
+    if (fresh_pictures) {
+        for (const vk::Image made :
+             {static_cast<vk::Image>(fix.pictures[0]), static_cast<vk::Image>(fix.pictures[1]),
+              static_cast<vk::Image>(fix.tiles)}) {
+            image_barriers[image_barrier_count] = to_write;
+            image_barriers[image_barrier_count].dstAccessMask =
+                vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eShaderStorageRead |
+                vk::AccessFlagBits2::eShaderSampledRead;
+            image_barriers[image_barrier_count].image = made;
+            ++image_barrier_count;
+        }
+    }
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &written,
+        .imageMemoryBarrierCount = image_barrier_count,
+        .pImageMemoryBarriers = image_barriers.data(),
+    });
+    const vk::DescriptorImageInfo source{
+        .imageView = t.motion_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorImageInfo target{
+        .imageView = *fix.view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    // Without the display before its interface, the colour is compared with itself (no mask).
+    const bool mask = t.ui_scene_view && input;
+    const vk::DescriptorImageInfo shown{
+        .imageView = input ? input : t.motion_view,
+        .imageLayout = input ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorImageInfo scene = mask ? vk::DescriptorImageInfo{
+                                                     .imageView = t.ui_scene_view,
+                                                     .imageLayout = vk::ImageLayout::eGeneral,
+                                                 }
+                                               : shown;
+    const vk::DescriptorImageInfo previous{
+        .imageView = *fix.picture_views[fix.next_picture ^ 1],
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorImageInfo keep{
+        .imageView = *fix.picture_views[fix.next_picture],
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorImageInfo tiles{
+        .imageView = *fix.tiles_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const std::array<vk::WriteDescriptorSet, 7> writes{{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &source},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &target},
+        {.dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &scene},
+        {.dstBinding = 3,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &shown},
+        {.dstBinding = 4,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &previous},
+        {.dstBinding = 5,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &keep},
+        {.dstBinding = 6,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &tiles},
+    }};
+    // jitter (pixels) = -(c14*c20, c15*c21) and scale = -(c14, c15) / size: back to (c20, c21).
+    // Then the vectors' unit in pixels (vector * scale * size = where it was - where it is), the
+    // mask, the least change taken for the interface (half a step of a 10-bit display's colour,
+    // so equal pictures never count), whether the frame before's picture is there, the stage,
+    // and the interface's shift in the frame before minus in this one (it is drawn shifted by the
+    // frame's jitter when Home leaves it so: the frame before's picture is read that much off,
+    // so an interface that stays put matches with no motion exactly).
+    const bool ui_jittered = RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed);
+    const std::array<float, 2> ui_shift{ui_jittered ? t.jitter[0] : 0.0f,
+                                        ui_jittered ? t.jitter[1] : 0.0f};
+    const bool search = mask && fix.have_previous;
+    std::array<float, 10> jitter{
+        t.jitter[0] / (t.mvec_scale[0] * static_cast<float>(t.size.width)),
+        t.jitter[1] / (t.mvec_scale[1] * static_cast<float>(t.size.height)),
+        t.mvec_scale[0] * static_cast<float>(t.size.width),
+        t.mvec_scale[1] * static_cast<float>(t.size.height),
+        mask ? 1.0f : 0.0f,
+        0.5f / 1023.0f,
+        search ? 1.0f : 0.0f,
+        0.0f,
+        fix.last_ui_shift[0] - ui_shift[0],
+        fix.last_ui_shift[1] - ui_shift[1],
+    };
+    static u64 masked_frames = 0;
+    if (mask && masked_frames++ % 600 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: the menu's interface handed to DLSS with its own motion, "
+                    "measured per tile against the frame before ({} frames so)",
+                    masked_frames);
+    }
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fix.pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fix.layout, 0, writes);
+    if (search) {
+        // Stage 1: the interface's shift per tile; stage 0 reads it.
+        jitter[7] = 1.0f;
+        cmdbuf.pushConstants(*fix.layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             static_cast<u32>(sizeof(jitter)), jitter.data());
+        cmdbuf.dispatch(fix.tiles_size.width, fix.tiles_size.height, 1);
+        const vk::MemoryBarrier2 tiles_written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &tiles_written,
+        });
+        jitter[7] = 0.0f;
+    }
+    cmdbuf.pushConstants(*fix.layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         static_cast<u32>(sizeof(jitter)), jitter.data());
+    cmdbuf.dispatch((t.size.width + 7) / 8, (t.size.height + 7) / 8, 1);
+    // This frame's picture is kept for the next only in a masked frame.
+    fix.have_previous = mask;
+    if (mask) {
+        fix.next_picture ^= 1;
+        fix.last_ui_shift = ui_shift;
+    }
+    const vk::ImageMemoryBarrier2 to_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .image = fix.image,
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_read,
+    });
+    if (fix.frames++ == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: motion vectors handed to DLSS without the frame's jitter "
+                    "({:.6f}, {:.6f} in their unit in this frame)",
+                    jitter[0], jitter[1]);
+    }
+    return true;
+}
 
 // Zero motion vectors and a flat depth image (the game picture comes without either).
 struct AuxImages {
@@ -619,7 +1030,8 @@ bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output) {
 bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
-             vk::Format output_format, vk::Extent2D output_size) {
+             vk::Format output_format, vk::Extent2D output_size,
+             const RytyUpscale::TemporalInputs* temporal) {
     if (!UpscaleSupports(input_size, output_size)) {
         return false;
     }
@@ -642,6 +1054,16 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!g_sl.sr.Ready(input_size)) {
         CreateAuxImages(g_sl.sr, device, allocator, cmdbuf, input_size);
     }
+    // DLSS-GT7-001 (temporal DLSS; ryty_upscale.h): with the frame's own depth,
+    // motion vectors and jitter, DLSS keeps its history from frame to frame. A refusal from
+    // Streamline ends the prototype for the run, and the frame is scaled as before.
+    static bool temporal_refused = false;
+    static bool last_temporal = false;
+    static u64 temporal_frames = 0;
+    static u64 flat_frames = 0;
+    const bool use_temporal = temporal && !temporal_refused && temporal->size == input_size &&
+                              temporal->depth_view && temporal->motion_view;
+    const auto run = [&](const RytyUpscale::TemporalInputs* t) -> bool {
     sl::FrameToken* frame{};
     ++g_sl.frame_index;
     if (g_sl.new_frame_token(frame, &g_sl.frame_index) != sl::Result::eOk || !frame) {
@@ -653,7 +1075,35 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
 
     // No motion vectors: every frame starts DLSS's history over, like the plugin.
-    g_sl.set_constants(FlatConstants(input_size, true), *frame, viewport);
+    sl::Constants constants = FlatConstants(input_size, true);
+    if (t) {
+        static const std::array<float, 4> factors = [] {
+            std::array<float, 4> f{};
+            RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_JITTER", &f[0]);
+            RytyUpscale::TemporalFactors("RYGT_DLSS_TEMPORAL_MVEC", &f[2]);
+            return f;
+        }();
+        const bool reset = t->reset || !last_temporal;
+        constants.jitterOffset =
+            sl::float2(t->jitter[0] * factors[0], t->jitter[1] * factors[1]);
+        constants.mvecScale =
+            sl::float2(t->mvec_scale[0] * factors[2], t->mvec_scale[1] * factors[3]);
+        constants.depthInverted = sl::Boolean::eTrue;
+        constants.cameraMotionIncluded = sl::Boolean::eTrue;
+        constants.motionVectorsJittered = sl::Boolean::eFalse;
+        constants.motionVectorsDilated = sl::Boolean::eFalse;
+        constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        if (temporal_frames < 4 || (reset && temporal_frames % 16 == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: temporal frame {}: jitter {:.4f},{:.4f} px, motion scale "
+                        "{:.4f},{:.4f}, depth {} motion {}, {}x{}{}",
+                        temporal_frames, constants.jitterOffset.x, constants.jitterOffset.y,
+                        constants.mvecScale.x, constants.mvecScale.y,
+                        vk::to_string(t->depth_format), vk::to_string(t->motion_format),
+                        t->size.width, t->size.height, reset ? ", history reset" : "");
+        }
+    }
+    g_sl.set_constants(constants, *frame, viewport);
 
     constexpr auto aux_usage = vk::ImageUsageFlagBits::eSampled |
                                vk::ImageUsageFlagBits::eTransferDst |
@@ -676,6 +1126,25 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     sl::Resource depth = Texture(g_sl.sr.depth, *g_sl.sr.depth_view,
                                  vk::ImageLayout::eShaderReadOnlyOptimal, input_size,
                                  vk::Format::eR32Sfloat, aux_usage);
+    if (t) {
+        // The game's own pictures: native mode keeps them in the general layout, and the next
+        // frame draws into them again, so they are only promised until the evaluate.
+        mvec = Texture(t->motion, t->motion_view, vk::ImageLayout::eGeneral, input_size,
+                       t->motion_format,
+                       vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment);
+        if (FixMotion(device, allocator, cmdbuf, *t, input)) {
+            mvec = Texture(g_motion_fix.image, *g_motion_fix.view,
+                           vk::ImageLayout::eShaderReadOnlyOptimal, input_size,
+                           vk::Format::eR16G16Sfloat,
+                           vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage);
+        }
+        depth = Texture(t->depth, t->depth_view, vk::ImageLayout::eGeneral, input_size,
+                        t->depth_format,
+                        vk::ImageUsageFlagBits::eSampled |
+                            vk::ImageUsageFlagBits::eDepthStencilAttachment);
+    }
+    const auto aux_life = t ? sl::ResourceLifecycle::eValidUntilEvaluate
+                            : sl::ResourceLifecycle::eValidUntilPresent;
     const sl::Extent in_extent{0, 0, input_size.width, input_size.height};
     const sl::Extent out_extent{0, 0, output_size.width, output_size.height};
     const sl::ResourceTag tags[] = {
@@ -683,10 +1152,8 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                         sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent},
         sl::ResourceTag{&color_out, sl::kBufferTypeScalingOutputColor,
                         sl::ResourceLifecycle::eValidUntilEvaluate, &out_extent},
-        sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors,
-                        sl::ResourceLifecycle::eValidUntilPresent, &in_extent},
-        sl::ResourceTag{&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
-                        &in_extent},
+        sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors, aux_life, &in_extent},
+        sl::ResourceTag{&depth, sl::kBufferTypeDepth, aux_life, &in_extent},
     };
     auto* command_buffer =
         reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(cmdbuf));
@@ -700,11 +1167,44 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *frame, inputs,
                                             static_cast<u32>(std::size(inputs)), command_buffer);
     if (result != sl::Result::eOk) {
-        LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline's DLSS failed (result {})",
-                  static_cast<int>(result));
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline's DLSS failed (result {}){}",
+                  static_cast<int>(result), t ? " with the game's depth and motion vectors" : "");
         return false;
     }
     return true;
+    };
+    bool ok = false;
+    if (use_temporal) {
+        ok = run(temporal);
+        if (!ok) {
+            temporal_refused = true;
+            LOG_ERROR(Render_Vulkan, "DLSS-GT7-001: the temporal inputs were refused; DLSS runs "
+                                     "on single frames for the rest of this run");
+        }
+    }
+    const bool ran_temporal = ok;
+    if (!ok) {
+        ok = run(nullptr);
+    }
+    if (ok) {
+        if (ran_temporal != last_temporal && RytyUpscale::TemporalRequested()) {
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: DLSS now runs {} ({} temporal frames, {} single so far)",
+                        ran_temporal ? "with the game's depth, motion vectors and jitter"
+                                     : "on single frames",
+                        temporal_frames, flat_frames);
+        }
+        ++(ran_temporal ? temporal_frames : flat_frames);
+        last_temporal = ran_temporal;
+        RytyUpscale::TemporalStatus().store(ran_temporal ? 1 : 0, std::memory_order_relaxed);
+        if (ran_temporal) {
+            RytyUpscale::NoteTemporalScale(input_size, output_size); // DLSS-GT7-002
+        }
+    }
+    // DLSS-GT7-001: from the next frame on the native renderer may replace the game's
+    // anti-aliasing for DLSS (ryty_upscale.h), unless Streamline refused the inputs.
+    RytyUpscale::TemporalUsable().store(ok && !temporal_refused, std::memory_order_relaxed);
+    return ok;
 }
 
 void PresentStart() {

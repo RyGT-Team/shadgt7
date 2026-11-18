@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
@@ -41,9 +42,11 @@ public:
     void Create(vk::Device device, VmaAllocator allocator, u32 num_images);
 
     /// Returns the scaled picture, or input when DLSS is off or cannot scale this size.
+    /// temporal (DLSS-GT7-001, may be null): the frame's depth, motion vectors and jitter.
     vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                          vk::Format input_format, vk::Extent2D input_size,
-                         vk::Extent2D output_size);
+                         vk::Extent2D output_size,
+                         const RytyUpscale::TemporalInputs* temporal = nullptr);
 
 private:
     struct Img {

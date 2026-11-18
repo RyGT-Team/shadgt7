@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 RyGT Team
 // SPDX-License-Identifier: MIT
 //
 // The interface between ryGT's renderer (libSceVideoOut.prx) and the optional DLSS plugin

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -46,11 +47,13 @@ bool InitUpscale();
 bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output);
 
 /// Records DLSS into cmdbuf: input (shader-read-only layout) into output (general layout,
-/// storage usage). False when nothing usable was written.
+/// storage usage). False when nothing usable was written. temporal (DLSS-GT7-001, may be null):
+/// the frame's own depth, motion vectors (both in the general layout) and jitter.
 bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
-             vk::Format output_format, vk::Extent2D output_size);
+             vk::Format output_format, vk::Extent2D output_size,
+             const RytyUpscale::TemporalInputs* temporal = nullptr);
 
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();
