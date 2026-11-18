@@ -15,10 +15,16 @@
 #include <ranges>
 #include <sstream>
 #include <chrono>
-#include <future>
 #include <thread>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <optional>
+#include <filesystem>
+#include <span>
+#include <variant>
+#include <bit>
+#include <stop_token>
 
 #include "common/diagnostics.h"
 #include "common/elf_info.h"
@@ -73,7 +79,7 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     // folded out). RYGT_TESS_LDS_EMULATION=0: off; =1: slots from the start of the VGT group.
     static const u32 mode = [] {
         const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
-        return env && *env ? u32(env[0] - '0') : 2u;
+        return env && *env ? std::min(u32(std::max(env[0] - '0', 0)), 2u) : 2u;
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) {
@@ -415,7 +421,13 @@ private:
             if (!job) {
                 continue;
             }
-            Translate(*job, pools);
+            try {
+                Translate(*job, pools);
+            } catch (...) {
+                // Any failure other than a RecoverableFailure ends the job without a result
+                // (counted as failed). The job must still complete: a draw may wait on it.
+                Common::t_guest_read_log = nullptr;
+            }
             {
                 std::scoped_lock lk{job->mutex};
                 job->done = true;
@@ -1875,6 +1887,9 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> subgroups(r.stages.size());
     stages.reserve(r.stages.size());
+    if (r.subgroups.size() < r.stages.size()) {
+        return 0; // a damaged recipe
+    }
     const VkSpecializationInfo* spec = nullptr;
     for (const auto& [bit, code] : r.stages) {
         auto [result, module] = device.createShaderModuleUnique(vk::ShaderModuleCreateInfo{
@@ -1942,6 +1957,7 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
     }
     r.rendering.colorAttachmentCount = static_cast<u32>(r.color_formats.size());
     r.rendering.pColorAttachmentFormats = r.color_formats.data();
+    r.rendering.pNext = nullptr;
     r.library.pNext = &r.rendering;
     if (r.sample_counts) {
         r.sample_counts->colorAttachmentCount = static_cast<u32>(r.color_samples.size());
@@ -2202,8 +2218,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                    (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                     instance.IsAmdLegacyShaderCompiler());
         }(),
-        .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        .needs_lds_barriers = true,
         .intel_arc_workarounds = instance.IsIntel(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
@@ -2349,6 +2364,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                                instance.IsShaderObjectEnabled());
         translate_stats.since = std::chrono::steady_clock::now();
     }
+    // Made here, not on the first build: job threads read the pointer without the lookup lock.
+    build_workers = std::make_unique<PipelineBuildWorkers>();
 }
 
 PipelineCache::~PipelineCache() {
@@ -2374,6 +2391,9 @@ PipelineCache::~PipelineCache() {
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
     }
+    // Workers use the pipeline cache, descriptor heap and device: stop them before the save.
+    build_workers.reset();
+    translate_workers.reset();
     SaveDriverCache(true);
     store_readers.reset(); // PERF-GT7-118: its threads make modules
     for (const auto& [key, module] : prefetched_modules) {
@@ -2689,14 +2709,14 @@ void PipelineCache::MaybeSaveDriverCache() {
         (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= interval)) {
         SaveDriverCache(false);
     }
-    return;
-#endif
+#else
     // New pipelines are compiled during play; save them in batches without blocking the frame.
     using namespace std::chrono_literals;
     if (num_new_pipelines - pipelines_at_driver_save >= 64 &&
         std::chrono::steady_clock::now() - driver_cache_saved_at >= 30s) {
         SaveDriverCache(false);
     }
+#endif
 }
 
 const AmdGpu::Regs& PipelineCache::Regs() const {
@@ -3443,7 +3463,7 @@ Shader::Info& PipelineCache::MatchInfo(const Shader::Info& cached) {
         std::unique_ptr<Shader::Info> info;
     };
     static thread_local std::unordered_map<const Shader::Info*, Copy> copies;
-    if (copies.size() > 8192) {
+    if (copies.size() > 1024) {
         copies.clear(); // programs come and go: don't keep copies of retired ones forever
     }
     auto& copy = copies[&cached];
@@ -3455,6 +3475,9 @@ Shader::Info& PipelineCache::MatchInfo(const Shader::Info& cached) {
 }
 
 const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectParams params) {
+    if (const auto hit = graphics_pipelines.find(S().graphics_key); hit != graphics_pipelines.end()) {
+        return hit->second.get(); // a key in the map was checked when it was added
+    }
     if (S().graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
         LOG_WARNING(Render_Vulkan, "Skipping draw with {} color attachments (MRT mask={:#x})",
                     S().graphics_key.num_color_attachments, S().graphics_key.mrt_mask);
@@ -3501,7 +3524,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // hundreds of keys for the same few programs).
         // DIAG-051: which part of a new key differs from the last key with the same stages
         // (GT Sport's race summary asks for thousands of new pipelines).
-        {
+        // RYGT_DIAG_KEY_DIFF=1 turns it on.
+        if (static const bool diag_key_diff = Common::DiagEnv("RYGT_DIAG_KEY_DIFF") != nullptr;
+            diag_key_diff) {
             static std::unordered_map<u64, GraphicsPipelineKey> last_by_stages;
             static std::unordered_map<std::string, u32> diff_counts;
             static u32 keys_seen = 0;
@@ -4273,10 +4298,6 @@ bool PipelineCache::RefreshComputeKey() {
 }
 
 } // namespace Vulkan
-namespace Shader::Optimization {
-extern thread_local std::span<const u32> g_diag_compiling_code;
-extern thread_local u64 g_diag_compiling_hash;
-} // namespace Shader::Optimization
 namespace Vulkan {
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
@@ -4337,14 +4358,13 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
             .count(),
         spv.size());
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
-
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
     if (EmulatorSettings.IsShaderCollect()) {
         DebugState.CollectShader(name, info.sw_stage, module, spv, code,
                                  patch ? *patch : std::span<const u32>{}, is_patched);
     }
+    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx); // after the last use of spv
     return module;
 }
 
@@ -5213,17 +5233,19 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     const auto is_sane = [&] { return TessConstantsInBounds(c); };
     Common::CopyGuest(&c, reinterpret_cast<const void*>(base), sizeof(c));
     const bool sane = is_sane();
-    {
-        // DIAG-060: sane and garbage constants per hull program, every 5 s.
+    // DIAG-060: sane and garbage constants per hull program, every 5 s
+    // (RYGT_DIAG_TESS_HULLS=1: it took a global mutex on every tessellated draw).
+    if (static const bool diag_hulls = Common::DiagEnv("RYGT_DIAG_TESS_HULLS") != nullptr;
+        diag_hulls) {
         static std::mutex stats_mutex;
         static std::unordered_map<u64, std::pair<u32, u32>> per_hull;
         static u32 garbage_drawn{};
         static u32 garbage_read_ahead{};
+        static auto last = std::chrono::steady_clock::now();
+        std::scoped_lock lk{stats_mutex};
         if (!sane) {
             ++(read_ahead ? garbage_read_ahead : garbage_drawn);
         }
-        static auto last = std::chrono::steady_clock::now();
-        std::scoped_lock lk{stats_mutex};
         auto& [good, bad] = per_hull[hull.pgm_hash];
         ++(sane ? good : bad);
         if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds{5}) {
