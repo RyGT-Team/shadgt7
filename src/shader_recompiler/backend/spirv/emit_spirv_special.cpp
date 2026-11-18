@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/alignment.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/debug_print.h"
@@ -101,6 +102,25 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     for (u32 i = 0; Sirit::ValidId(ctx.output_tess_level_inner) && i < 2; ++i) {
         ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.output_tess_level_inner, ctx.ConstU32(i)),
                     ctx.ConstF32(0.0f));
+    }
+    // DIAG-247: the writer's other outputs get 0 too, so none is left undefined at its return
+    // (the writer pass of hs 0x332e7293 hung AMD GPUs).
+    const Id out_vec4 = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4]);
+    const Id zero_vec4 = ctx.ConstantNull(ctx.F32[4]);
+    const u32 num_out_attrs =
+        Common::AlignUp(ctx.runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
+    if (Sirit::ValidId(ctx.output_attr_array)) {
+        const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
+        for (u32 attr = 0; attr < num_out_attrs; ++attr) {
+            ctx.OpStore(ctx.OpAccessChain(out_vec4, ctx.output_attr_array, invocation,
+                                          ctx.ConstU32(attr)),
+                        zero_vec4);
+        }
+    }
+    for (const Id patch : ctx.patches) {
+        if (Sirit::ValidId(patch)) {
+            ctx.OpStore(patch, zero_vec4);
+        }
     }
     ctx.OpReturn();
     ctx.AddLabel(merge_label);
